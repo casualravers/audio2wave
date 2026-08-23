@@ -115,9 +115,10 @@ def parse_args() -> argparse.Namespace:
                     help="Taille de fenetre FFT pour --style analyzer: plus grand = analyse plus fine "
                          "mais moins d'images par seconde. Par defaut, la plus grande valeur qui tient "
                          "encore les --fps demandes")
-    p.add_argument("--averaging", type=int, default=1,
-                    help="Lissage temporel pour analyzer/radio: 1 = tres reactif, 8-16 = plus fluide "
-                         "(defaut: 1)")
+    p.add_argument("--averaging", type=int, default=10,
+                    help="Lissage temporel pour analyzer/radio: 1 = tres reactif mais nerveux, image "
+                         "par image, 20+ = tres pose. Le but n'est pas la precision spectrale mais un "
+                         "mouvement agreable a regarder (defaut: 10)")
     p.add_argument("--channel-mode", choices=["combined", "separate"], default="combined",
                     help="Canaux superposes ou empiles pour analyzer/radio (defaut: combined)")
 
