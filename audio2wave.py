@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Genere une video de waveform (ou spectre) a partir d'un fichier .wav via ffmpeg.
+"""Genere une video de spectre frequentiel (ou waveform) a partir d'un fichier .wav via ffmpeg.
 
 Exemples:
-    python audio2wave.py voix.wav voix_wave.mov
-    python audio2wave.py voix.wav voix_wave.webm --format webm
-    python audio2wave.py voix.wav voix_spec.mov --style spectrum --colormap rainbow
+    python audio2wave.py voix.wav voix_spec.mov
+    python audio2wave.py voix.wav voix_spec.webm --format webm --colormap rainbow
+    python audio2wave.py voix.wav voix_wave.mov --style waveform --mode cline
     python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
 """
 
@@ -32,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("input", type=Path, help="Fichier audio source (.wav)")
     p.add_argument("output", type=Path, help="Fichier video de sortie")
 
-    p.add_argument("--style", choices=["waveform", "spectrum"], default="waveform",
-                    help="waveform = showwaves, spectrum = showspectrum (defaut: waveform)")
+    p.add_argument("--style", choices=["waveform", "spectrum"], default="spectrum",
+                    help="waveform = showwaves, spectrum = showspectrum (defaut: spectrum)")
     p.add_argument("--format", choices=list(FORMAT_INFO), default="prores4444",
                     help="Codec/conteneur de sortie (defaut: prores4444)")
     p.add_argument("--size", default="1920x1080", help="Resolution WIDTHxHEIGHT (defaut: 1920x1080)")
