@@ -33,9 +33,13 @@ STYLE_BOOST_DB = {"analyzer": 18.0, "radio": -22.0}
 DEFAULT_GAIN_DB = {"analyzer": 30.0, "radio": -10.0}
 
 # Le cout de rendu est domine par la FFT (win_size) et la capture, pas par le nombre
-# de colonnes dessinees: mesure, 48 vs 128 barres ne change pas le temps de traitement.
-# Autant profiter de cette marge gratuite pour un trace net plutot que pixelise.
-DEFAULT_BARS = {"analyzer": 128, "radio": 240}
+# de colonnes dessinees ni par la taille de sortie: mesure, 48 vs 240 barres et
+# 960x540 vs 1920x1080 donnent le meme temps de traitement. Autant profiter de cette
+# marge gratuite pour un trace net plutot que pixelise.
+# analyzer: nombre de barres voulu a l'ecran, independant de la resolution.
+# radio: proportionnel a la largeur, sinon les traits s'epaississent quand on agrandit.
+DEFAULT_ANALYZER_BARS = 128
+RADIO_POINTS_PER_WIDTH = 4
 
 # Plafond de fenetre FFT en temps reel. auto_win_size vise la finesse maximale
 # compatible avec les fps; ici on prefere une fenetre courte, car sa duree
@@ -73,9 +77,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bar-gap", type=float, default=0.25,
                     help="Espace entre barres, en fraction de leur largeur. Ignore en --shape line "
                          "et en --style radio (defaut: 0.25)")
-    p.add_argument("--size", default="960x540",
-                    help="Resolution de la fenetre WIDTHxHEIGHT. Plus petit = moins de donnees a "
-                         "transferer et a afficher (defaut: 960x540)")
+    p.add_argument("--size", default=None,
+                    help="Resolution de rendu WIDTHxHEIGHT. Par defaut 960x540, ou la resolution de "
+                         "l'ecran avec --fullscreen: dessiner plus petit que l'affichage ajoute un "
+                         "agrandissement flou par ffplay, et ne fait rien gagner en vitesse")
     p.add_argument("--fps", type=int, default=30, help="Images par seconde (defaut: 30)")
 
     p.add_argument("--gain", type=float, default=None,
@@ -138,8 +143,37 @@ def resolve_gain(args: argparse.Namespace) -> float:
     return args.gain if args.gain is not None else DEFAULT_GAIN_DB[args.style]
 
 
-def resolve_bars(args: argparse.Namespace) -> int:
-    return args.bars if args.bars is not None else DEFAULT_BARS[args.style]
+def primary_screen_size() -> tuple[int, int] | None:
+    """Resolution de l'ecran principal, pour dessiner a la taille reelle d'affichage."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.SetProcessDPIAware()
+        width, height = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def resolve_size(args: argparse.Namespace) -> tuple[int, int]:
+    if args.size:
+        return parse_size(args.size)
+    # En plein ecran, dessiner plus petit que l'ecran ne fait qu'ajouter un
+    # agrandissement flou par ffplay: autant produire directement la bonne taille,
+    # d'autant que la resolution de sortie ne change pas le cout de traitement.
+    if args.fullscreen:
+        screen = primary_screen_size()
+        if screen:
+            return screen
+    return 960, 540
+
+
+def resolve_bars(args: argparse.Namespace, width: int) -> int:
+    if args.bars is not None:
+        return args.bars
+    if args.style == "analyzer":
+        return DEFAULT_ANALYZER_BARS
+    return width // RADIO_POINTS_PER_WIDTH
 
 
 def capture_input_args(args: argparse.Namespace) -> list[str]:
@@ -182,8 +216,8 @@ def tune(args: argparse.Namespace) -> None:
 
 
 def build_filter(args: argparse.Namespace) -> str:
-    width, height = parse_size(args.size)
-    bars = resolve_bars(args)
+    width, height = resolve_size(args)
+    bars = resolve_bars(args, width)
     gain = resolve_gain(args)
     bar_mode = args.style == "analyzer" and args.shape == "bar"
 
@@ -213,8 +247,9 @@ def build_filter(args: argparse.Namespace) -> str:
         )
 
     # Dessiner etroit puis agrandir: le gros du travail se fait sur {bars} colonnes.
-    # neighbor pour des barres franches, interpolation lissee pour une courbe.
-    flags = ":flags=neighbor" if bar_mode else ""
+    # neighbor garde les bords francs. Seule exception: analyzer en shape=line, ou
+    # l'interpolation bilineaire adoucit le zigzag en courbe; partout ailleurs elle bave.
+    flags = "" if (args.style == "analyzer" and args.shape == "line") else ":flags=neighbor"
     chain.append(f"scale={width}:{height}{flags}")
     chain.append("setsar=1")
     if bar_mode and args.bar_gap > 0:
@@ -272,7 +307,7 @@ def main() -> None:
         tune(args)
         return
 
-    width, height = parse_size(args.size)
+    width, height = resolve_size(args)
 
     producer = (
         ["ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -298,6 +333,8 @@ def main() -> None:
         print(" ".join(f'"{c}"' if " " in c else c for c in viewer))
         return
 
+    print(f"Rendu {width}x{height} en {describe_mode(args)}, {resolve_bars(args, width)} colonnes.",
+          flush=True)
     report_latency(args)
     print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
 

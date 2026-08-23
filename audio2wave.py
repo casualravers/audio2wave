@@ -249,16 +249,19 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
     else:  # analyzer / radio
         width, height = parse_size(args.size)
         # Des barres larges et une onde fine ne veulent pas la meme finesse de trace.
-        bars = args.bars if args.bars is not None else (128 if args.style == "analyzer" else 240)
+        # Le trace radio est proportionnel a la largeur: a nombre de points fixe, agrandir
+        # la sortie epaissit les traits jusqu'a les rendre grossiers.
+        bars = args.bars if args.bars is not None else (128 if args.style == "analyzer" else width // 4)
         # cbrt: seule echelle qui garde la silhouette quand le gain monte, contrairement a log
         # qui aplatit tout en un mur des que le signal est fort.
         amp_scale = args.amp_scale or "cbrt"
         # Tracer etroit puis agrandir: c'est ce qui epaissit le trait au lieu de laisser des aiguilles.
         draw_w = bars if bars > 0 else width
-        # bar: neighbor garde les bords francs, une interpolation lisse delaverait les barres.
-        # line: l'interpolation par defaut (bilineaire) adoucit le zigzag en courbe continue;
-        # neighbor y produirait des marches d'escalier au lieu d'une ligne.
-        flags = ":flags=neighbor" if args.style == "analyzer" and args.shape == "bar" else ""
+        # neighbor garde les bords francs. Seule exception: analyzer en shape=line, ou
+        # l'interpolation bilineaire adoucit le zigzag en courbe continue et ou neighbor
+        # produirait des marches d'escalier. Partout ailleurs elle ne fait que baver.
+        smooth_line = args.style == "analyzer" and args.shape == "line"
+        flags = "" if smooth_line else ":flags=neighbor"
         # setsar=1: sans ca, scale recalcule le SAR pour preserver le DAR de l'image
         # etroite d'avant agrandissement, et les lecteurs affichent la video ecrasee.
         post = f",scale={width}:{height}{flags},setsar=1" if bars > 0 else ""

@@ -43,7 +43,7 @@ python audio2wave.py <source.wav> [sortie] [options]
 | `--colors` | couleur(s) du trace, separees par `\|` | `white` |
 | `--gain auto\|<dB>` | niveau avant analyse ; `auto` mesure la crete et remplit l'image | `auto` |
 | `--averaging <n>` | lissage temporel (1 = nerveux, 20+ = pose) | `10` |
-| `--bars <n>` | nombre de barres/points (0 = pleine resolution) | `64` (analyzer) / `240` (radio) |
+| `--bars <n>` | nombre de barres/points (0 = pleine resolution) | `128` (analyzer) / largeur/4 (radio) |
 | `--format` | `prores4444` \| `webm` \| `mp4` | `prores4444` |
 | `--no-transparent --bg-color <c>` | fond plein au lieu de l'alpha | alpha actif |
 | `--keep-audio` | reinjecte la piste audio source dans la sortie | desactive |
@@ -111,7 +111,7 @@ touche deja les bords a crete normalisee, alors qu'une barre reste loin du plafo
 | `--buffer <ms>` | tampon de capture ; trop bas = coupures | `50` |
 | `--averaging <n>` | lissage ; **poste de latence principal**, analyzer seul | `6` |
 | `--win-size <n>` | fenetre FFT ; plus petit = plus reactif, moins precis | auto (max 512) |
-| `--size` | resolution de la fenetre | `960x540` |
+| `--size` | resolution de rendu | `960x540`, ou l'ecran avec `--fullscreen` |
 | `--fullscreen` | plein ecran | - |
 
 `--shape`, `--colors`, `--bars`, `--bar-gap`, `--max-freq`, `--freq-scale`,
@@ -130,6 +130,11 @@ python audio2wave_live.py -d "<entree>" --averaging 2 --buffer 20
 ## Ce qui est sacrifie pour la vitesse
 
 - fenetre FFT courte (512) : frequences plus grossieres
-- moins de barres (48) et resolution reduite
 - pas de canal alpha ni de pre-analyse du fichier
 - mono par defaut : deux fois moins de FFT a calculer
+
+En revanche **ni la resolution ni le nombre de barres ne sont sacrifies** : mesure
+faite, 960x540 et 1920x1080 coutent le meme temps de traitement, tout comme 48 et
+240 colonnes. Le cout est domine par la capture et la FFT. Avec `--fullscreen`, le
+rendu se fait donc directement a la resolution de l'ecran, plutot que d'etre
+agrandi (et flouté) par ffplay.
