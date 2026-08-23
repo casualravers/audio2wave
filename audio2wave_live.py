@@ -32,8 +32,10 @@ STYLE_BOOST_DB = {"analyzer": 18.0, "radio": -22.0}
 # entree ligne classique (crete vers -12 dBFS); --tune donne la valeur exacte.
 DEFAULT_GAIN_DB = {"analyzer": 30.0, "radio": -10.0}
 
-# Une onde a besoin de plus de points qu'un banc de barres pour rester lisible.
-DEFAULT_BARS = {"analyzer": 48, "radio": 160}
+# Le cout de rendu est domine par la FFT (win_size) et la capture, pas par le nombre
+# de colonnes dessinees: mesure, 48 vs 128 barres ne change pas le temps de traitement.
+# Autant profiter de cette marge gratuite pour un trace net plutot que pixelise.
+DEFAULT_BARS = {"analyzer": 128, "radio": 240}
 
 # Plafond de fenetre FFT en temps reel. auto_win_size vise la finesse maximale
 # compatible avec les fps; ici on prefere une fenetre courte, car sa duree
@@ -67,7 +69,7 @@ def parse_args() -> argparse.Namespace:
                     help="Couleur(s) du trace, separees par | (defaut: cyan)")
     p.add_argument("--bars", type=int, default=None,
                     help="Nombre de barres/points. Moins = moins de calcul "
-                         "(defaut: 48 en analyzer, 160 en radio)")
+                         "(defaut: 128 en analyzer, 240 en radio)")
     p.add_argument("--bar-gap", type=float, default=0.25,
                     help="Espace entre barres, en fraction de leur largeur. Ignore en --shape line "
                          "et en --style radio (defaut: 0.25)")

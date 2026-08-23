@@ -95,7 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bars", type=int, default=None,
                     help="Nombre de barres/points pour analyzer/radio. Le trace est rendu a cette "
                          "largeur puis agrandi, ce qui donne des barres epaisses facon spectrometre. "
-                         "0 = pleine resolution, tres fin (defaut: 64 en analyzer, 240 en radio)")
+                         "Trop bas = rendu grossier/pixelise ou flou selon --shape. "
+                         "0 = pleine resolution, tres fin (defaut: 128 en analyzer, 240 en radio)")
     p.add_argument("--bar-gap", type=float, default=0.25,
                     help="Espace entre les barres pour --style analyzer --shape bar, en fraction de "
                          "la largeur d'une barre. 0 = barres jointives, ignore en --shape line "
@@ -248,7 +249,7 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
     else:  # analyzer / radio
         width, height = parse_size(args.size)
         # Des barres larges et une onde fine ne veulent pas la meme finesse de trace.
-        bars = args.bars if args.bars is not None else (64 if args.style == "analyzer" else 240)
+        bars = args.bars if args.bars is not None else (128 if args.style == "analyzer" else 240)
         # cbrt: seule echelle qui garde la silhouette quand le gain monte, contrairement a log
         # qui aplatit tout en un mur des que le signal est fort.
         amp_scale = args.amp_scale or "cbrt"
