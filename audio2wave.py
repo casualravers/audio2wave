@@ -19,16 +19,34 @@ Exemples:
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# Correction appliquee au-dessus d'une normalisation de crete, pour que le trace
+# remplisse l'image sans la deborder. Les echelles cbrt etant multiplicatives, ce
+# terme agit comme un facteur d'echelle constant sur la hauteur.
+# analyzer: une barre isolee reste loin du plafond, il faut remonter.
+# radio: l'onde touche deja les bords a crete normalisee, il faut redescendre.
+AUTO_GAIN_BOOST_DB = {"analyzer": 18.0, "radio": -22.0}
 
 FORMAT_INFO = {
     "prores4444": {"ext": ".mov", "container": "mov"},
     "webm": {"ext": ".webm", "container": "webm"},
     "mp4": {"ext": ".mp4", "container": "mp4"},
 }
+
+
+def gain_value(raw: str) -> float | str:
+    if raw.strip().lower() == "auto":
+        return "auto"
+    try:
+        return float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"gain invalide: {raw} (un nombre en dB, ou 'auto')")
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,9 +94,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bar-gap", type=float, default=0.25,
                     help="Espace entre les barres pour --style analyzer, en fraction de la largeur "
                          "d'une barre. 0 = barres jointives (defaut: 0.25)")
-    p.add_argument("--gain", type=float, default=0.0,
-                    help="Gain en dB applique avant l'analyse, pour remplir la hauteur de l'image "
-                         "sur un enregistrement discret (defaut: 0)")
+    p.add_argument("--gain", type=gain_value, default="auto",
+                    help="Gain en dB applique avant l'analyse. 'auto' mesure la crete du fichier et "
+                         "la remonte pour remplir la hauteur de l'image, ce qui evite de regler le "
+                         "gain a la main sur chaque source. Passe un nombre pour forcer (defaut: auto)")
+    p.add_argument("--max-freq", type=int, default=8000,
+                    help="Frequence la plus haute affichee par --style analyzer, en Hz. L'audio est "
+                         "reechantillonne a 2x cette valeur pour que toute la largeur serve au "
+                         "contenu utile au lieu d'aigus vides. 0 = pleine bande (defaut: 8000)")
     p.add_argument("--stereo", action="store_true",
                     help="Trace chaque canal separement pour analyzer/radio. Par defaut l'audio est "
                          "reduit en mono pour obtenir une forme unique et lisible")
@@ -88,9 +111,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp-scale", choices=["lin", "sqrt", "cbrt", "log"], default=None,
                     help="Echelle d'amplitude pour analyzer/radio "
                          "(defaut: log en analyzer, cbrt en radio)")
-    p.add_argument("--win-size", type=int, default=2048,
-                    help="Taille de fenetre FFT pour analyzer/radio: plus grand = plus de barres fines "
-                         "(defaut: 2048)")
+    p.add_argument("--win-size", type=int, default=None,
+                    help="Taille de fenetre FFT pour --style analyzer: plus grand = analyse plus fine "
+                         "mais moins d'images par seconde. Par defaut, la plus grande valeur qui tient "
+                         "encore les --fps demandes")
     p.add_argument("--averaging", type=int, default=1,
                     help="Lissage temporel pour analyzer/radio: 1 = tres reactif, 8-16 = plus fluide "
                          "(defaut: 1)")
@@ -126,6 +150,67 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def probe_sample_rate(source: Path) -> int | None:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate", "-of", "csv=p=0", str(source)],
+        capture_output=True, text=True, errors="replace",
+    )
+    rate = proc.stdout.strip()
+    return int(rate) if rate.isdigit() else None
+
+
+def probe_peak_dbfs(source: Path) -> float | None:
+    """Crete du fichier en dBFS, via volumedetect (qui ecrit sur stderr)."""
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(source),
+         "-af", "volumedetect", "-f", "null", os.devnull],
+        capture_output=True, text=True, errors="replace",
+    )
+    found = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?) dB", proc.stderr)
+    return float(found.group(1)) if found else None
+
+
+def resolve_gain(args: argparse.Namespace, source: Path) -> float:
+    if args.gain != "auto":
+        return float(args.gain)
+
+    boost = AUTO_GAIN_BOOST_DB.get(args.style)
+    if boost is None:  # spectrum / waveform ont leur propre mise a l'echelle
+        return 0.0
+
+    peak = probe_peak_dbfs(source)
+    if peak is None:
+        print("Note: crete non mesurable, gain auto ignore (utilise --gain pour forcer)")
+        return 0.0
+
+    gain = -peak + boost
+    print(f"Gain auto: crete a {peak:.1f} dBFS -> {gain:+.1f} dB")
+    return gain
+
+
+def resolve_analysis_rate(args: argparse.Namespace, source: Path) -> tuple[int | None, int]:
+    """(reechantillonnage a appliquer ou None, frequence d'analyse effective)."""
+    source_rate = probe_sample_rate(source) or 44100
+    if args.style != "analyzer" or args.max_freq <= 0:
+        return None, source_rate
+    target = args.max_freq * 2
+    if source_rate <= target:
+        return None, source_rate  # deja plus etroit que demande, rien a gagner
+    return target, target
+
+
+def auto_win_size(rate: int, fps: int) -> int:
+    """Plus grande fenetre FFT qui produit encore fps images par seconde.
+
+    showfreqs sort environ 2*rate/win_size images par seconde. Si c'est moins que
+    fps, il en manque et la video sort tronquee au lieu d'etre simplement moins fine.
+    """
+    limit = int(2 * rate / max(fps, 1))
+    size = 1 << max(limit, 1).bit_length() - 1  # puissance de deux inferieure ou egale
+    return max(256, min(size, 65536))
+
+
 def parse_size(size: str) -> tuple[int, int]:
     try:
         width, height = (int(part) for part in size.lower().split("x", 1))
@@ -135,7 +220,8 @@ def parse_size(size: str) -> tuple[int, int]:
     return width, height
 
 
-def build_filter(args: argparse.Namespace) -> str:
+def build_filter(args: argparse.Namespace, gain: float = 0.0,
+                 rate: int | None = None, analysis_rate: int = 44100) -> str:
     transparent = not args.no_transparent
 
     if args.style == "waveform":
@@ -156,20 +242,28 @@ def build_filter(args: argparse.Namespace) -> str:
         width, height = parse_size(args.size)
         # Des barres larges et une onde fine ne veulent pas la meme finesse de trace.
         bars = args.bars if args.bars is not None else (64 if args.style == "analyzer" else 240)
-        amp_scale = args.amp_scale or ("log" if args.style == "analyzer" else "cbrt")
+        # cbrt: seule echelle qui garde la silhouette quand le gain monte, contrairement a log
+        # qui aplatit tout en un mur des que le signal est fort.
+        amp_scale = args.amp_scale or "cbrt"
         # Tracer etroit puis agrandir: c'est ce qui epaissit le trait au lieu de laisser des aiguilles.
         draw_w = bars if bars > 0 else width
         # neighbor garde les bords francs; une interpolation lisse delaverait le trace.
         post = f",scale={width}:{height}:flags=neighbor" if bars > 0 else ""
 
-        pre = "" if args.stereo else "aformat=channel_layouts=mono,"
-        if args.gain:
-            pre += f"volume={args.gain}dB,"
+        # fltp: sans virgule flottante, un gain auto de +40 dB ecreterait l'audio et
+        # deformerait le spectre au lieu de simplement agrandir le trace.
+        layout = "" if args.stereo else ":channel_layouts=mono"
+        pre = f"aformat=sample_fmts=fltp{layout},"
+        if gain:
+            pre += f"volume={gain}dB,"
+        if rate:
+            pre += f"aresample={rate},"
 
         if args.style == "analyzer":
+            win_size = args.win_size or auto_win_size(analysis_rate, args.fps)
             draw = (
                 f"showfreqs=s={draw_w}x{height}:rate={args.fps}:mode=bar"
-                f":ascale={amp_scale}:fscale={args.freq_scale}:win_size={args.win_size}"
+                f":ascale={amp_scale}:fscale={args.freq_scale}:win_size={win_size}"
                 f":averaging={args.averaging}:cmode={args.channel_mode}:colors={args.colors}"
             )
             if bars > 0 and args.bar_gap > 0:
@@ -270,7 +364,9 @@ def main() -> None:
     output = resolve_output(args, source)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    filter_complex = build_filter(args)
+    gain = resolve_gain(args, source)
+    rate, analysis_rate = resolve_analysis_rate(args, source)
+    filter_complex = build_filter(args, gain, rate, analysis_rate)
     vcodec, acodec = build_codec_args(args)
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", args.loglevel, "-stats"]
