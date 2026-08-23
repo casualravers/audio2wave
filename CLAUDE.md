@@ -46,7 +46,9 @@ resolution de chemins.
   binaire sous PowerShell ; le parent doit fermer `source.stdout` pour que ffmpeg voie
   la fermeture de la fenetre.
 - [audio2wave_snap.py](audio2wave_snap.py) — photo fixe d'un temps, rafraichie a chaque
-  temps, coloree par bande facon platine (`--style rekordbox`).
+  temps et tracee progressivement. Deux familles de rendu: `--style pencil` (defaut)
+  rasterise une polyligne d'enveloppe **en Python**, `rekordbox`/`simple` passent par
+  ffmpeg. `render_command` refuse explicitement `pencil`, la frontiere est la.
   **Trois processus, pas deux** : un ffmpeg de capture permanent (dshow -> PCM `s16le`
   sur stdout), Python qui lit des blocs de `interval` secondes, un ffmpeg de rendu
   jetable par photo (`showwavespic`, PCM sur stdin -> une image RGB sur stdout), et un
@@ -55,7 +57,12 @@ resolution de chemins.
   (`LiveCapture`, fenetre glissante) et la cadence est calee sur `time.monotonic()`,
   pas sur la fin du rendu : sinon les ~100 ms de rendu s'ajoutent a chaque cycle et la
   photo derive par rapport a la musique. La cadence annoncee a ffplay vaut le double
-  du rythme des photos, sinon sa file d'images se remplit et l'affichage retarde.
+  du rythme des images, sinon sa file se remplit et l'affichage retarde.
+  Le trace progressif (`draw_progressively`) se fait **cote Python**, pas dans ffmpeg :
+  canevas persistant, seules les colonnes nouvellement decouvertes y sont recopiees
+  (0,4 ms par pas en 1920x360 contre 1,1 ms en reconstruisant l'image). L'avancee est
+  calculee sur l'horloge et non sur le numero d'image, pour finir a l'echeance meme
+  si un pas traine. Mesure: fin a +1 a +5 ms de l'echeance.
 
 ### Couplage entre les fichiers
 
@@ -104,7 +111,16 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   crete mesuree par le gain auto est bien celle qui touche les bords.
 - **Passe-bas a deux poles en cascade** (24 dB/oct) : en 12 dB/oct, les bandes se
   recouvrent trop et tout le trace vire a la couleur des graves.
-- **Deux regimes de colonnes, jamais l'entre-deux** : au-dessus de `TARGET_COLUMN_MS`
+- **`--style pencil` ne passe pas par ffmpeg** : aucun filtre ne dessine une polyligne
+  d'enveloppe (`showwavespic` remplit une silhouette, `showwaves` trace la forme d'onde).
+  `render_pencil` peint pour chaque colonne le segment vertical reliant la hauteur
+  precedente a la nouvelle — un point par colonne laisserait des trous sur les attaques,
+  et c'est aussi ce qui rend `--wave` possible, ou le trait devient raide entre deux
+  colonnes. `--wave` remplace les deux hauteurs du contour par une seule, oscillante;
+  sa phase ne depend que de x, sinon les cretes sauteraient d'une photo a l'autre.
+  Consequence a garder en tete: le rendu passe de ~95 ms a ~6 ms, ce qui rallonge
+  d'autant le trace progressif (463 ms de balayage sur 469 au lieu de 375).
+- **Deux regimes de colonnes, jamais l'entre-deux** (styles ffmpeg) : au-dessus de `TARGET_COLUMN_MS`
   (10 ms, un cycle de basse) chaque colonne resume une crete et l'onde est pleine ;
   en dessous de `RESOLVED_COLUMN_MS` (1 ms/pixel) la forme d'onde est dessinee en
   entier. Entre les deux, une colonne attrape un bout de cycle au hasard et le trace
@@ -112,6 +128,11 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   un temps sur 1920 px on est a 0,24 ms, donc pleine resolution. Quand il y a
   agrandissement, le rapport est arrondi a un entier, sinon les colonnes alternent
   4 px et 5 px.
+- **`format=rgb24` explicite sur la source `color` sondee** par `background_pixel` :
+  sans lui elle passe par du yuv et rend une couleur decalee d'un cran (`0x14161c` ->
+  `(21,22,28)` au lieu de `(20,22,28)`), donc differente du fond de la photo que le
+  trace progressif doit prolonger. Dans le graphe de rendu le probleme ne se pose pas,
+  `overlay=format=auto` y force deja le rgb.
 - **`format=rgba` explicite avant la sortie PNG** quand le fond doit rester transparent :
   des qu'un `scale` precede, l'encodeur png accepte rgb24 comme rgba et la negociation
   laisse tomber l'alpha. Regression attrapee au test, invisible a l'oeil.
@@ -121,6 +142,17 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   `primary_screen_size`).
 - **En live, `--averaging` est le poste de latence principal** ; `report_latency()` doit
   refleter tout changement de la chaine (capture + fenetre FFT + lissage).
+
+### Frequence d'echantillonnage
+
+`audio2wave_snap.py` prend par defaut la frequence native du peripherique
+(`probe_device_rate`, une ouverture de 0,2 s au lancement, repli
+`DEFAULT_CAPTURE_RATE = 48000`). Le but est de supprimer le reechantillonnage, pas de
+gagner des Hz : **monter la frequence n'ameliore pas l'image**. Mesure, a 0,244 ms par
+colonne, de l'erreur sur la crete retenue : 0,4 % a 44100, 0,1 % a 48000, 0,0 % a
+96000 pour du contenu a 2 kHz ; et sur les graves l'ecart ne bouge pas du tout
+(32,6 % a 44100 comme a 192000), parce qu'il ne s'agit pas d'une imprecision mais du
+regime "forme d'onde resolue". Ne pas relancer ce debat sans refaire la mesure.
 
 ### Gain
 

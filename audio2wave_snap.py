@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import array
 import math
+import os
+import re
 import subprocess
 import sys
 import threading
@@ -31,7 +33,11 @@ from audio2wave_live import list_audio_devices, primary_screen_size, require_too
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
 # transite par Python entre la capture et le rendu: fixer le format a la sortie de
 # la capture evite d'avoir a le sonder pour savoir combien d'octets lire.
-CAPTURE_RATE = 44100
+# Repli quand la frequence native du peripherique n'a pas pu etre lue. 48000 est la
+# frequence de travail de la quasi-totalite des cartes son sous Windows: la demander
+# evite un reechantillonnage, la ou 44100 en imposait un a presque tout le monde.
+# Monter plus haut ne cree aucune information que le peripherique n'a pas.
+DEFAULT_CAPTURE_RATE = 48000
 SAMPLE_BYTES = 2  # s16le
 
 # showwavespic dessine l'amplitude telle quelle: a crete normalisee le trace touche
@@ -61,6 +67,24 @@ DEFAULT_CROSSOVER = (200, 2000)
 # Couleur unique du style simple.
 SIMPLE_COLOR = "cyan"
 
+# Style crayon: un seul trait blanc qui suit l'enveloppe, sans remplissage.
+PENCIL_COLOR = "white"
+PENCIL_BG = "black"
+# Nombre de points de la polyligne. C'est le reglage de la grossierete du trace: a
+# 96 points sur 1920 px, un segment fait une vingtaine de pixels et le trait reste
+# franchement anguleux, comme une esquisse. Beaucoup plus, et il colle a la forme
+# d'onde au lieu d'en donner le contour.
+PENCIL_POINTS = 96
+# Lissage de l'enveloppe, en nombre de points de part et d'autre. Adoucit les angles
+# sans effacer les attaques.
+PENCIL_SMOOTH = 1
+DEFAULT_LINE_WIDTH = 2
+
+# Nombre d'oscillations de --wave sur la largeur de l'image. A 24 sur 1920 px, une
+# oscillation fait 80 px: assez serre pour se lire comme une onde, assez large pour
+# que l'enveloppe reste visible a travers.
+WAVE_CYCLES = 24
+
 # Duree d'audio visee par colonne dessinee, quand une photo resume plusieurs secondes.
 # En dessous d'un cycle de basse (10 ms a 100 Hz), une colonne attrape un bout de cycle
 # au hasard et le trace part en peigne de traits fins; au-dela, chaque colonne resume
@@ -78,6 +102,11 @@ RESOLVED_COLUMN_MS = 1.0
 # finissent par montrer la meme chose. Rien n'oblige a l'agrandir, LiveCapture vidant
 # le tube en permanence.
 DEFAULT_BUFFER_MS = 50
+
+# Cadence du trace progressif. Le trait avance colonne par colonne pour finir pile au
+# rafraichissement suivant, ce qui donne un balayage cale sur le tempo. 30 img/s suffit
+# a le rendre fluide; au-dela on n'ajoute que du debit dans le tube.
+DEFAULT_DRAW_FPS = 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,19 +135,32 @@ def parse_args() -> argparse.Namespace:
                          "de sa hauteur; l'ecran entier avec --fullscreen)")
     p.add_argument("--fullscreen", action="store_true", help="Ouvre la fenetre en plein ecran")
 
-    p.add_argument("--style", choices=["rekordbox", "simple"], default="rekordbox",
-                    help="rekordbox = onde coloree par bande, facon platine: graves en bleu au "
-                         "centre, medium en orange, aigus en blanc sur les pointes. "
-                         "simple = trace d'une seule couleur (defaut: rekordbox)")
+    p.add_argument("--style", choices=["pencil", "rekordbox", "simple"], default="pencil",
+                    help="pencil = un seul trait blanc qui suit grossierement le contour de "
+                         "l'amplitude, sans remplissage. rekordbox = onde coloree par bande, "
+                         "facon platine: graves en bleu au centre, medium en orange, aigus en "
+                         "blanc sur les pointes. simple = onde pleine d'une seule couleur "
+                         "(defaut: pencil)")
     p.add_argument("--colors", default=None,
                     help=f"Couleur(s) du trace, separees par |. En --style rekordbox, trois "
-                         f"couleurs graves|medium|aigus (defaut: {'|'.join(REKORDBOX_COLORS)} "
-                         f"en rekordbox, {SIMPLE_COLOR} en simple)")
+                         f"couleurs graves|medium|aigus (defaut: {PENCIL_COLOR} en pencil, "
+                         f"{'|'.join(REKORDBOX_COLORS)} en rekordbox, {SIMPLE_COLOR} en simple)")
+    p.add_argument("--line-width", type=int, default=DEFAULT_LINE_WIDTH,
+                    help=f"Epaisseur du trait en pixels, pour --style pencil "
+                         f"(defaut: {DEFAULT_LINE_WIDTH})")
+    p.add_argument("--wave", type=int, nargs="?", const=WAVE_CYCLES, default=None,
+                    help=f"Trace une sinusoide bornee par l'amplitude, a la place du contour: "
+                         f"le trait oscille et l'enveloppe ne fait plus que le limiter. "
+                         f"Un nombre d'oscillations sur la largeur peut suivre l'option. "
+                         f"--style pencil seul (defaut sans l'option: contour; avec: "
+                         f"{WAVE_CYCLES} oscillations)")
     p.add_argument("--columns", type=int, default=None,
                     help=f"Nombre de colonnes dessinees, puis agrandies a la largeur voulue. "
-                         f"Moins = onde plus pleine et plus lisible, plus = detail fin facon "
-                         f"editeur audio. 0 = une colonne par pixel "
-                         f"(defaut: une colonne par {TARGET_COLUMN_MS:g} ms d'audio)")
+                         f"En --style pencil, nombre de points de la polyligne: c'est le reglage "
+                         f"de la grossierete du trait. Moins = onde plus pleine et plus lisible, "
+                         f"plus = detail fin facon editeur audio. 0 = une colonne par pixel "
+                         f"(defaut: {PENCIL_POINTS} points en pencil, sinon une colonne par "
+                         f"{TARGET_COLUMN_MS:g} ms d'audio)")
     p.add_argument("--crossover", default=None,
                     help=f"Coupures entre bandes en Hz, GRAVES,AIGUS, pour --style rekordbox "
                          f"(defaut: {DEFAULT_CROSSOVER[0]},{DEFAULT_CROSSOVER[1]})")
@@ -145,8 +187,19 @@ def parse_args() -> argparse.Namespace:
                          "independamment. Passe un nombre pour garder les ecarts de niveau "
                          "visibles d'une photo a l'autre (defaut: auto)")
 
+    p.add_argument("--draw-fps", type=int, default=DEFAULT_DRAW_FPS,
+                    help=f"Images par seconde du trace progressif. La photo n'est pas affichee "
+                         f"d'un coup: elle se dessine de gauche a droite, et le trait atteint le "
+                         f"bord droit pile au moment ou la photo suivante la remplace. "
+                         f"0 = affichage direct (defaut: {DEFAULT_DRAW_FPS})")
     p.add_argument("--save-dir", type=Path, default=None,
                     help="Enregistre aussi chaque photo en PNG dans ce dossier, cree au besoin")
+    p.add_argument("--rate", default="auto",
+                    help=f"Frequence d'echantillonnage de la capture, en Hz. 'auto' interroge le "
+                         f"peripherique et prend la sienne, ce qui supprime tout "
+                         f"reechantillonnage. Demander plus que ce qu'il fournit ne fait "
+                         f"qu'interpoler, sans gain de precision (defaut: auto, repli "
+                         f"{DEFAULT_CAPTURE_RATE})")
     p.add_argument("--buffer", type=int, default=DEFAULT_BUFFER_MS,
                     help=f"Tampon de capture en ms. Sans effet sur l'affichage, il absorbe les "
                          f"pauses de lecture pendant le rendu (defaut: {DEFAULT_BUFFER_MS})")
@@ -162,6 +215,18 @@ def parse_args() -> argparse.Namespace:
         if args.bpm <= 0 or args.beats <= 0:
             p.error("--bpm et --beats doivent etre superieurs a 0")
         args.interval = args.beats * 60.0 / args.bpm
+    if args.wave is not None and args.wave < 1:
+        p.error("--wave demande au moins une oscillation")
+    # None = a decider face au peripherique; un entier = impose par l'utilisateur.
+    if str(args.rate).strip().lower() == "auto":
+        args.rate = None
+    else:
+        try:
+            args.rate = int(args.rate)
+        except ValueError:
+            p.error(f"--rate invalide: {args.rate} (une frequence en Hz, ou 'auto')")
+        if args.rate < 8000:
+            p.error("--rate doit valoir au moins 8000 Hz")
     return args
 
 
@@ -186,6 +251,28 @@ def channel_count(args: argparse.Namespace) -> int:
     return 2 if (args.stereo or args.split_channels) else 1
 
 
+def capture_rate(args: argparse.Namespace) -> int:
+    """Frequence retenue pour la capture, une fois --rate resolu."""
+    return args.rate or DEFAULT_CAPTURE_RATE
+
+
+def probe_device_rate(args: argparse.Namespace) -> int | None:
+    """Frequence native du peripherique, lue en l'ouvrant une seconde.
+
+    Forcer une frequence differente de la sienne insere un reechantillonneur, qui est
+    un filtre: il coute du temps et lisse legerement les attaques, sans jamais rien
+    ajouter. Autant prendre ce que la carte produit.
+    """
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin"] + capture_input_args(args)
+        + ["-t", "0.2", "-f", "null", os.devnull],
+        capture_output=True, text=True, errors="replace",
+    )
+    # ffmpeg decrit le flux d'entree sur stderr: "Audio: pcm_s16le, 48000 Hz, stereo".
+    found = re.search(r"Audio:[^\n]*?(\d{4,6}) Hz", proc.stderr)
+    return int(found.group(1)) if found else None
+
+
 def describe_window(args: argparse.Namespace) -> str:
     """Ce que couvre une photo, en temps quand c'est --bpm/--beats qui l'a fixe."""
     if args.interval_from_beats:
@@ -194,7 +281,15 @@ def describe_window(args: argparse.Namespace) -> str:
 
 
 def resolve_colors(args: argparse.Namespace) -> list[str]:
-    """Couleurs du trace: trois bandes en rekordbox, une seule en simple."""
+    """Couleurs du trace: trois bandes en rekordbox, une seule ailleurs."""
+    if args.style == "pencil":
+        # Un seul trait, donc une seule couleur. Le style simple, lui, en accepte
+        # plusieurs: showwaves en donne une par canal avec --split-channels.
+        if args.colors and "|" in args.colors:
+            print(f"--style pencil ne trace qu'un trait, donc une seule couleur: {args.colors}",
+                  file=sys.stderr)
+            sys.exit(2)
+        return [args.colors or PENCIL_COLOR]
     if args.style == "simple":
         return [args.colors or SIMPLE_COLOR]
     if not args.colors:
@@ -211,8 +306,18 @@ def resolve_bg(args: argparse.Namespace) -> str:
     if args.bg_color:
         return args.bg_color
     # En rekordbox le fond fait partie du look, et un PNG a fond transparent n'aurait
-    # pas de sens pour une image qui imite un ecran de platine.
-    return REKORDBOX_BG if args.style == "rekordbox" else "black"
+    # pas de sens pour une image qui imite un ecran de platine. En pencil au contraire,
+    # un trait blanc sur noir franc est ce qui se rapproche le plus d'un trait de crayon.
+    if args.style == "rekordbox":
+        return REKORDBOX_BG
+    return PENCIL_BG if args.style == "pencil" else "black"
+
+
+def resolve_points(args: argparse.Namespace, width: int) -> int:
+    """Nombre de points de la polyligne du style pencil."""
+    if args.columns is not None:
+        return width if args.columns <= 0 else max(2, min(args.columns, width))
+    return min(PENCIL_POINTS, width)
 
 
 def resolve_columns(args: argparse.Namespace, width: int) -> int:
@@ -247,7 +352,11 @@ def resolve_crossover(args: argparse.Namespace) -> tuple[int, int]:
 
 def chunk_size(args: argparse.Namespace) -> int:
     """Octets de PCM correspondant a une photo."""
-    return int(CAPTURE_RATE * args.interval) * SAMPLE_BYTES * channel_count(args)
+    return int(capture_rate(args) * args.interval) * SAMPLE_BYTES * channel_count(args)
+
+
+def capture_input_args(args: argparse.Namespace) -> list[str]:
+    return ["-f", "dshow", "-audio_buffer_size", str(args.buffer), "-i", f"audio={args.device}"]
 
 
 def capture_command(args: argparse.Namespace) -> list[str]:
@@ -259,9 +368,8 @@ def capture_command(args: argparse.Namespace) -> list[str]:
     """
     return [
         "ffmpeg", "-hide_banner", "-loglevel", args.loglevel, "-nostdin",
-        "-f", "dshow", "-audio_buffer_size", str(args.buffer),
-        "-i", f"audio={args.device}",
-        "-ac", str(channel_count(args)), "-ar", str(CAPTURE_RATE),
+    ] + capture_input_args(args) + [
+        "-ac", str(channel_count(args)), "-ar", str(capture_rate(args)),
         "-f", "s16le", "-",
     ]
 
@@ -273,6 +381,9 @@ def render_command(args: argparse.Namespace, gain: float, size: tuple[int, int],
     showwavespic ne sort qu'une image, a la fin de son entree: c'est exactement une
     photo. Le bloc etant fini et deja en memoire, le rendu se termine tout seul.
     """
+    if args.style == "pencil":
+        raise ValueError("le style pencil est rasterise par render_pencil, pas par ffmpeg")
+
     width, height = size
     colors = resolve_colors(args)
     bg = resolve_bg(args)
@@ -360,7 +471,7 @@ def build_render_args(args: argparse.Namespace, graph: str, png: Path | None) ->
 
     return [
         "ffmpeg", "-hide_banner", "-loglevel", args.loglevel, "-nostdin",
-        "-f", "s16le", "-ar", str(CAPTURE_RATE), "-ac", str(channel_count(args)), "-i", "-",
+        "-f", "s16le", "-ar", str(capture_rate(args)), "-ac", str(channel_count(args)), "-i", "-",
         "-filter_complex", graph,
     ] + outputs
 
@@ -371,17 +482,22 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]
     Une image par photo suffit: privee de donnees, ffplay laisse la derniere a l'ecran,
     ce qui est precisement le comportement voulu entre deux rafraichissements.
 
-    La cadence annoncee vaut le double du rythme des photos: ffplay doit toujours
-    consommer plus vite qu'on ne le nourrit, sinon les images s'empilent dans sa file
-    et l'affichage prend un retard qui grandit. Trop vite, il attend simplement.
+    La cadence annoncee vaut le double du rythme reel des images: ffplay doit toujours
+    consommer plus vite qu'on ne le nourrit, sinon elles s'empilent dans sa file et
+    l'affichage prend un retard qui grandit. Trop vite, il attend simplement. Ce rythme
+    est celui du trace progressif quand il est actif, et celui des photos sinon.
     """
     width, height = size
+    if args.draw_fps > 0:
+        rate = str(2 * args.draw_fps)
+    else:
+        rate = f"2000/{max(1, round(args.interval * 1000))}"
     cmd = [
         "ffplay", "-hide_banner", "-loglevel", args.loglevel,
         "-fflags", "nobuffer", "-flags", "low_delay",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", f"{width}x{height}",
-        "-framerate", f"2000/{max(1, round(args.interval * 1000))}",
+        "-framerate", rate,
         "-i", "-", "-autoexit",
         "-window_title", f"audio2wave photo [{args.style}, {describe_window(args)}] - {args.device}",
     ]
@@ -453,6 +569,101 @@ def resolve_gain(args: argparse.Namespace, pcm: bytes) -> tuple[float, float | N
     return -peak + AUTO_GAIN_MARGIN_DB, peak
 
 
+def amplitude_envelope(pcm: bytes, points: int, channels: int) -> list[float]:
+    """Contour de l'amplitude: la crete de chaque tranche, ramenee entre 0 et 1.
+
+    C'est volontairement grossier: quelques dizaines de tranches sur toute la fenetre,
+    la ou une waveform classique en dessine une par pixel. On cherche la silhouette,
+    pas la forme d'onde.
+    """
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    frames = len(samples) // channels
+    if frames < 1:
+        return [0.0] * points
+
+    raw = []
+    for i in range(points):
+        start = frames * i // points
+        end = max(start + 1, frames * (i + 1) // points)
+        slice_ = samples[start * channels:end * channels]
+        raw.append(min(max(max(slice_), -min(slice_)), 32768) / 32768)
+
+    if PENCIL_SMOOTH <= 0:
+        return raw
+    # Moyenne glissante: adoucit les angles sans effacer les attaques, un trait de
+    # crayon ne fait pas de creneaux.
+    smoothed = []
+    for i in range(points):
+        lo = max(0, i - PENCIL_SMOOTH)
+        hi = min(points, i + PENCIL_SMOOTH + 1)
+        smoothed.append(sum(raw[lo:hi]) / (hi - lo))
+    return smoothed
+
+
+def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
+                  background: bytes, ink: bytes) -> bytes:
+    """Trace l'enveloppe au trait, sans passer par ffmpeg.
+
+    Aucun filtre ffmpeg ne dessine une polyligne d'enveloppe: showwavespic remplit une
+    silhouette, showwaves trace la forme d'onde elle-meme. Le trait est donc rasterise
+    ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
+
+    Pour chaque colonne, on peint le segment vertical qui relie la hauteur precedente a
+    la nouvelle: le trait reste continu meme quand l'enveloppe saute, la ou un simple
+    point par colonne laisserait des trous sur les attaques. C'est aussi ce qui rend
+    --wave possible, ou le trait devient franchement raide entre deux colonnes.
+    """
+    width, height = size
+    stride = width * 3
+    canvas = bytearray(background * (width * height))
+
+    env = amplitude_envelope(pcm, resolve_points(args, width), channel_count(args))
+    factor = 10 ** (gain / 20)
+    thickness = max(1, args.line_width)
+    center = (height - thickness) / 2
+    reach = center  # le trait touche le bord a amplitude pleine, epaisseur comprise
+
+    previous = None
+    for x in range(width):
+        # Position continue dans l'enveloppe, interpolee entre deux points: c'est ce
+        # qui donne des segments droits entre points, et non un escalier.
+        pos = x * (len(env) - 1) / max(1, width - 1)
+        left = int(pos)
+        right = min(left + 1, len(env) - 1)
+        value = env[left] + (env[right] - env[left]) * (pos - left)
+        offset = min(1.0, value * factor) * reach
+
+        if args.wave:
+            # Une seule ligne qui oscille, bornee par l'enveloppe au lieu de la suivre.
+            # La phase ne depend que de x: d'une photo a l'autre les cretes restent en
+            # place et seule leur hauteur bouge, ce qui evite un scintillement.
+            swing = offset * math.sin(2 * math.pi * args.wave * x / width)
+            heights = (int(round(center + swing)),)
+        else:
+            heights = (int(round(center - offset)), int(round(center + offset)))
+
+        for index, y_now in enumerate(heights):
+            y_prev = previous[index] if previous else y_now
+            for y in range(min(y_now, y_prev), max(y_now, y_prev) + thickness):
+                if 0 <= y < height:
+                    base = y * stride + x * 3
+                    canvas[base:base + 3] = ink
+        previous = heights
+
+    return bytes(canvas)
+
+
+def write_png(size: tuple[int, int], frame: bytes, png: Path) -> None:
+    """Enregistre une image deja rasterisee, ffmpeg ne servant plus qu'a encoder."""
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+         "-f", "rawvideo", "-pixel_format", "rgb24", "-video_size", f"{size[0]}x{size[1]}",
+         "-i", "-", "-frames:v", "1", str(png)],
+        input=frame, capture_output=True,
+    )
+
+
 def render_photo(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
                  png: Path | None) -> bytes | None:
     proc = subprocess.run(render_command(args, gain, size, png), input=pcm, capture_output=True)
@@ -461,6 +672,76 @@ def render_photo(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[
         print(f"Rendu echoue: {proc.stderr.decode(errors='replace').strip()[-400:]}", file=sys.stderr)
         return None
     return proc.stdout
+
+
+def probe_color(spec: str) -> bytes:
+    """Une couleur en trois octets RGB, telle que ffmpeg la comprend.
+
+    Python doit peindre lui-meme le fond du trace progressif et le trait du style
+    pencil, or --colors et --bg-color acceptent aussi bien 'navy' que '0x14161c'.
+    Plutot que de reimplementer l'analyse des noms de couleurs, on demande la reponse
+    a ffmpeg une fois pour toutes au demarrage.
+
+    format=rgb24 explicite: sans lui la source color passe par du yuv et la couleur
+    revient decalee d'un cran (0x14161c ressortait en 21,22,28), donc differente du
+    fond de la photo elle-meme. Ecart invisible, mais autant peindre la bonne couleur.
+    """
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-f", "lavfi", "-i", f"color=s=1x1:c={spec},format=rgb24",
+         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True,
+    )
+    return proc.stdout[:3] if len(proc.stdout) >= 3 else b"\x00\x00\x00"
+
+
+def send_frame(viewer: subprocess.Popen, frame) -> bool:
+    """Envoie une image a la fenetre. False si elle a ete fermee."""
+    try:
+        viewer.stdin.write(frame)
+        viewer.stdin.flush()
+        return True
+    except OSError:
+        return False
+
+
+def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, int],
+                       background: bytes, deadline: float, fps: int) -> bool:
+    """Dessine l'image de gauche a droite, pour atteindre le bord droit a l'echeance.
+
+    Le canevas est persistant et seules les colonnes nouvellement decouvertes y sont
+    recopiees: un pas ne coute alors que quelques dixiemes de milliseconde, contre une
+    reconstruction complete de l'image a chaque fois.
+
+    L'avancee est calculee sur l'horloge et non sur le numero de pas, pour que le trait
+    arrive au bout au bon moment meme si un pas a traine.
+    """
+    width, height = size
+    stride = width * 3
+    span = deadline - time.monotonic()
+    if fps <= 0 or span <= 0:
+        return send_frame(viewer, frame)  # pas le temps de dessiner: image d'un coup
+
+    canvas = bytearray(background * (width * height))
+    start = time.monotonic()
+    drawn = 0
+    period = 1.0 / fps
+
+    if not send_frame(viewer, canvas):  # efface la photo precedente
+        return False
+    while drawn < width:
+        time.sleep(max(0.0, min(period, deadline - time.monotonic())))
+        progress = (time.monotonic() - start) / span
+        target = width if progress >= 1 else max(drawn, int(width * progress))
+        if target == drawn:
+            continue
+        for y in range(height):
+            base = y * stride
+            canvas[base + drawn * 3:base + target * 3] = frame[base + drawn * 3:base + target * 3]
+        drawn = target
+        if not send_frame(viewer, canvas):
+            return False
+    return True
 
 
 def main() -> None:
@@ -490,9 +771,18 @@ def main() -> None:
 
     if args.dry_run:
         print(" ".join(f'"{c}"' if " " in c else c for c in capture_command(args)))
-        print("  |  (blocs de %d octets, %.3g s)" % (chunk_size(args), args.interval))
-        print(" ".join(f'"{c}"' if " " in c else c for c in
-                       render_command(args, 0.0, size, sample_png)))
+        print("  |  (blocs de %d octets, %.3g s%s)"
+              % (chunk_size(args), args.interval,
+                 "" if args.rate else f", frequence de repli {DEFAULT_CAPTURE_RATE} Hz: "
+                                      f"--rate auto interroge le peripherique au lancement"))
+        if args.style == "pencil":
+            forme = f"sinusoide de {args.wave} oscillations" if args.wave else "contour"
+            print(f"  (trace rasterise en Python: {forme} sur "
+                  f"{resolve_points(args, size[0])} points, trait de {args.line_width} px "
+                  f"en {resolve_colors(args)[0]} sur {resolve_bg(args)})")
+        else:
+            print(" ".join(f'"{c}"' if " " in c else c for c in
+                           render_command(args, 0.0, size, sample_png)))
         print("  |")
         print(" ".join(f'"{c}"' if " " in c else c for c in viewer_command(args, size)))
         return
@@ -500,13 +790,37 @@ def main() -> None:
     if args.save_dir:
         args.save_dir.mkdir(parents=True, exist_ok=True)
 
-    columns = resolve_columns(args, size[0])
+    if args.rate is None:
+        native = probe_device_rate(args)
+        if native:
+            args.rate = native
+            print(f"Capture a {native} Hz, la frequence du peripherique: aucun "
+                  f"reechantillonnage.", flush=True)
+        else:
+            args.rate = DEFAULT_CAPTURE_RATE
+            print(f"Frequence du peripherique non lisible, capture a "
+                  f"{DEFAULT_CAPTURE_RATE} Hz (voir --rate).", flush=True)
+    else:
+        print(f"Capture a {args.rate} Hz (impose).", flush=True)
+
     print(f"Photo {args.style} {size[0]}x{size[1]} des {describe_window(args)}, "
           f"soit {args.interval * 1000:.0f} ms, rafraichie au meme rythme.", flush=True)
-    print(f"{columns} colonnes, soit {args.interval * 1000 / columns:.2f} ms d'audio par colonne.",
-          flush=True)
+    if args.style == "pencil":
+        points = resolve_points(args, size[0])
+        forme = f"sinusoide de {args.wave} oscillations" if args.wave else "contour"
+        print(f"Trait de {args.line_width} px, {forme} sur {points} points, soit "
+              f"{args.interval * 1000 / points:.1f} ms d'audio par point.", flush=True)
+    else:
+        columns = resolve_columns(args, size[0])
+        print(f"{columns} colonnes, soit {args.interval * 1000 / columns:.2f} ms d'audio "
+              f"par colonne.", flush=True)
+    if args.draw_fps > 0:
+        print(f"Trace progressif a {args.draw_fps} img/s, termine pile au rafraichissement.",
+              flush=True)
     print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
 
+    background = probe_color(resolve_bg(args))
+    ink = probe_color(resolve_colors(args)[0])
     capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
     viewer = subprocess.Popen(viewer_command(args, size), stdin=subprocess.PIPE)
     capture = LiveCapture(capture_proc.stdout, chunk_size(args))
@@ -551,20 +865,26 @@ def main() -> None:
             png = (args.save_dir / f"waveform_{time.strftime('%Y%m%d_%H%M%S')}_{taken:04d}.png"
                    ) if args.save_dir else None
 
-            frame = render_photo(args, pcm, gain, size, png)
+            if args.style == "pencil":
+                frame = render_pencil(args, pcm, gain, size, background, ink)
+                if png:
+                    write_png(size, frame, png)
+            else:
+                frame = render_photo(args, pcm, gain, size, png)
             if frame is None:
-                break
-            try:
-                viewer.stdin.write(frame)
-                viewer.stdin.flush()
-            except OSError:  # fenetre fermee
                 break
 
             # Une ligne de statut reecrite sur place: a un temps par photo, une ligne
-            # par photo noierait le terminal.
+            # par photo noierait le terminal. Ecrite avant le trace, qui occupe tout le
+            # temps restant du creneau.
             level = "silence" if peak is None else f"crete {peak:5.1f} dBFS -> gain {gain:+5.1f} dB"
             print(f"\r[{time.strftime('%H:%M:%S')}] {level}"
                   f"{f' -> {png.name}' if png else ''}   ", end="", flush=True)
+
+            # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
+            # bord droit au moment ou la photo suivante prend sa place.
+            if not draw_progressively(viewer, frame, size, background, next_at, args.draw_fps):
+                break  # fenetre fermee
     except KeyboardInterrupt:
         pass
     finally:

@@ -193,8 +193,9 @@ agrandi (et flouté) par ffplay.
 # Photo de waveform — `audio2wave_snap.py`
 
 Meme entree live que `audio2wave_live.py`, mais **rien ne defile** : la fenetre
-affiche une image fixe du dernier temps joue, remplacee par une nouvelle a chaque
-temps. C'est la vue d'une platine, pas celle d'un spectrometre.
+montre le contour du dernier temps joue, **trace de gauche a droite** en accelere
+comme un crayon, et le trait atteint le bord droit pile au moment ou le temps suivant
+prend sa place.
 
 ## Usage
 
@@ -218,6 +219,65 @@ La cadence est calee sur l'horloge et non sur la fin du rendu, sinon chaque phot
 arriverait avec le retard cumule des rendus precedents. Si le rendu deborde de
 l'intervalle, le creneau est saute plutot que pris en retard, avec un avertissement.
 
+## Frequence d'echantillonnage
+
+`--rate auto` (defaut) **interroge le peripherique au lancement et prend sa
+frequence**, ce qui supprime tout reechantillonnage. C'est le seul gain de precision
+reel a attendre de ce reglage : la capture etait auparavant forcee a 44100 Hz, alors
+que la quasi-totalite des cartes son sous Windows travaillent a 48000 — chaque
+echantillon passait donc par un reechantillonneur, qui est un filtre, coute du temps
+et lisse legerement les attaques, sans jamais rien ajouter.
+
+**Monter au-dela de la frequence du peripherique n'apporte rien** : ffmpeg ne ferait
+qu'interpoler des valeurs absentes. Et meme a frequence reelle plus haute, le gain sur
+l'image est negligeable. Mesure de l'erreur sur la crete retenue par colonne, a un
+temps sur 1920 px (soit 0,244 ms par colonne) :
+
+| frequence | ech./colonne | erreur moyenne, contenu 2 kHz | pire cas |
+|---|---|---|---|
+| 44100 | 10,8 | 0,4 % | 3,9 % |
+| 48000 | 11,7 | 0,1 % | 3,4 % |
+| 96000 | 23,4 | 0,0 % | 0,9 % |
+| 192000 | 46,9 | 0,0 % | 0,2 % |
+
+Sur les graves, l'ecart entre crete vue et crete reelle ne bouge pas du tout avec la
+frequence (32,6 % a 44100 comme a 192000) : ce n'est pas une imprecision mais le
+regime voulu, une colonne de 0,244 ms ne couvrant que 2 % d'un cycle a 80 Hz, elle
+montre la forme d'onde plutot que son enveloppe.
+
+**Ce qui fait la precision de l'image, ce sont donc les pixels et les points, pas les
+Hz** : `--size` pour la resolution, `--columns` pour la finesse du trace, `--beats`
+pour la duree couverte.
+
+`--rate 48000` impose une valeur et evite la sonde. Celle-ci ouvre le peripherique une
+fraction de seconde avant la capture ; si votre carte n'aime pas etre reprise aussitot
+apres avoir ete relachee, c'est l'echappatoire.
+
+## Trace progressif
+
+L'image n'apparait pas d'un coup : elle se dessine colonne par colonne, et **le trait
+atteint le bord droit exactement au rafraichissement suivant**. Un creneau se deroule
+ainsi, a 128 BPM :
+
+| | `pencil` | styles ffmpeg |
+|---|---|---|
+| rendu de la photo | ~6 ms | ~95 ms |
+| balayage de gauche a droite | ~463 ms | ~375 ms |
+| **total** | **469 ms, un temps** | **469 ms, un temps** |
+
+Le balayage occupe donc tout le temps disponible et se termine sur le temps, a
+quelques millisecondes pres (mesure : +1 a +5 ms, la granularite des pauses sous
+Windows). Il ne couvre pas tout a fait un temps entier parce que le rendu occupe le
+debut du creneau — en `pencil` il n'en reste presque rien.
+
+L'avancee est calculee sur l'horloge et non sur le numero d'image : si un pas traine,
+le suivant rattrape au lieu de decaler la fin. Le canevas est persistant et seules les
+colonnes nouvellement decouvertes y sont recopiees — 0,4 ms par pas en 1920x360, 1 ms
+en 1080p, contre trois fois plus si l'image entiere etait reconstruite a chaque fois.
+
+`--draw-fps` regle la fluidite (30 img/s par defaut, soit 12 a 14 images par temps) ;
+`--draw-fps 0` revient a l'affichage direct de la photo entiere.
+
 Chaque photo est annoncee dans le terminal avec sa crete et le gain applique :
 
 ```
@@ -228,11 +288,47 @@ Chaque photo est annoncee dans le terminal avec sa crete et le gain applique :
 
 | style | rendu |
 |---|---|
-| `rekordbox` (defaut) | onde coloree par bande, facon platine : graves en bleu, medium en orange, aigus en blanc |
-| `simple` | onde d'une seule couleur, facon editeur audio |
+| `pencil` (defaut) | un seul trait blanc, sans remplissage : contour grossier de l'amplitude, ou sinusoide bornee par elle avec `--wave` |
+| `rekordbox` | onde coloree par bande, facon platine : graves en bleu, medium en orange, aigus en blanc |
+| `simple` | onde pleine d'une seule couleur, facon editeur audio |
 
-Le style `rekordbox` empile **trois traces du plus large au plus etroit**, et non
-trois bandes cote a cote :
+### `pencil`
+
+Pas de couleur, pas de remplissage : l'amplitude est reduite a **une polyligne de
+96 points** par defaut, dessinee en blanc sur noir, en haut et en bas du centre. A
+96 points sur 1920 px, un segment fait une vingtaine de pixels et le trait reste
+franchement anguleux, comme une esquisse. `--columns` regle cette grossierete
+(`--columns 40` pour un trait plus lisse encore, `--columns 240` pour coller de plus
+pres a l'onde), `--line-width` l'epaisseur, `--colors` et `--bg-color` les deux
+couleurs.
+
+**`--wave`** remplace le contour par une **sinusoide bornee par l'amplitude** : le
+trait oscille, et l'enveloppe ne fait plus que limiter son ampleur. Une attaque
+devient une grande oscillation qui se resserre ensuite, ce qui donne un visuel plus
+vivant qu'un simple contour. Le nombre d'oscillations sur la largeur peut suivre
+l'option — `--wave` seul en met 24, `--wave 12` les etale, `--wave 48` les resserre :
+
+```bash
+python audio2wave_snap.py -d "<entree>" --wave
+python audio2wave_snap.py -d "<entree>" --wave 12 --line-width 3
+```
+
+La phase ne depend que de la position horizontale : d'une photo a l'autre les cretes
+restent en place et seule leur hauteur change, ce qui evite un scintillement d'un
+temps sur l'autre.
+
+Ce style est **rasterise en Python, pas par ffmpeg** : aucun filtre ne dessine une
+polyligne d'enveloppe, `showwavespic` remplit une silhouette et `showwaves` trace la
+forme d'onde elle-meme. Pour chaque colonne, le segment vertical reliant la hauteur
+precedente a la nouvelle est peint, ce qui garde le trait continu meme sur une
+attaque, la ou un point par colonne laisserait des trous. Effet de bord notable : le
+rendu tombe de ~95 ms a **~6 ms** par photo, et le trace progressif recupere ce temps
+(463 ms de balayage sur un temps de 469 ms, contre 375 ms avec les styles ffmpeg).
+
+### `rekordbox`
+
+Empile **trois traces du plus large au plus etroit**, et non trois bandes cote a
+cote :
 
 | trace | signal | couleur |
 |---|---|---|
@@ -256,14 +352,18 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--bpm <n>` | tempo de reference | `128` |
 | `--beats <n>` | temps par photo **et** delai entre deux photos | `1` |
 | `--interval <s>` | la meme duree en secondes, a la place de `--bpm/--beats` | - |
-| `--style` | `rekordbox` \| `simple` | `rekordbox` |
-| `--columns <n>` | colonnes dessinees avant agrandissement ; `0` = une par pixel | voir plus bas |
+| `--style` | `pencil` \| `rekordbox` \| `simple` | `pencil` |
+| `--columns <n>` | points de la polyligne en `pencil`, colonnes dessinees sinon | `96` en `pencil` |
+| `--line-width <n>` | epaisseur du trait, `pencil` seul | `2` |
+| `--wave [n]` | sinusoide bornee par l'amplitude au lieu du contour, `pencil` seul | contour ; `24` avec l'option |
 | `--crossover <g,a>` | coupures entre bandes, en Hz | `200,2000` |
 | `--gain auto\|<dB>` | `auto` normalise chaque photo sur sa propre crete | `auto` |
 | `--scale` | `lin` \| `sqrt` \| `cbrt` \| `log` | `lin` |
 | `--filter-mode peak\|average` | crete gardee ou enveloppe lissee par colonne | `peak` |
-| `--save-dir <dir>` | ecrit aussi chaque photo en PNG | - |
+| `--draw-fps <n>` | fluidite du trace progressif ; `0` = affichage direct | `30` |
+| `--save-dir <dir>` | ecrit aussi chaque photo en PNG (image entiere) | - |
 | `--size` | resolution | largeur de l'ecran, tiers de sa hauteur |
+| `--rate auto\|<Hz>` | frequence d'echantillonnage de la capture | `auto` |
 | `--buffer <ms>` | tampon de capture | `50` |
 
 `--colors`, `--bg-color`, `--stereo`, `--split-channels`, `--fullscreen`,
@@ -328,10 +428,10 @@ qui finissent en bloc bleu plein ou l'on ne distingue plus les kicks.
   n'acceptent pas d'etre reprises aussitot. Le PCM brut transite par Python.
 - **`showwavespic` ne sort qu'une image**, a la fin de son entree : c'est exactement
   une photo, et le rendu se termine tout seul puisque le bloc est fini.
-- **Une image envoyee par photo suffit a ffplay** : prive de donnees, il laisse la
-  derniere a l'ecran, ce qui est precisement le comportement voulu entre deux
-  rafraichissements. La cadence qu'on lui annonce vaut le double du rythme reel des
-  photos : il doit toujours consommer plus vite qu'on ne le nourrit, sinon les images
+- **ffplay ne recoit que des images completes**, une par pas du trace : le dessin se
+  fait cote Python, sur un canevas garde en memoire. Prive de donnees, ffplay laisse la
+  derniere image a l'ecran. La cadence qu'on lui annonce vaut le double du rythme reel
+  des images : il doit toujours consommer plus vite qu'on ne le nourrit, sinon elles
   s'empilent dans sa file et l'affichage prend un retard qui grandit.
 - **Un fil vide le tube de capture en permanence**, et garde une fenetre glissante.
   Sans lui, le rendu (~100 ms) serait une pause pendant laquelle personne ne lit le
