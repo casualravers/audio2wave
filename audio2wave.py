@@ -7,10 +7,12 @@ Styles disponibles:
     spectrum  spectrogramme defilant, temps en X et frequence en Y (showspectrum)
     waveform  oscillogramme classique (showwaves)
 
+La source est cherchee dans asset/ et le rendu ecrit dans output/ (voir --asset-dir / --output-dir).
+
 Exemples:
-    python audio2wave.py voix.wav voix_bars.mov
-    python audio2wave.py voix.wav voix_radio.mov --style radio --colors cyan
-    python audio2wave.py voix.wav voix_spec.webm --style spectrum --format webm --colormap rainbow
+    python audio2wave.py voix.wav                       -> output/voix_analyzer.mov
+    python audio2wave.py voix.wav --style radio --colors cyan
+    python audio2wave.py voix.wav clip.webm --format webm --style spectrum --colormap rainbow
     python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
 """
 
@@ -35,8 +37,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("input", type=Path, help="Fichier audio source (.wav)")
-    p.add_argument("output", type=Path, help="Fichier video de sortie")
+    p.add_argument("input", type=Path,
+                    help="Fichier audio source (.wav). S'il n'existe pas tel quel, il est cherche "
+                         "dans --asset-dir")
+    p.add_argument("output", type=Path, nargs="?", default=None,
+                    help="Fichier video de sortie. Un nom simple atterrit dans --output-dir, un "
+                         "chemin contenant un dossier est respecte tel quel. Omis, le nom est "
+                         "deduit de la source et du style")
+    p.add_argument("--asset-dir", type=Path, default=Path("asset"),
+                    help="Dossier des fichiers audio source (defaut: asset)")
+    p.add_argument("--output-dir", type=Path, default=Path("output"),
+                    help="Dossier des videos generees, cree au besoin (defaut: output)")
 
     p.add_argument("--style", choices=["analyzer", "radio", "spectrum", "waveform"], default="analyzer",
                     help="analyzer = barres facon spectrometre, radio = courbe ondulante, "
@@ -216,12 +227,29 @@ def build_codec_args(args: argparse.Namespace) -> list[str]:
     return vcodec, acodec
 
 
-def resolve_output_path(output: Path, fmt: str) -> Path:
-    expected_ext = FORMAT_INFO[fmt]["ext"]
+def resolve_input(args: argparse.Namespace) -> Path:
+    if args.input.exists():
+        return args.input
+    in_assets = args.asset_dir / args.input
+    if in_assets.exists():
+        return in_assets
+    print(f"Fichier introuvable: {args.input} (ni dans {args.asset_dir})", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_output(args: argparse.Namespace, source: Path) -> Path:
+    expected_ext = FORMAT_INFO[args.format]["ext"]
+
+    if args.output is None:
+        return args.output_dir / f"{source.stem}_{args.style}{expected_ext}"
+
+    output = args.output
     if output.suffix.lower() != expected_ext:
-        fixed = output.with_suffix(expected_ext)
-        print(f"Note: extension ajustee pour --format {fmt} -> {fixed.name}")
-        return fixed
+        output = output.with_suffix(expected_ext)
+        print(f"Note: extension ajustee pour --format {args.format} -> {output.name}")
+    # Un nom seul va dans le dossier de sortie; un chemin explicite reste ou il est.
+    if output.parent == Path("."):
+        output = args.output_dir / output
     return output
 
 
@@ -238,18 +266,17 @@ def main() -> None:
         )
         sys.exit(1)
 
-    if not args.input.exists():
-        print(f"Fichier introuvable: {args.input}", file=sys.stderr)
-        sys.exit(1)
+    source = resolve_input(args)
+    output = resolve_output(args, source)
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    output = resolve_output_path(args.output, args.format)
     filter_complex = build_filter(args)
     vcodec, acodec = build_codec_args(args)
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", args.loglevel, "-stats"]
     if args.yes:
         cmd.append("-y")
-    cmd += ["-i", str(args.input)]
+    cmd += ["-i", str(source)]
 
     cmd += ["-filter_complex", filter_complex, "-map", "[v]"]
     if args.keep_audio:
