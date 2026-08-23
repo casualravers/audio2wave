@@ -1,2 +1,4 @@
 # Rendus generes par audio2wave.py
 output/
+
+__pycache__/
