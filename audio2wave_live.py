@@ -71,6 +71,9 @@ def parse_args() -> argparse.Namespace:
                          "line = courbe continue. Ignore en --style radio (defaut: bar)")
     p.add_argument("--colors", default="cyan",
                     help="Couleur(s) du trace, separees par | (defaut: cyan)")
+    p.add_argument("--bg-color", default="black",
+                    help="Couleur du fond, independante de --colors. Accepte un nom (white, navy) "
+                         "ou un code 0xRRGGBB (defaut: black)")
     p.add_argument("--bars", type=int, default=None,
                     help="Nombre de barres/points. Moins = moins de calcul "
                          "(defaut: 128 en analyzer, 240 en radio)")
@@ -253,11 +256,24 @@ def build_filter(args: argparse.Namespace) -> str:
     chain.append(f"scale={width}:{height}{flags}")
     chain.append("setsar=1")
     if bar_mode and args.bar_gap > 0:
-        # Separateurs noirs: le fond etant noir, ils creusent l'espace entre les barres.
+        # Separateurs noirs, rendus transparents plus bas quand un fond est demande.
         thickness = max(1, round(width / bars * args.bar_gap))
         chain.append(f"drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black")
 
-    return "[0:a]" + ",".join(chain) + "[v]"
+    trace = "[0:a]" + ",".join(chain)
+    if args.bg_color.lower() in ("black", "0x000000", "#000000"):
+        # Le noir est deja ce qu'on obtient sans rien faire: le fond des filtres est
+        # transparent, et la conversion en rgb24 pour l'affichage le rend noir.
+        return trace + "[v]"
+
+    # Detoure le noir (fond des filtres et separateurs entre barres) puis compose sur
+    # la couleur demandee. overlay respecte l'alpha, donc le trace garde exactement sa
+    # couleur au lieu d'etre melange au fond.
+    return (
+        f"{trace},format=rgba,colorkey=0x000000:0.03:0.15[trace];"
+        f"color=s={width}x{height}:c={args.bg_color}:r={args.fps}[bg];"
+        f"[bg][trace]overlay=shortest=1[v]"
+    )
 
 
 def describe_mode(args: argparse.Namespace) -> str:

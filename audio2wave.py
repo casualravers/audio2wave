@@ -298,14 +298,20 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
         stage = f"[0:a]{pre}{draw}{post}[freqs]"
         node = "freqs"
 
+    # Detoure le noir: le fond des filtres, mais aussi les separateurs entre barres,
+    # qui doivent laisser voir le fond et non rester noirs.
+    keyed = f"[{node}]format=rgba,colorkey=0x000000:{args.colorkey_similarity}:{args.colorkey_blend}"
+
     if transparent:
-        tail = (
-            f"[{node}]format=rgba,colorkey=0x000000:{args.colorkey_similarity}:{args.colorkey_blend}[v]"
-        )
+        tail = f"{keyed}[v]"
     elif args.bg_color.lower() not in ("black", "0x000000", "#000000"):
+        # overlay compose en respectant l'alpha: le trace garde exactement sa couleur,
+        # alors qu'un blend la melangeait a celle du fond. shortest=1 borne en prime la
+        # source color, infinie par nature: sans ca le rendu ne se terminait jamais.
         tail = (
+            f"{keyed}[keyed];"
             f"color=s={args.size}:c={args.bg_color}:r={args.fps}[bg];"
-            f"[bg][{node}]blend=all_mode=screen[v]"
+            f"[bg][keyed]overlay=shortest=1[v]"
         )
     else:
         tail = f"[{node}]copy[v]"
@@ -396,10 +402,6 @@ def main() -> None:
         cmd += ["-map", "0:a"] + acodec
     else:
         cmd += ["-an"]
-
-    if args.no_transparent and args.bg_color.lower() not in ("black", "0x000000", "#000000"):
-        # the `color=` background source is infinite; stop once the audio-derived stream ends.
-        cmd.append("-shortest")
 
     cmd += vcodec + [str(output)]
 

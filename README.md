@@ -41,6 +41,7 @@ python audio2wave.py <source.wav> [sortie] [options]
 |---|---|---|
 | `--shape bar\|line` | forme du trace pour `--style analyzer` | `bar` |
 | `--colors` | couleur(s) du trace, separees par `\|` | `white` |
+| `--bg-color` | couleur du fond (avec `--no-transparent`) | `black` |
 | `--gain auto\|<dB>` | niveau avant analyse ; `auto` mesure la crete et remplit l'image | `auto` |
 | `--averaging <n>` | lissage temporel (1 = nerveux, 20+ = pose) | `10` |
 | `--bars <n>` | nombre de barres/points (0 = pleine resolution) | `128` (analyzer) / largeur/4 (radio) |
@@ -90,6 +91,12 @@ python audio2wave_live.py -d "<entree>" --shape line             # courbe de spe
 python audio2wave_live.py -d "<entree>" --style radio --gain -10 # onde temporelle
 ```
 
+Le fond se regle separement du trace, dans les deux programmes :
+
+```bash
+python audio2wave_live.py -d "<entree>" --colors cyan --bg-color navy
+```
+
 | mode | rendu | latence |
 |---|---|---|
 | `--style analyzer --shape bar` (defaut) | barres facon egaliseur | ~180 ms |
@@ -111,6 +118,7 @@ touche deja les bords a crete normalisee, alors qu'une barre reste loin du plafo
 | `--buffer <ms>` | tampon de capture ; trop bas = coupures | `50` |
 | `--averaging <n>` | lissage ; **poste de latence principal**, analyzer seul | `6` |
 | `--win-size <n>` | fenetre FFT ; plus petit = plus reactif, moins precis | auto (max 512) |
+| `--bg-color` | couleur du fond, independante de `--colors` | `black` |
 | `--size` | resolution de rendu | `960x540`, ou l'ecran avec `--fullscreen` |
 | `--fullscreen` | plein ecran | - |
 
