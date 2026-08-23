@@ -39,6 +39,63 @@ FORMAT_INFO = {
     "mp4": {"ext": ".mp4", "container": "mp4"},
 }
 
+# Ambiances: fond en degrade anime (filtre gradients), halo lumineux autour du trace,
+# et rotation lente de la teinte du trace. glow est le rayon de flou applique au quart
+# de resolution (voir compose_scene), hue est en degres par seconde.
+THEMES = {
+    "aurora": {"colors": ("0x030d1a", "0x0a3d4f", "0x14856b", "0x7ee8b0"),
+               "type": "linear", "speed": 0.006, "glow": 5.0, "hue": 20.0},
+    "sunset": {"colors": ("0x1a0526", "0x6b1240", "0xc94f2d", "0xffb36b"),
+               "type": "linear", "speed": 0.008, "glow": 5.0, "hue": 12.0},
+    # radial plutot que spiral: mesure a 15.3s contre 20.3s pour 30s d'audio, et le
+    # spiral faisait passer l'ensemble halo compris au-dessus du temps reel en direct.
+    "nebula": {"colors": ("0x03010a", "0x1b0a3d", "0x4a1a6b", "0x2a1a5c"),
+               "type": "radial", "speed": 0.004, "glow": 6.0, "hue": 35.0},
+    "ocean": {"colors": ("0x01121f", "0x02304a", "0x046b8a", "0x0aa5b5"),
+              "type": "radial", "speed": 0.005, "glow": 5.0, "hue": 18.0},
+    "ember": {"colors": ("0x0a0300", "0x3d1004", "0x8a2b06", "0xd96a1e"),
+              "type": "radial", "speed": 0.006, "glow": 6.0, "hue": 8.0},
+}
+
+
+def resolve_theme(args: argparse.Namespace) -> dict:
+    """Reglages d'ambiance, avec les surcharges explicites appliquees par-dessus."""
+    base = dict(THEMES[args.theme]) if args.theme != "flat" else {"glow": 0.0, "hue": 0.0}
+    if args.glow is not None:
+        base["glow"] = args.glow
+    if args.hue_cycle is not None:
+        base["hue"] = args.hue_cycle
+    return base
+
+
+def gradient_source(theme: dict, width: int, height: int, fps: int) -> str:
+    colors = "".join(f":c{i}={c}" for i, c in enumerate(theme["colors"]))
+    return (f"gradients=s={width}x{height}:r={fps}:n={len(theme['colors'])}{colors}"
+            f":type={theme['type']}:speed={theme['speed']}")
+
+
+def compose_scene(trace: str, background: str | None, glow: float,
+                  width: int, height: int) -> str:
+    """Assemble le trace (deja detoure) et son fond en un graphe se terminant sur [v]."""
+    if glow <= 0:
+        if background is None:
+            return f"{trace}[v]"
+        return f"{trace}[t];{background}[bg];[bg][t]overlay=shortest=1[v]"
+
+    # Flouter au quart de resolution puis agrandir: halo visuellement identique, mais
+    # mesure a 23.7s contre 29.2s pour 30s d'audio, ce qui garde de la marge en direct.
+    layers = (
+        f"{trace},split[sharp][soft];"
+        f"[soft]scale=iw/4:ih/4,gblur=sigma={glow},scale={width}:{height}[halo];"
+    )
+    if background is None:
+        return layers + "[halo][sharp]overlay[v]"
+    return (
+        layers
+        + f"{background}[bg];[bg][halo]overlay=shortest=1[lit];"
+          f"[lit][sharp]overlay=shortest=1[v]"
+    )
+
 
 def gain_value(raw: str) -> float | str:
     if raw.strip().lower() == "auto":
@@ -145,6 +202,16 @@ def parse_args() -> argparse.Namespace:
                     help="Desactive l'alpha: composite sur un fond de couleur pleine (--bg-color)")
     p.add_argument("--bg-color", default="black",
                     help="Couleur de fond utilisee avec --no-transparent (defaut: black)")
+    p.add_argument("--theme", choices=["flat"] + sorted(THEMES), default="flat",
+                    help="Ambiance: fond en degrade anime, halo lumineux et teinte du trace "
+                         "qui derive lentement. flat = fond uni --bg-color (defaut: flat)")
+    p.add_argument("--glow", type=float, default=None,
+                    help="Rayon du halo lumineux autour du trace. 0 desactive. Fonctionne aussi "
+                         "sans --theme, y compris en sortie transparente (defaut: selon le theme)")
+    p.add_argument("--hue-cycle", type=float, default=None,
+                    help="Derive de la teinte du trace, en degres par seconde. 0 desactive. "
+                         "Sans effet sur un trace blanc ou noir, qui n'a pas de teinte a tourner "
+                         "(defaut: selon le theme)")
     p.add_argument("--colorkey-similarity", type=float, default=0.03,
                     help="Tolerance du colorkey pour detourer le noir (defaut: 0.03)")
     p.add_argument("--colorkey-blend", type=float, default=0.15,
@@ -298,25 +365,35 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
         stage = f"[0:a]{pre}{draw}{post}[freqs]"
         node = "freqs"
 
+    theme = resolve_theme(args)
+    plain_black = args.bg_color.lower() in ("black", "0x000000", "#000000")
+
+    # Rien a composer: le fond noir est deja ce que donne la conversion finale.
+    if args.theme == "flat" and not transparent and plain_black \
+            and not theme["glow"] and not theme["hue"]:
+        return f"{stage};[{node}]copy[v]"
+
+    trace = f"[{node}]"
+    if theme["hue"]:
+        # La rotation de teinte laisse le noir inchange (il n'a pas de teinte), donc le
+        # detourage qui suit fonctionne toujours sur le fond et sur les separateurs.
+        trace += f"hue=h='t*{theme['hue']}',"
     # Detoure le noir: le fond des filtres, mais aussi les separateurs entre barres,
     # qui doivent laisser voir le fond et non rester noirs.
-    keyed = f"[{node}]format=rgba,colorkey=0x000000:{args.colorkey_similarity}:{args.colorkey_blend}"
+    trace += f"format=rgba,colorkey=0x000000:{args.colorkey_similarity}:{args.colorkey_blend}"
 
-    if transparent:
-        tail = f"{keyed}[v]"
-    elif args.bg_color.lower() not in ("black", "0x000000", "#000000"):
+    width, height = parse_size(args.size)
+    if args.theme != "flat":
+        background = gradient_source(theme, width, height, args.fps)
+    elif transparent:
+        background = None
+    else:
         # overlay compose en respectant l'alpha: le trace garde exactement sa couleur,
         # alors qu'un blend la melangeait a celle du fond. shortest=1 borne en prime la
         # source color, infinie par nature: sans ca le rendu ne se terminait jamais.
-        tail = (
-            f"{keyed}[keyed];"
-            f"color=s={args.size}:c={args.bg_color}:r={args.fps}[bg];"
-            f"[bg][keyed]overlay=shortest=1[v]"
-        )
-    else:
-        tail = f"[{node}]copy[v]"
+        background = f"color=s={args.size}:c={args.bg_color}:r={args.fps}"
 
-    return f"{stage};{tail}"
+    return f"{stage};{compose_scene(trace, background, theme['glow'], width, height)}"
 
 
 def build_codec_args(args: argparse.Namespace) -> list[str]:
@@ -382,6 +459,11 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if args.theme != "flat" and not args.no_transparent:
+        # Un fond en degrade remplit toute l'image: il ne reste rien a rendre transparent.
+        print(f"Note: --theme {args.theme} fournit un fond, la sortie devient opaque.")
+        args.no_transparent = True
 
     source = resolve_input(args)
     output = resolve_output(args, source)

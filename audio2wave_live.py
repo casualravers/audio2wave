@@ -20,7 +20,9 @@ import shutil
 import subprocess
 import sys
 
-from audio2wave import auto_win_size, parse_size
+from audio2wave import (
+    THEMES, auto_win_size, compose_scene, gradient_source, parse_size, resolve_theme,
+)
 
 # Meme logique que audio2wave.py: au-dessus d'une normalisation de crete, ce qu'il
 # faut ajouter pour que le trace remplisse l'image. Sert a conseiller --gain.
@@ -74,6 +76,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bg-color", default="black",
                     help="Couleur du fond, independante de --colors. Accepte un nom (white, navy) "
                          "ou un code 0xRRGGBB (defaut: black)")
+    p.add_argument("--theme", choices=["flat"] + sorted(THEMES), default="flat",
+                    help="Ambiance: fond en degrade anime, halo lumineux et teinte du trace qui "
+                         "derive lentement. flat = fond uni --bg-color (defaut: flat)")
+    p.add_argument("--glow", type=float, default=None,
+                    help="Rayon du halo lumineux autour du trace. 0 desactive. C'est l'effet le "
+                         "plus couteux: a baisser en premier si l'affichage saccade "
+                         "(defaut: selon le theme)")
+    p.add_argument("--hue-cycle", type=float, default=None,
+                    help="Derive de la teinte du trace, en degres par seconde. 0 desactive. Sans "
+                         "effet sur un trace blanc, qui n'a pas de teinte a tourner "
+                         "(defaut: selon le theme)")
     p.add_argument("--bars", type=int, default=None,
                     help="Nombre de barres/points. Moins = moins de calcul "
                          "(defaut: 128 en analyzer, 240 en radio)")
@@ -260,20 +273,29 @@ def build_filter(args: argparse.Namespace) -> str:
         thickness = max(1, round(width / bars * args.bar_gap))
         chain.append(f"drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black")
 
+    theme = resolve_theme(args)
     trace = "[0:a]" + ",".join(chain)
-    if args.bg_color.lower() in ("black", "0x000000", "#000000"):
+    plain_black = args.bg_color.lower() in ("black", "0x000000", "#000000")
+
+    if args.theme == "flat" and plain_black and not theme["glow"] and not theme["hue"]:
         # Le noir est deja ce qu'on obtient sans rien faire: le fond des filtres est
         # transparent, et la conversion en rgb24 pour l'affichage le rend noir.
         return trace + "[v]"
 
-    # Detoure le noir (fond des filtres et separateurs entre barres) puis compose sur
-    # la couleur demandee. overlay respecte l'alpha, donc le trace garde exactement sa
-    # couleur au lieu d'etre melange au fond.
-    return (
-        f"{trace},format=rgba,colorkey=0x000000:0.03:0.15[trace];"
-        f"color=s={width}x{height}:c={args.bg_color}:r={args.fps}[bg];"
-        f"[bg][trace]overlay=shortest=1[v]"
-    )
+    if theme["hue"]:
+        # Le noir n'ayant pas de teinte, la rotation le laisse intact et le detourage
+        # qui suit continue de fonctionner.
+        trace += f",hue=h='t*{theme['hue']}'"
+    # Detoure le noir (fond des filtres et separateurs entre barres) pour que le fond
+    # apparaisse a la place. overlay respecte l'alpha, donc le trace garde sa couleur.
+    trace += ",format=rgba,colorkey=0x000000:0.03:0.15"
+
+    if args.theme != "flat":
+        background = gradient_source(theme, width, height, args.fps)
+    else:
+        background = f"color=s={width}x{height}:c={args.bg_color}:r={args.fps}"
+
+    return compose_scene(trace, background, theme["glow"], width, height)
 
 
 def describe_mode(args: argparse.Namespace) -> str:
