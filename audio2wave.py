@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Genere une video de spectre frequentiel (ou waveform) a partir d'un fichier .wav via ffmpeg.
+"""Genere une video reactive a l'audio (analyseur de spectre, spectrogramme, waveform) via ffmpeg.
+
+Styles disponibles:
+    analyzer  barres verticales facon spectrometre / egaliseur graphique (showfreqs, defaut)
+    radio     courbe de spectre qui ondule, facon onde radio de dessin anime (showfreqs)
+    spectrum  spectrogramme defilant, temps en X et frequence en Y (showspectrum)
+    waveform  oscillogramme classique (showwaves)
 
 Exemples:
-    python audio2wave.py voix.wav voix_spec.mov
-    python audio2wave.py voix.wav voix_spec.webm --format webm --colormap rainbow
-    python audio2wave.py voix.wav voix_wave.mov --style waveform --mode cline
+    python audio2wave.py voix.wav voix_bars.mov
+    python audio2wave.py voix.wav voix_radio.mov --style radio --colors cyan
+    python audio2wave.py voix.wav voix_spec.webm --style spectrum --format webm --colormap rainbow
     python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
 """
 
@@ -32,8 +38,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("input", type=Path, help="Fichier audio source (.wav)")
     p.add_argument("output", type=Path, help="Fichier video de sortie")
 
-    p.add_argument("--style", choices=["waveform", "spectrum"], default="spectrum",
-                    help="waveform = showwaves, spectrum = showspectrum (defaut: spectrum)")
+    p.add_argument("--style", choices=["analyzer", "radio", "spectrum", "waveform"], default="analyzer",
+                    help="analyzer = barres facon spectrometre, radio = courbe ondulante, "
+                         "spectrum = spectrogramme defilant, waveform = oscillogramme (defaut: analyzer)")
     p.add_argument("--format", choices=list(FORMAT_INFO), default="prores4444",
                     help="Codec/conteneur de sortie (defaut: prores4444)")
     p.add_argument("--size", default="1920x1080", help="Resolution WIDTHxHEIGHT (defaut: 1920x1080)")
@@ -43,11 +50,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["point", "line", "p2p", "cline"], default="cline",
                     help="Style de trace pour --style waveform (defaut: cline)")
     p.add_argument("--colors", default="white",
-                    help="Couleur(s) de la waveform, separees par des virgules (defaut: white)")
+                    help="Couleur(s) du trace, separees par | (defaut: white). "
+                         "Utilise par --style analyzer, radio et waveform")
     p.add_argument("--wave-scale", choices=["lin", "log", "sqrt", "cbrt"], default="lin",
                     help="Echelle d'amplitude pour --style waveform (defaut: lin)")
     p.add_argument("--split-channels", action="store_true",
                     help="Affiche chaque canal audio separement (waveform)")
+
+    # showfreqs (styles analyzer / radio)
+    p.add_argument("--bars", type=int, default=None,
+                    help="Nombre de barres/points pour analyzer/radio. Le trace est rendu a cette "
+                         "largeur puis agrandi, ce qui donne des barres epaisses facon spectrometre. "
+                         "0 = pleine resolution, tres fin (defaut: 64 en analyzer, 240 en radio)")
+    p.add_argument("--bar-gap", type=float, default=0.25,
+                    help="Espace entre les barres pour --style analyzer, en fraction de la largeur "
+                         "d'une barre. 0 = barres jointives (defaut: 0.25)")
+    p.add_argument("--gain", type=float, default=0.0,
+                    help="Gain en dB applique avant l'analyse, pour remplir la hauteur de l'image "
+                         "sur un enregistrement discret (defaut: 0)")
+    p.add_argument("--stereo", action="store_true",
+                    help="Trace chaque canal separement pour analyzer/radio. Par defaut l'audio est "
+                         "reduit en mono pour obtenir une forme unique et lisible")
+    p.add_argument("--freq-scale", choices=["lin", "log", "rlog"], default="log",
+                    help="Repartition des frequences en X pour analyzer/radio. "
+                         "log = aigus compresses, rendu proche d'un vrai spectrometre (defaut: log)")
+    p.add_argument("--amp-scale", choices=["lin", "sqrt", "cbrt", "log"], default=None,
+                    help="Echelle d'amplitude pour analyzer/radio "
+                         "(defaut: log en analyzer, cbrt en radio)")
+    p.add_argument("--win-size", type=int, default=2048,
+                    help="Taille de fenetre FFT pour analyzer/radio: plus grand = plus de barres fines "
+                         "(defaut: 2048)")
+    p.add_argument("--averaging", type=int, default=1,
+                    help="Lissage temporel pour analyzer/radio: 1 = tres reactif, 8-16 = plus fluide "
+                         "(defaut: 1)")
+    p.add_argument("--channel-mode", choices=["combined", "separate"], default="combined",
+                    help="Canaux superposes ou empiles pour analyzer/radio (defaut: combined)")
 
     # showspectrum
     p.add_argument("--colormap", default="intensity",
@@ -78,24 +115,66 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def parse_size(size: str) -> tuple[int, int]:
+    try:
+        width, height = (int(part) for part in size.lower().split("x", 1))
+    except ValueError:
+        print(f"Resolution invalide: {size} (attendu WIDTHxHEIGHT, ex. 1920x1080)", file=sys.stderr)
+        sys.exit(2)
+    return width, height
+
+
 def build_filter(args: argparse.Namespace) -> str:
     transparent = not args.no_transparent
 
     if args.style == "waveform":
-        colors = f":colors={args.colors}"
         split = ":split_channels=1" if args.split_channels else ""
         stage = (
             f"[0:a]showwaves=s={args.size}:mode={args.mode}:rate={args.fps}"
-            f":scale={args.wave_scale}{colors}{split}[wave]"
+            f":scale={args.wave_scale}:colors={args.colors}{split}[wave]"
         )
         node = "wave"
-    else:
+    elif args.style == "spectrum":
         legend = "1" if args.legend else "0"
         stage = (
             f"[0:a]showspectrum=s={args.size}:mode={args.spectrum_mode}"
             f":color={args.colormap}:scale={args.spectrum_scale}:fps={args.fps}:legend={legend}[spec]"
         )
         node = "spec"
+    else:  # analyzer / radio
+        width, height = parse_size(args.size)
+        # Des barres larges et une onde fine ne veulent pas la meme finesse de trace.
+        bars = args.bars if args.bars is not None else (64 if args.style == "analyzer" else 240)
+        amp_scale = args.amp_scale or ("log" if args.style == "analyzer" else "cbrt")
+        # Tracer etroit puis agrandir: c'est ce qui epaissit le trait au lieu de laisser des aiguilles.
+        draw_w = bars if bars > 0 else width
+        # neighbor garde les bords francs; une interpolation lisse delaverait le trace.
+        post = f",scale={width}:{height}:flags=neighbor" if bars > 0 else ""
+
+        pre = "" if args.stereo else "aformat=channel_layouts=mono,"
+        if args.gain:
+            pre += f"volume={args.gain}dB,"
+
+        if args.style == "analyzer":
+            draw = (
+                f"showfreqs=s={draw_w}x{height}:rate={args.fps}:mode=bar"
+                f":ascale={amp_scale}:fscale={args.freq_scale}:win_size={args.win_size}"
+                f":averaging={args.averaging}:cmode={args.channel_mode}:colors={args.colors}"
+            )
+            if bars > 0 and args.bar_gap > 0:
+                # Separateurs noirs: le colorkey les rend transparents, et en fond plein un blend
+                # screen les laisse invisibles. D'ou des barres detachees dans les deux cas.
+                thickness = max(1, round(width / bars * args.bar_gap))
+                post += f",drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black"
+        else:
+            # radio: onde temporelle centree, la forme que l'on reconnait comme "onde sonore".
+            draw = (
+                f"showwaves=s={draw_w}x{height}:rate={args.fps}:mode=cline"
+                f":scale={amp_scale}:colors={args.colors}"
+            )
+
+        stage = f"[0:a]{pre}{draw}{post}[freqs]"
+        node = "freqs"
 
     if transparent:
         tail = (
