@@ -248,7 +248,9 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
         # Tracer etroit puis agrandir: c'est ce qui epaissit le trait au lieu de laisser des aiguilles.
         draw_w = bars if bars > 0 else width
         # neighbor garde les bords francs; une interpolation lisse delaverait le trace.
-        post = f",scale={width}:{height}:flags=neighbor" if bars > 0 else ""
+        # setsar=1: sans ca, scale recalcule le SAR pour preserver le DAR de l'image
+        # etroite d'avant agrandissement, et les lecteurs affichent la video ecrasee.
+        post = f",scale={width}:{height}:flags=neighbor,setsar=1" if bars > 0 else ""
 
         # fltp: sans virgule flottante, un gain auto de +40 dB ecreterait l'audio et
         # deformerait le spectre au lieu de simplement agrandir le trace.
