@@ -78,17 +78,38 @@ python audio2wave_live.py -d "<entree>" --gain 34     # lance l'affichage
 
 `--tune` est l'etape a faire une fois la carte son branchee et la platine lancee :
 un flux live n'a pas de crete connue a l'avance, contrairement a un fichier, donc
-`--gain` ne peut pas etre automatique.
+`--gain` ne peut pas etre automatique. Il donne la valeur pour chacun des modes.
+
+## Modes d'affichage
+
+Le mode se choisit au lancement (relancer pour en changer) :
+
+```bash
+python audio2wave_live.py -d "<entree>"                          # barres
+python audio2wave_live.py -d "<entree>" --shape line             # courbe de spectre
+python audio2wave_live.py -d "<entree>" --style radio --gain -10 # onde temporelle
+```
+
+| mode | rendu | latence |
+|---|---|---|
+| `--style analyzer --shape bar` (defaut) | barres facon egaliseur | ~180 ms |
+| `--style analyzer --shape line` | courbe de spectre continue | ~180 ms |
+| `--style radio` | onde temporelle centree | **~50 ms** |
+
+`radio` n'utilise ni FFT ni lissage : c'est nettement le mode le plus reactif.
+**Son gain n'est pas le meme** que celui de l'analyzer (40 dB d'ecart) — une onde
+touche deja les bords a crete normalisee, alors qu'une barre reste loin du plafond.
 
 ## Options specifiques
 
 | option | role | defaut |
 |---|---|---|
 | `-d`, `--device` | entree DirectShow a capturer | requis |
-| `--tune` | mesure le niveau et conseille un `--gain` | - |
-| `--gain <dB>` | niveau avant analyse | `30` |
+| `--tune` | mesure le niveau et conseille un `--gain` par mode | - |
+| `--style` | `analyzer` \| `radio` | `analyzer` |
+| `--gain <dB>` | niveau avant analyse | `30` (analyzer) / `-10` (radio) |
 | `--buffer <ms>` | tampon de capture ; trop bas = coupures | `50` |
-| `--averaging <n>` | lissage ; **le poste de latence le plus cher** | `6` |
+| `--averaging <n>` | lissage ; **poste de latence principal**, analyzer seul | `6` |
 | `--win-size <n>` | fenetre FFT ; plus petit = plus reactif, moins precis | auto (max 512) |
 | `--size` | resolution de la fenetre | `960x540` |
 | `--fullscreen` | plein ecran | - |
@@ -98,9 +119,9 @@ un flux live n'a pas de crete connue a l'avance, contrairement a un fichier, don
 
 ## Latence
 
-Affichee au demarrage, avec son detail. Aux valeurs par defaut : **~180 ms**
-(capture 50 + fenetre FFT 32 + lissage 100). Le lissage domine — c'est le premier
-levier a baisser si le rendu semble en retard sur la musique :
+Affichee au demarrage, avec son detail. En analyzer, aux valeurs par defaut :
+**~180 ms** (capture 50 + fenetre FFT 32 + lissage 100). Le lissage domine — c'est
+le premier levier a baisser si le rendu semble en retard sur la musique :
 
 ```bash
 python audio2wave_live.py -d "<entree>" --averaging 2 --buffer 20

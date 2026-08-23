@@ -23,8 +23,17 @@ import sys
 from audio2wave import auto_win_size, parse_size
 
 # Meme logique que audio2wave.py: au-dessus d'une normalisation de crete, ce qu'il
-# faut ajouter pour que les barres remplissent l'image. Sert a conseiller --gain.
-ANALYZER_BOOST_DB = 18.0
+# faut ajouter pour que le trace remplisse l'image. Sert a conseiller --gain.
+# Les deux styles sont a 40 dB d'ecart: une onde temporelle touche deja les bords
+# a crete normalisee, alors qu'une barre isolee reste loin du plafond.
+STYLE_BOOST_DB = {"analyzer": 18.0, "radio": -22.0}
+
+# Gain par defaut, faute de pouvoir mesurer un flux live a l'avance. Cale sur une
+# entree ligne classique (crete vers -12 dBFS); --tune donne la valeur exacte.
+DEFAULT_GAIN_DB = {"analyzer": 30.0, "radio": -10.0}
+
+# Une onde a besoin de plus de points qu'un banc de barres pour rester lisible.
+DEFAULT_BARS = {"analyzer": 48, "radio": 160}
 
 # Plafond de fenetre FFT en temps reel. auto_win_size vise la finesse maximale
 # compatible avec les fps; ici on prefere une fenetre courte, car sa duree
@@ -48,30 +57,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tune-seconds", type=float, default=3.0,
                     help="Duree de la mesure --tune en secondes (defaut: 3)")
 
+    p.add_argument("--style", choices=["analyzer", "radio"], default="analyzer",
+                    help="analyzer = spectre (barres ou courbe, voir --shape), "
+                         "radio = onde temporelle centree (defaut: analyzer)")
     p.add_argument("--shape", choices=["bar", "line"], default="bar",
-                    help="bar = barres separees, line = courbe continue (defaut: bar)")
+                    help="Forme du trace pour --style analyzer: bar = barres separees, "
+                         "line = courbe continue. Ignore en --style radio (defaut: bar)")
     p.add_argument("--colors", default="cyan",
                     help="Couleur(s) du trace, separees par | (defaut: cyan)")
-    p.add_argument("--bars", type=int, default=48,
-                    help="Nombre de barres/points. Moins = moins de calcul (defaut: 48)")
+    p.add_argument("--bars", type=int, default=None,
+                    help="Nombre de barres/points. Moins = moins de calcul "
+                         "(defaut: 48 en analyzer, 160 en radio)")
     p.add_argument("--bar-gap", type=float, default=0.25,
                     help="Espace entre barres, en fraction de leur largeur. Ignore en --shape line "
-                         "(defaut: 0.25)")
+                         "et en --style radio (defaut: 0.25)")
     p.add_argument("--size", default="960x540",
                     help="Resolution de la fenetre WIDTHxHEIGHT. Plus petit = moins de donnees a "
                          "transferer et a afficher (defaut: 960x540)")
     p.add_argument("--fps", type=int, default=30, help="Images par seconde (defaut: 30)")
 
-    p.add_argument("--gain", type=float, default=30.0,
+    p.add_argument("--gain", type=float, default=None,
                     help="Gain en dB avant analyse. Contrairement au mode fichier, un flux live n'a "
                          "pas de crete connue a l'avance: utilise --tune pour trouver la valeur "
-                         "adaptee a ta carte son (defaut: 30)")
+                         "adaptee a ta carte son (defaut: 30 en analyzer, -10 en radio)")
     p.add_argument("--averaging", type=int, default=6,
-                    help="Lissage temporel. Attention, chaque image moyennee retarde l'affichage: "
-                         "c'est le reglage qui coute le plus cher en reactivite (defaut: 6)")
+                    help="Lissage temporel du spectre. Attention, chaque image moyennee retarde "
+                         "l'affichage: c'est le reglage qui coute le plus cher en reactivite. "
+                         "Sans effet en --style radio (defaut: 6)")
     p.add_argument("--max-freq", type=int, default=8000,
                     help="Frequence la plus haute affichee, en Hz. Reechantillonner plus bas allege "
-                         "aussi la FFT. 0 = pleine bande (defaut: 8000)")
+                         "aussi la FFT. Sans effet en --style radio, qui n'analyse pas les "
+                         "frequences. 0 = pleine bande (defaut: 8000)")
     p.add_argument("--win-size", type=int, default=None,
                     help=f"Taille de fenetre FFT. Plus petit = plus reactif mais frequences plus "
                          f"grossieres (defaut: auto, plafonne a {LIVE_WIN_SIZE_CAP})")
@@ -116,6 +132,14 @@ def list_audio_devices() -> list[str]:
     return re.findall(r'"([^"]+)"\s*\(audio\)', proc.stderr)
 
 
+def resolve_gain(args: argparse.Namespace) -> float:
+    return args.gain if args.gain is not None else DEFAULT_GAIN_DB[args.style]
+
+
+def resolve_bars(args: argparse.Namespace) -> int:
+    return args.bars if args.bars is not None else DEFAULT_BARS[args.style]
+
+
 def capture_input_args(args: argparse.Namespace) -> list[str]:
     return [
         "-f", "dshow",
@@ -149,42 +173,67 @@ def tune(args: argparse.Namespace) -> None:
         print("\nSignal quasi nul: la carte son ne recoit probablement rien "
               "(mauvaise entree, cable, ou volume de la platine a zero).")
         return
-    print(f"\n  --gain {-peak_db + ANALYZER_BOOST_DB:.0f}")
+    # Le gain conseille depend du style: les deux sont a 40 dB d'ecart.
+    print(f"\n  --style {args.style} --gain {-peak_db + STYLE_BOOST_DB[args.style]:.0f}")
+    other = "radio" if args.style == "analyzer" else "analyzer"
+    print(f"  --style {other} --gain {-peak_db + STYLE_BOOST_DB[other]:.0f}")
 
 
 def build_filter(args: argparse.Namespace) -> str:
     width, height = parse_size(args.size)
-    rate = args.max_freq * 2 if args.max_freq > 0 else 44100
-    win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
+    bars = resolve_bars(args)
+    gain = resolve_gain(args)
+    bar_mode = args.style == "analyzer" and args.shape == "bar"
 
     # fltp: le gain doit pouvoir depasser 0 dBFS sans ecreter le signal analyse.
     layout = "" if args.stereo else ":channel_layouts=mono"
     chain = [f"aformat=sample_fmts=fltp{layout}"]
-    if args.gain:
-        chain.append(f"volume={args.gain}dB")
-    if args.max_freq > 0:
-        # Borne la bande affichee, et allege la FFT au passage.
-        chain.append(f"aresample={rate}")
+    if gain:
+        chain.append(f"volume={gain}dB")
 
-    chain.append(
-        f"showfreqs=s={args.bars}x{height}:rate={args.fps}:mode={args.shape}"
-        f":ascale={args.amp_scale}:fscale={args.freq_scale}:win_size={win_size}"
-        f":averaging={args.averaging}:colors={args.colors}"
-    )
+    if args.style == "analyzer":
+        rate = args.max_freq * 2 if args.max_freq > 0 else 44100
+        win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
+        if args.max_freq > 0:
+            # Borne la bande affichee, et allege la FFT au passage.
+            chain.append(f"aresample={rate}")
+        chain.append(
+            f"showfreqs=s={bars}x{height}:rate={args.fps}:mode={args.shape}"
+            f":ascale={args.amp_scale}:fscale={args.freq_scale}:win_size={win_size}"
+            f":averaging={args.averaging}:colors={args.colors}"
+        )
+    else:
+        # radio: onde temporelle centree. Pas de FFT, donc ni fenetre ni lissage,
+        # ni interet a borner la bande: c'est le style le plus reactif des deux.
+        chain.append(
+            f"showwaves=s={bars}x{height}:rate={args.fps}:mode=cline"
+            f":scale={args.amp_scale}:colors={args.colors}"
+        )
+
     # Dessiner etroit puis agrandir: le gros du travail se fait sur {bars} colonnes.
     # neighbor pour des barres franches, interpolation lissee pour une courbe.
-    flags = ":flags=neighbor" if args.shape == "bar" else ""
+    flags = ":flags=neighbor" if bar_mode else ""
     chain.append(f"scale={width}:{height}{flags}")
     chain.append("setsar=1")
-    if args.shape == "bar" and args.bar_gap > 0:
+    if bar_mode and args.bar_gap > 0:
         # Separateurs noirs: le fond etant noir, ils creusent l'espace entre les barres.
-        thickness = max(1, round(width / args.bars * args.bar_gap))
-        chain.append(f"drawgrid=w=iw/{args.bars}:h=ih:t={thickness}:c=black")
+        thickness = max(1, round(width / bars * args.bar_gap))
+        chain.append(f"drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black")
 
     return "[0:a]" + ",".join(chain) + "[v]"
 
 
+def describe_mode(args: argparse.Namespace) -> str:
+    return f"analyzer {args.shape}" if args.style == "analyzer" else "radio"
+
+
 def report_latency(args: argparse.Namespace) -> None:
+    if args.style == "radio":
+        # showwaves lit les echantillons directement: ni fenetre FFT ni moyenne.
+        print(f"Latence approximative: ~{args.buffer} ms (capture seule), hors affichage.\n"
+              "Pour reduire: --buffer plus bas.", flush=True)
+        return
+
     rate = args.max_freq * 2 if args.max_freq > 0 else 44100
     win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
     window_ms = win_size / rate * 1000
@@ -235,7 +284,8 @@ def main() -> None:
         "-fflags", "nobuffer", "-flags", "low_delay",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", f"{width}x{height}", "-framerate", str(args.fps),
-        "-i", "-", "-autoexit", "-window_title", f"audio2wave live - {args.device}",
+        "-i", "-", "-autoexit",
+        "-window_title", f"audio2wave live [{describe_mode(args)}] - {args.device}",
     ]
     if args.fullscreen:
         viewer.append("-fs")
