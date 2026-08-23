@@ -68,8 +68,13 @@ def parse_args() -> argparse.Namespace:
                     help="Dossier des videos generees, cree au besoin (defaut: output)")
 
     p.add_argument("--style", choices=["analyzer", "radio", "spectrum", "waveform"], default="analyzer",
-                    help="analyzer = barres facon spectrometre, radio = courbe ondulante, "
-                         "spectrum = spectrogramme defilant, waveform = oscillogramme (defaut: analyzer)")
+                    help="analyzer = spectre facon spectrometre (barres ou ligne, voir --shape), "
+                         "radio = courbe ondulante, spectrum = spectrogramme defilant, "
+                         "waveform = oscillogramme (defaut: analyzer)")
+    p.add_argument("--shape", choices=["bar", "line"], default="bar",
+                    help="Forme du trace pour --style analyzer: bar = barres separees facon "
+                         "egaliseur, line = courbe continue facon spectrometre analogique "
+                         "(defaut: bar)")
     p.add_argument("--format", choices=list(FORMAT_INFO), default="prores4444",
                     help="Codec/conteneur de sortie (defaut: prores4444)")
     p.add_argument("--size", default="1920x1080", help="Resolution WIDTHxHEIGHT (defaut: 1920x1080)")
@@ -92,8 +97,9 @@ def parse_args() -> argparse.Namespace:
                          "largeur puis agrandi, ce qui donne des barres epaisses facon spectrometre. "
                          "0 = pleine resolution, tres fin (defaut: 64 en analyzer, 240 en radio)")
     p.add_argument("--bar-gap", type=float, default=0.25,
-                    help="Espace entre les barres pour --style analyzer, en fraction de la largeur "
-                         "d'une barre. 0 = barres jointives (defaut: 0.25)")
+                    help="Espace entre les barres pour --style analyzer --shape bar, en fraction de "
+                         "la largeur d'une barre. 0 = barres jointives, ignore en --shape line "
+                         "(defaut: 0.25)")
     p.add_argument("--gain", type=gain_value, default="auto",
                     help="Gain en dB applique avant l'analyse. 'auto' mesure la crete du fichier et "
                          "la remonte pour remplir la hauteur de l'image, ce qui evite de regler le "
@@ -248,10 +254,13 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
         amp_scale = args.amp_scale or "cbrt"
         # Tracer etroit puis agrandir: c'est ce qui epaissit le trait au lieu de laisser des aiguilles.
         draw_w = bars if bars > 0 else width
-        # neighbor garde les bords francs; une interpolation lisse delaverait le trace.
+        # bar: neighbor garde les bords francs, une interpolation lisse delaverait les barres.
+        # line: l'interpolation par defaut (bilineaire) adoucit le zigzag en courbe continue;
+        # neighbor y produirait des marches d'escalier au lieu d'une ligne.
+        flags = ":flags=neighbor" if args.style == "analyzer" and args.shape == "bar" else ""
         # setsar=1: sans ca, scale recalcule le SAR pour preserver le DAR de l'image
         # etroite d'avant agrandissement, et les lecteurs affichent la video ecrasee.
-        post = f",scale={width}:{height}:flags=neighbor,setsar=1" if bars > 0 else ""
+        post = f",scale={width}:{height}{flags},setsar=1" if bars > 0 else ""
 
         # fltp: sans virgule flottante, un gain auto de +40 dB ecreterait l'audio et
         # deformerait le spectre au lieu de simplement agrandir le trace.
@@ -265,13 +274,14 @@ def build_filter(args: argparse.Namespace, gain: float = 0.0,
         if args.style == "analyzer":
             win_size = args.win_size or auto_win_size(analysis_rate, args.fps)
             draw = (
-                f"showfreqs=s={draw_w}x{height}:rate={args.fps}:mode=bar"
+                f"showfreqs=s={draw_w}x{height}:rate={args.fps}:mode={args.shape}"
                 f":ascale={amp_scale}:fscale={args.freq_scale}:win_size={win_size}"
                 f":averaging={args.averaging}:cmode={args.channel_mode}:colors={args.colors}"
             )
-            if bars > 0 and args.bar_gap > 0:
+            if args.shape == "bar" and bars > 0 and args.bar_gap > 0:
                 # Separateurs noirs: le colorkey les rend transparents, et en fond plein un blend
                 # screen les laisse invisibles. D'ou des barres detachees dans les deux cas.
+                # N'a pas de sens en ligne: il n'y a pas de barres individuelles a separer.
                 thickness = max(1, round(width / bars * args.bar_gap))
                 post += f",drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black"
         else:
