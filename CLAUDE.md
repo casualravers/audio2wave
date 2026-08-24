@@ -60,14 +60,28 @@ resolution de chemins.
   scripts : il n'y a pas de boucle Python par image ici, le tube `source.stdout ->
   display.stdin` est direct (voir ci-dessus, deliberement pour la latence). `run()`
   supervise donc un cycle spawn/attente/nettoyage (`spawn()`, factoree de l'ancien
-  `main()`) et le rejoue entierement quand `restart_event` est positionne (clic sur
-  "Appliquer" dans `build_gui()`) : ancienne paire terminee, nouvelle paire lancee
-  avec les `args` a jour. `stop_event` sort de la boucle definitivement ; il est aussi
-  positionne automatiquement des que `display.poll()` n'est plus `None` (fenetre
-  fermee par l'utilisateur), pour que ce cas arrete tout au lieu de relancer. Verifie
-  sans peripherique reel en substituant `spawn()` par une paire `ffmpeg -f lavfi
-  testsrc -> ffplay` : redemarrage confirme par des PID differents a chaque cycle,
-  fermeture de fenetre confirmee par `stop_event` sans nouvelle paire.
+  `main()`) et le rejoue quand `restart_event` est positionne (clic sur "Appliquer"
+  dans `build_gui()`).
+  **Le redemarrage est masque, pas seulement declenche** : la nouvelle paire est
+  lancee *avant* que l'ancienne ne soit fermee (`RESTART_GRACE_S = 0.3` s de
+  coexistence), et `find_window_position()` (ctypes/`user32.FindWindowW` +
+  `GetWindowRect`, meme famille que `primary_screen_size()`) retrouve la position de
+  la fenetre en cours pour la passer en `-left`/`-top` a la nouvelle instance
+  ffplay : le changement se voit comme une mise a jour sur place, pas une fenetre qui
+  se ferme puis se rouvre ailleurs. Si la nouvelle paire echoue dans la fenetre de
+  grace (`poll()` non `None` sur l'un des deux process), elle est nettoyee et
+  l'ancienne paire, `source`/`display`, **n'est pas touchee** : `run()` retombe dans
+  la boucle d'attente sur la paire encore active au lieu de retenter un `spawn()`
+  immediatement — un premier brouillon retentait en boucle et finissait par tuer la
+  paire fonctionnelle, attrape par un test avec un `spawn()` qui echoue une fois puis
+  reussit. `stop_event` sort de la boucle definitivement ; il est aussi positionne
+  automatiquement des que `display.poll()` n'est plus `None` (fenetre fermee par
+  l'utilisateur), pour que ce cas arrete tout au lieu de relancer. Verifie sans
+  peripherique reel en substituant `spawn()` par une paire `ffmpeg -f lavfi testsrc
+  -> ffplay` : chevauchement bref des deux paires confirme (ancienne encore vivante
+  pendant que la nouvelle tourne deja), position reprise confirmee via
+  `find_window_position`, paire precedente preservee sur un echec simule, fermeture
+  de fenetre confirmee par `stop_event` sans nouvelle paire.
 - [audio2wave_snap.py](audio2wave_snap.py) — photo fixe, rafraichie au meme rythme que sa
   duree, tracee progressivement. Duree en temps plutot qu'en secondes (`--bpm`/`--beats`,
   defaut 4 temps soit une mesure a 4/4). Deux familles de rendu: `--style pencil` (defaut)

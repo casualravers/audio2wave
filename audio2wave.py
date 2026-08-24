@@ -11,7 +11,7 @@ La source est cherchee dans asset/ et le rendu ecrit dans output/ (voir --asset-
 
 Exemples:
     python audio2wave.py voix.wav                       -> output/voix_analyzer.mov
-    python audio2wave.py voix.wav --style radio --colors cyan
+    python audio2wave.py voix.wav --style radio --colors grey
     python audio2wave.py voix.wav clip.webm --format webm --style spectrum --colormap rainbow
     python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
 """
