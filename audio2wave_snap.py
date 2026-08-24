@@ -27,6 +27,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import tkinter as tk
+except ImportError:  # tkinter absent de certaines installations minimales de Python
+    tk = None
+
 from audio2wave import gain_value, parse_size
 from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
 
@@ -249,6 +254,11 @@ def parse_args() -> argparse.Namespace:
                          f"d'un coup: elle se dessine de gauche a droite, et le trait atteint le "
                          f"bord droit pile au moment ou la photo suivante la remplace. "
                          f"0 = affichage direct (defaut: {DEFAULT_DRAW_FPS})")
+    p.add_argument("--gui", action="store_true",
+                    help="Ouvre une petite fenetre de reglages (tkinter) pour modifier le "
+                         "style, les couleurs, l'epaisseur, --wave, les points/colonnes, "
+                         "l'echelle, le crossover et la cadence du trace pendant que le "
+                         "programme tourne, sans le relancer")
     p.add_argument("--save-dir", type=Path, default=None,
                     help="Enregistre aussi chaque photo en PNG dans ce dossier, cree au besoin")
     p.add_argument("--rate", default="auto",
@@ -821,6 +831,263 @@ def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, 
     return True
 
 
+def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
+             stop_event: threading.Event, finished_event: threading.Event) -> None:
+    """Petite fenetre de reglages en direct.
+
+    Ne touche a rien d'autre qu'aux attributs de `args`: le fil de rendu (run(), dans
+    un thread separe) les relit a chaque photo, donc un changement ici prend effet a
+    la photo suivante, sans redemarrer la capture ni la fenetre ffplay. Aucun verrou:
+    une simple affectation d'attribut (int/float/str) est atomique sous le GIL, ce qui
+    suffit ici.
+    """
+    width = size[0]
+    root = tk.Tk()
+    root.title("audio2wave snap - reglages")
+    root.resizable(False, False)
+    row = 0
+
+    def next_row() -> int:
+        nonlocal row
+        row += 1
+        return row - 1
+
+    style_var = tk.StringVar(value=args.style)
+
+    def on_style_change() -> None:
+        args.style = style_var.get()
+        # Les couleurs par defaut dependent du style (resolve_colors/resolve_bg):
+        # vider les champs laisse ces fonctions choisir la bonne valeur plutot que
+        # de garder une couleur pensee pour l'ancien style (rekordbox exige trois
+        # couleurs separees par |, pencil/simple une seule).
+        colors_var.set("")
+        bg_var.set("")
+        args.colors = None
+        args.bg_color = None
+
+    tk.Label(root, text="Style").grid(row=next_row(), column=0, sticky="w", padx=8, pady=4)
+    style_frame = tk.Frame(root)
+    style_frame.grid(row=row - 1, column=1, sticky="w", padx=8, pady=4)
+    for value in ("pencil", "rekordbox", "simple"):
+        tk.Radiobutton(style_frame, text=value, variable=style_var, value=value,
+                       command=on_style_change).pack(side="left")
+
+    def add_slider(label: str, attr: str, lo: float, hi: float, step: float,
+                  initial: float | None = None) -> None:
+        r = next_row()
+        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        var = tk.DoubleVar(value=initial if initial is not None else getattr(args, attr))
+        is_int = step >= 1
+
+        def on_change(_value: str) -> None:
+            setattr(args, attr, int(var.get()) if is_int else round(var.get(), 3))
+
+        tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal",
+                variable=var, length=220, showvalue=True, command=on_change,
+                ).grid(row=r, column=1, padx=8, pady=4)
+
+    def add_entry(label: str, attr: str, width_chars: int = 20) -> tk.StringVar:
+        r = next_row()
+        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        var = tk.StringVar(value=getattr(args, attr) or "")
+
+        def apply(_evt=None) -> None:
+            setattr(args, attr, var.get().strip() or None)
+
+        entry = tk.Entry(root, textvariable=var, width=width_chars)
+        entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        entry.bind("<Return>", apply)
+        entry.bind("<FocusOut>", apply)
+        return var
+
+    def add_dropdown(label: str, attr: str, choices: tuple[str, ...]) -> None:
+        r = next_row()
+        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        var = tk.StringVar(value=getattr(args, attr))
+
+        def on_change(*_args) -> None:
+            setattr(args, attr, var.get())
+
+        var.trace_add("write", on_change)
+        tk.OptionMenu(root, var, *choices).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+
+    colors_var = add_entry("Couleur(s) (vide = defaut)", "colors")
+    bg_var = add_entry("Couleur de fond (vide = defaut)", "bg_color")
+    add_slider("Epaisseur du trait (px, pencil)", "line_width", 1, 10, 1)
+
+    wave_on = tk.BooleanVar(value=args.wave is not None)
+    wave_cycles = tk.IntVar(value=args.wave if args.wave else WAVE_CYCLES)
+
+    def on_wave_change() -> None:
+        args.wave = wave_cycles.get() if wave_on.get() else None
+
+    r = next_row()
+    tk.Checkbutton(root, text="--wave (sinusoide, pencil)", variable=wave_on,
+                  command=on_wave_change).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    tk.Scale(root, from_=1, to=64, resolution=1, orient="horizontal", variable=wave_cycles,
+            length=220, showvalue=True,
+            command=lambda _v: on_wave_change()).grid(row=r, column=1, padx=8, pady=4)
+
+    add_slider("Points / colonnes (0=plein)", "columns", 0, 400, 4,
+              initial=args.columns if args.columns is not None else PENCIL_POINTS)
+    add_dropdown("Echelle (rekordbox/simple)", "scale", ("lin", "log", "sqrt", "cbrt"))
+    add_dropdown("Filtre colonne (rekordbox/simple)", "filter_mode", ("peak", "average"))
+
+    low0, high0 = DEFAULT_CROSSOVER
+    if args.crossover:
+        try:
+            low0, high0 = (int(p) for p in args.crossover.split(","))
+        except ValueError:
+            pass
+    low_var = tk.StringVar(value=str(low0))
+    high_var = tk.StringVar(value=str(high0))
+
+    def apply_crossover(_evt=None) -> None:
+        args.crossover = f"{low_var.get().strip()},{high_var.get().strip()}"
+
+    r = next_row()
+    tk.Label(root, text="Crossover Hz (rekordbox)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    cross_frame = tk.Frame(root)
+    cross_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    for var in (low_var, high_var):
+        entry = tk.Entry(cross_frame, textvariable=var, width=8)
+        entry.pack(side="left", padx=(0, 6))
+        entry.bind("<Return>", apply_crossover)
+        entry.bind("<FocusOut>", apply_crossover)
+
+    add_slider("Images/s du trace", "draw_fps", 0, 60, 1)
+
+    status_label = tk.Label(root, text="", justify="left", anchor="w")
+    status_label.grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 8))
+
+    def refresh() -> None:
+        status_label.config(text=status.get("text", ""))
+        if finished_event.is_set():
+            root.destroy()
+            return
+        root.after(200, refresh)
+
+    root.protocol("WM_DELETE_WINDOW", stop_event.set)
+    refresh()
+    root.mainloop()
+    # La fenetre peut se fermer avant la fin du rendu (Ctrl+C au clavier, peripherique
+    # perdu...): on demande l'arret et on laisse main() attendre la fin propre du fil.
+    stop_event.set()
+
+
+def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink: bytes,
+       capture_proc: subprocess.Popen, viewer: subprocess.Popen, capture: LiveCapture,
+       status: dict, stop_event: threading.Event, finished_event: threading.Event) -> None:
+    """Boucle de capture/rendu/affichage. Tourne dans un fil separe quand --gui est
+    actif (pour laisser tkinter posseder le fil principal), directement dans main()
+    sinon.
+    """
+    last_bg = resolve_bg(args)
+    last_colors = resolve_colors(args)[0]
+
+    # Cadence calee sur l'horloge, et non sur la fin du rendu: sinon chaque photo
+    # arriverait avec le retard cumule des rendus precedents et glisserait par rapport
+    # au tempo. La premiere photo attend d'avoir une fenetre pleine.
+    next_at = time.monotonic() + args.interval
+    warned_slow = False
+    taken = 0
+
+    try:
+        while True:
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            # Rendu trop lent pour la cadence: on saute le creneau manque au lieu de
+            # prendre du retard. Mieux vaut une photo sur deux, a l'heure. En marche
+            # normale la boucle n'avance que d'un cran.
+            missed = 0
+            while next_at <= time.monotonic():
+                next_at += args.interval
+                missed += 1
+            if missed > 1 and not warned_slow:
+                warned_slow = True
+                print("\nRendu plus lent que l'intervalle: des photos sont sautees. "
+                      "Baisse --size, ou augmente --beats.", file=sys.stderr)
+
+            if stop_event.is_set():
+                break
+            if capture.ended:
+                print("\nCapture interrompue.", file=sys.stderr)
+                break
+            if viewer.poll() is not None:
+                break
+            pcm = capture.latest()
+            if pcm is None:  # fenetre pas encore pleine
+                continue
+
+            gain, peak = resolve_gain(args, pcm)
+            taken += 1
+            # Un compteur en plus de l'horodatage: a plusieurs photos par seconde, la
+            # seconde ne suffit pas a distinguer deux fichiers.
+            png = (args.save_dir / f"waveform_{time.strftime('%Y%m%d_%H%M%S')}_{taken:04d}.png"
+                   ) if args.save_dir else None
+
+            try:
+                # Les couleurs resolues dependent du style (resolve_colors/resolve_bg),
+                # donc pas seulement de args.colors/args.bg_color: un changement de
+                # style seul peut deja changer la couleur effective. On ne resonde
+                # (sous-processus ffmpeg) que si la valeur resolue a change.
+                bg_resolved = resolve_bg(args)
+                color_resolved = resolve_colors(args)[0]
+                if bg_resolved != last_bg:
+                    background = probe_color(bg_resolved)
+                    last_bg = bg_resolved
+                if color_resolved != last_colors:
+                    ink = probe_color(color_resolved)
+                    last_colors = color_resolved
+
+                if args.style == "pencil":
+                    frame = render_pencil(args, pcm, gain, size, background, ink)
+                    if png:
+                        write_png(size, frame, png)
+                else:
+                    frame = render_photo(args, pcm, gain, size, png)
+            except (SystemExit, Exception) as exc:
+                # Un reglage change en direct peut etre temporairement invalide (ex.
+                # --crossover mal forme). On saute cette photo plutot que de tuer le
+                # fil de rendu: resolve_colors/resolve_crossover font sys.exit(2) en
+                # ligne de commande, ce qui n'a pas de sens ici.
+                msg = str(exc) or type(exc).__name__
+                status["text"] = f"reglage invalide, photo ignoree: {msg}"
+                print(f"\nReglage invalide, photo ignoree: {msg}", file=sys.stderr)
+                continue
+            if frame is None:
+                break
+
+            # Une ligne de statut reecrite sur place: a un temps par photo, une ligne
+            # par photo noierait le terminal. Ecrite avant le trace, qui occupe tout le
+            # temps restant du creneau.
+            level = "silence" if peak is None else f"crete {peak:5.1f} dBFS -> gain {gain:+5.1f} dB"
+            text = (f"[{time.strftime('%H:%M:%S')}] {level}"
+                    f"{f' -> {png.name}' if png else ''}")
+            status["text"] = text
+            print(f"\r{text}   ", end="", flush=True)
+
+            # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
+            # bord droit au moment ou la photo suivante prend sa place.
+            if not draw_progressively(viewer, frame, size, background, next_at, args.draw_fps):
+                break  # fenetre fermee
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print(flush=True)
+        capture_proc.terminate()
+        capture_proc.wait()
+        try:
+            viewer.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
+        except OSError:
+            pass
+        if viewer.poll() is None:
+            viewer.terminate()
+        viewer.wait()
+        finished_event.set()
+
+
 def main() -> None:
     args = parse_args()
     require_tools()
@@ -846,6 +1113,10 @@ def main() -> None:
     if args.interval <= 0:
         print("--interval doit etre superieur a 0.", file=sys.stderr)
         sys.exit(2)
+    if args.gui and tk is None:
+        print("tkinter n'est pas disponible: --gui ne peut pas demarrer. Installe "
+              "Python depuis python.org, qui l'inclut par defaut.", file=sys.stderr)
+        sys.exit(1)
 
     size = resolve_size(args)
     sample_png = (args.save_dir / "waveform_<horodatage>.png") if args.save_dir else None
@@ -900,85 +1171,33 @@ def main() -> None:
               flush=True)
     print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
 
+    if args.gui:
+        print("Fenetre de reglages ouverte: ferme-la ou Ctrl+C pour arreter.", flush=True)
+
     background = probe_color(resolve_bg(args))
     ink = probe_color(resolve_colors(args)[0])
     capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
     viewer = subprocess.Popen(viewer_command(args, size), stdin=subprocess.PIPE)
     capture = LiveCapture(capture_proc.stdout, chunk_size(args))
 
-    # Cadence calee sur l'horloge, et non sur la fin du rendu: sinon chaque photo
-    # arriverait avec le retard cumule des rendus precedents et glisserait par rapport
-    # au tempo. La premiere photo attend d'avoir une fenetre pleine.
-    next_at = time.monotonic() + args.interval
-    warned_slow = False
-    taken = 0
+    status: dict = {}
+    stop_event = threading.Event()
+    finished_event = threading.Event()
+    run_args = (args, size, background, ink, capture_proc, viewer, capture,
+                status, stop_event, finished_event)
 
-    try:
-        while True:
-            delay = next_at - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            # Rendu trop lent pour la cadence: on saute le creneau manque au lieu de
-            # prendre du retard. Mieux vaut une photo sur deux, a l'heure. En marche
-            # normale la boucle n'avance que d'un cran.
-            missed = 0
-            while next_at <= time.monotonic():
-                next_at += args.interval
-                missed += 1
-            if missed > 1 and not warned_slow:
-                warned_slow = True
-                print("\nRendu plus lent que l'intervalle: des photos sont sautees. "
-                      "Baisse --size, ou augmente --beats.", file=sys.stderr)
-
-            if capture.ended:
-                print("\nCapture interrompue.", file=sys.stderr)
-                break
-            if viewer.poll() is not None:
-                break
-            pcm = capture.latest()
-            if pcm is None:  # fenetre pas encore pleine
-                continue
-
-            gain, peak = resolve_gain(args, pcm)
-            taken += 1
-            # Un compteur en plus de l'horodatage: a plusieurs photos par seconde, la
-            # seconde ne suffit pas a distinguer deux fichiers.
-            png = (args.save_dir / f"waveform_{time.strftime('%Y%m%d_%H%M%S')}_{taken:04d}.png"
-                   ) if args.save_dir else None
-
-            if args.style == "pencil":
-                frame = render_pencil(args, pcm, gain, size, background, ink)
-                if png:
-                    write_png(size, frame, png)
-            else:
-                frame = render_photo(args, pcm, gain, size, png)
-            if frame is None:
-                break
-
-            # Une ligne de statut reecrite sur place: a un temps par photo, une ligne
-            # par photo noierait le terminal. Ecrite avant le trace, qui occupe tout le
-            # temps restant du creneau.
-            level = "silence" if peak is None else f"crete {peak:5.1f} dBFS -> gain {gain:+5.1f} dB"
-            print(f"\r[{time.strftime('%H:%M:%S')}] {level}"
-                  f"{f' -> {png.name}' if png else ''}   ", end="", flush=True)
-
-            # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
-            # bord droit au moment ou la photo suivante prend sa place.
-            if not draw_progressively(viewer, frame, size, background, next_at, args.draw_fps):
-                break  # fenetre fermee
-    except KeyboardInterrupt:
-        pass
-    finally:
-        print(flush=True)
-        capture_proc.terminate()
-        capture_proc.wait()
+    if args.gui:
+        # run() tourne dans un fil separe pour laisser tkinter posseder le fil
+        # principal (obligatoire sur certaines plateformes, prudent partout).
+        thread = threading.Thread(target=run, args=run_args, daemon=True)
+        thread.start()
         try:
-            viewer.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
-        except OSError:
-            pass
-        if viewer.poll() is None:
-            viewer.terminate()
-        viewer.wait()
+            build_gui(args, size, status, stop_event, finished_event)
+        except KeyboardInterrupt:
+            stop_event.set()
+        thread.join()
+    else:
+        run(*run_args)
 
 
 if __name__ == "__main__":

@@ -19,10 +19,17 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 from audio2wave import (
     THEMES, auto_win_size, compose_scene, gradient_source, parse_size, resolve_theme,
 )
+
+try:
+    import tkinter as tk
+except ImportError:  # tkinter absent de certaines installations minimales de Python
+    tk = None
 
 # Meme logique que audio2wave.py: au-dessus d'une normalisation de crete, ce qu'il
 # faut ajouter pour que le trace remplisse l'image. Sert a conseiller --gain.
@@ -126,6 +133,14 @@ def parse_args() -> argparse.Namespace:
                     help="Taille du tampon de capture en ms. C'est la premiere source de latence; "
                          "trop bas provoque des coupures (defaut: 50)")
     p.add_argument("--fullscreen", action="store_true", help="Ouvre la fenetre en plein ecran")
+    p.add_argument("--gui", action="store_true",
+                    help="Ouvre une petite fenetre de reglages (tkinter) pour le style, la "
+                         "forme, les couleurs, les barres, le gain, le lissage, le stereo et "
+                         "l'ambiance. Contrairement a audio2wave_snap.py/audio2wave_ridge.py, "
+                         "chaque application de reglage RELANCE le pipeline ffmpeg/ffplay "
+                         "(ce script n'a pas de boucle Python a modifier en direct : "
+                         "producteur et afficheur sont relies par un tube direct pour la "
+                         "latence, voir CLAUDE.md)")
     p.add_argument("--dry-run", action="store_true",
                     help="Affiche les commandes ffmpeg/ffplay sans les executer")
 
@@ -322,6 +337,185 @@ def report_latency(args: argparse.Namespace) -> None:
     )
 
 
+def producer_command(args: argparse.Namespace) -> list[str]:
+    return (
+        ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+         "-fflags", "nobuffer", "-flags", "low_delay"]
+        + capture_input_args(args)
+        + ["-filter_complex", build_filter(args), "-map", "[v]",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    )
+
+
+def viewer_command(args: argparse.Namespace, width: int, height: int) -> list[str]:
+    cmd = [
+        "ffplay", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "nobuffer", "-flags", "low_delay",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", f"{width}x{height}", "-framerate", str(args.fps),
+        "-i", "-", "-autoexit",
+        "-window_title", f"audio2wave live [{describe_mode(args)}] - {args.device}",
+    ]
+    if args.fullscreen:
+        cmd.append("-fs")
+    return cmd
+
+
+def spawn(args: argparse.Namespace, width: int, height: int
+         ) -> tuple[subprocess.Popen, subprocess.Popen]:
+    """Lance la paire producteur/afficheur, reliee par un tube direct (voir la note
+    dans audio2wave_live.py/CLAUDE.md: pas de relais Python, pour la latence).
+    """
+    source = subprocess.Popen(producer_command(args), stdout=subprocess.PIPE)
+    display = subprocess.Popen(viewer_command(args, width, height), stdin=source.stdout)
+    # Cote parent, laisser ffplay seul detenteur du tube: sinon ffmpeg ne verrait
+    # jamais la fermeture de la fenetre et continuerait a capturer.
+    source.stdout.close()
+    return source, display
+
+
+def run(args: argparse.Namespace, width: int, height: int, status: dict,
+       restart_event: threading.Event, stop_event: threading.Event,
+       finished_event: threading.Event) -> None:
+    """Supervise la paire producteur/afficheur ; la relance quand `restart_event` est
+    positionne (reglages changes dans --gui), s'arrete quand `stop_event` l'est ou que
+    la fenetre ffplay est fermee. Tourne dans un fil separe quand --gui est actif, pour
+    laisser tkinter posseder le fil principal ; appele une seule fois sinon.
+    """
+    try:
+        while not stop_event.is_set():
+            try:
+                source, display = spawn(args, width, height)
+            except OSError as exc:
+                status["text"] = f"echec du lancement: {exc}"
+                print(f"\nEchec du lancement: {exc}", file=sys.stderr)
+                break
+            status["text"] = (f"[{time.strftime('%H:%M:%S')}] {describe_mode(args)}, "
+                              f"{resolve_bars(args, width)} barres, gain {resolve_gain(args):+.0f} dB")
+            try:
+                while not stop_event.is_set() and not restart_event.is_set():
+                    if display.poll() is not None:
+                        # Fenetre fermee par l'utilisateur (ou -autoexit) : on arrete tout,
+                        # pas seulement ce cycle, comme en mode sans --gui.
+                        stop_event.set()
+                        break
+                    time.sleep(0.1)
+            finally:
+                source.terminate()
+                source.wait()
+                if display.poll() is None:
+                    display.terminate()
+                display.wait()
+            restart_event.clear()
+    finally:
+        finished_event.set()
+
+
+def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
+             restart_event: threading.Event, stop_event: threading.Event,
+             finished_event: threading.Event) -> None:
+    """Petite fenetre de reglages.
+
+    A la difference de audio2wave_snap.py/audio2wave_ridge.py, un changement ici ne
+    prend pas effet tout seul: ce script n'a pas de boucle Python par image a relire
+    (producteur et afficheur sont relies par un tube direct pour la latence, voir
+    CLAUDE.md). Chaque reglage n'est donc applique qu'au clic sur "Appliquer", qui
+    relance le pipeline avec les nouvelles valeurs — la fenetre video se referme et
+    se rouvre. Les curseurs ne redemarrent pas a chaque cran deplace, seulement au clic.
+    """
+    root = tk.Tk()
+    root.title("audio2wave live - reglages")
+    root.resizable(False, False)
+    row = 0
+
+    def next_row() -> int:
+        nonlocal row
+        row += 1
+        return row - 1
+
+    style_var = tk.StringVar(value=args.style)
+    r = next_row()
+    tk.Label(root, text="Style").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    style_frame = tk.Frame(root)
+    style_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    for value in ("analyzer", "radio"):
+        tk.Radiobutton(style_frame, text=value, variable=style_var, value=value).pack(side="left")
+
+    shape_var = tk.StringVar(value=args.shape)
+    r = next_row()
+    tk.Label(root, text="Forme (analyzer)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    shape_frame = tk.Frame(root)
+    shape_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    for value in ("bar", "line"):
+        tk.Radiobutton(shape_frame, text=value, variable=shape_var, value=value).pack(side="left")
+
+    def add_entry(label: str, initial: str) -> tk.StringVar:
+        r = next_row()
+        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        var = tk.StringVar(value=initial)
+        tk.Entry(root, textvariable=var, width=20).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        return var
+
+    colors_var = add_entry("Couleur(s)", args.colors)
+    bg_var = add_entry("Couleur de fond", args.bg_color)
+
+    def add_slider(label: str, lo: float, hi: float, step: float, initial: float) -> tk.DoubleVar:
+        r = next_row()
+        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        var = tk.DoubleVar(value=initial)
+        tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal", variable=var,
+                length=220, showvalue=True).grid(row=r, column=1, padx=8, pady=4)
+        return var
+
+    bars_var = add_slider("Barres/points", 8, 400, 4, resolve_bars(args, width))
+    gain_var = add_slider("Gain (dB)", -60, 60, 1, resolve_gain(args))
+    averaging_var = add_slider("Lissage (analyzer)", 1, 30, 1, args.averaging)
+
+    stereo_var = tk.BooleanVar(value=args.stereo)
+    tk.Checkbutton(root, text="Stereo", variable=stereo_var,
+                  ).grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=4)
+
+    theme_var = tk.StringVar(value=args.theme)
+    r = next_row()
+    tk.Label(root, text="Ambiance").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    tk.OptionMenu(root, theme_var, "flat", *sorted(THEMES)).grid(
+        row=r, column=1, sticky="w", padx=8, pady=4)
+
+    def apply(_evt=None) -> None:
+        args.style = style_var.get()
+        args.shape = shape_var.get()
+        args.colors = colors_var.get().strip() or "cyan"
+        args.bg_color = bg_var.get().strip() or "black"
+        args.bars = int(bars_var.get())
+        args.gain = gain_var.get()
+        args.averaging = int(averaging_var.get())
+        args.stereo = stereo_var.get()
+        args.theme = theme_var.get()
+        status["text"] = "Redemarrage..."
+        restart_event.set()
+
+    r = next_row()
+    tk.Button(root, text="Appliquer (redemarre)", command=apply).grid(
+        row=r, column=0, columnspan=2, pady=(6, 4))
+    tk.Label(root, text="Les curseurs ne redemarrent pas seuls : clique Appliquer.",
+            fg="gray40").grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8)
+
+    status_label = tk.Label(root, text="", justify="left", anchor="w")
+    status_label.grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 8))
+
+    def refresh() -> None:
+        status_label.config(text=status.get("text", ""))
+        if finished_event.is_set():
+            root.destroy()
+            return
+        root.after(200, refresh)
+
+    root.protocol("WM_DELETE_WINDOW", stop_event.set)
+    refresh()
+    root.mainloop()
+    stop_event.set()
+
+
 def main() -> None:
     args = parse_args()
     require_tools()
@@ -344,52 +538,52 @@ def main() -> None:
     if args.tune:
         tune(args)
         return
+    if args.gui and tk is None:
+        print("tkinter n'est pas disponible: --gui ne peut pas demarrer. Installe "
+              "Python depuis python.org, qui l'inclut par defaut.", file=sys.stderr)
+        sys.exit(1)
 
     width, height = resolve_size(args)
 
-    producer = (
-        ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-         "-fflags", "nobuffer", "-flags", "low_delay"]
-        + capture_input_args(args)
-        + ["-filter_complex", build_filter(args), "-map", "[v]",
-           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-    )
-    viewer = [
-        "ffplay", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "nobuffer", "-flags", "low_delay",
-        "-f", "rawvideo", "-pixel_format", "rgb24",
-        "-video_size", f"{width}x{height}", "-framerate", str(args.fps),
-        "-i", "-", "-autoexit",
-        "-window_title", f"audio2wave live [{describe_mode(args)}] - {args.device}",
-    ]
-    if args.fullscreen:
-        viewer.append("-fs")
-
     if args.dry_run:
-        print(" ".join(f'"{c}"' if " " in c else c for c in producer))
+        print(" ".join(f'"{c}"' if " " in c else c for c in producer_command(args)))
         print("  |")
-        print(" ".join(f'"{c}"' if " " in c else c for c in viewer))
+        print(" ".join(f'"{c}"' if " " in c else c for c in viewer_command(args, width, height)))
         return
 
     print(f"Rendu {width}x{height} en {describe_mode(args)}, {resolve_bars(args, width)} colonnes.",
           flush=True)
     report_latency(args)
-    print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
+    if args.gui:
+        print("Fenetre de reglages ouverte: ferme-la ou Ctrl+C pour arreter. Chaque clic sur "
+              "Appliquer relance le pipeline (la fenetre video se referme et se rouvre).",
+              flush=True)
+    else:
+        print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
 
-    # Les deux processus sont relies directement: passer par un pipe shell corromprait
-    # le flux binaire sous PowerShell.
-    source = subprocess.Popen(producer, stdout=subprocess.PIPE)
-    try:
-        display = subprocess.Popen(viewer, stdin=source.stdout)
-        # Cote parent, laisser ffplay seul detenteur du tube: sinon ffmpeg ne verrait
-        # jamais la fermeture de la fenetre et continuerait a capturer.
-        source.stdout.close()
-        display.wait()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        source.terminate()
-        source.wait()
+    status: dict = {}
+    stop_event = threading.Event()
+    restart_event = threading.Event()
+    finished_event = threading.Event()
+
+    if args.gui:
+        # run() tourne dans un fil separe pour laisser tkinter posseder le fil
+        # principal (obligatoire sur certaines plateformes, prudent partout).
+        thread = threading.Thread(
+            target=run, args=(args, width, height, status, restart_event, stop_event, finished_event),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            build_gui(args, width, height, status, restart_event, stop_event, finished_event)
+        except KeyboardInterrupt:
+            stop_event.set()
+        thread.join()
+    else:
+        try:
+            run(args, width, height, status, restart_event, stop_event, finished_event)
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
