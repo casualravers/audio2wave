@@ -89,7 +89,7 @@ blanc ou du noir, il n'y a pas de teinte a faire tourner.
 
 ```bash
 python audio2wave.py voix.wav                                    # -> output/voix_analyzer.mov
-python audio2wave.py voix.wav --shape line --colors cyan
+python audio2wave.py voix.wav --shape line --colors grey
 python audio2wave.py voix.wav --style radio --colors "0xff00ff"
 python audio2wave.py voix.wav clip.webm --format webm --style spectrum --colormap rainbow
 python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
@@ -127,7 +127,7 @@ python audio2wave_live.py -d "<entree>" --style radio --gain -10 # onde temporel
 Le fond se regle separement du trace, dans les deux programmes :
 
 ```bash
-python audio2wave_live.py -d "<entree>" --colors cyan --bg-color navy
+python audio2wave_live.py -d "<entree>" --colors grey --bg-color navy
 ```
 
 | mode | rendu | latence |
@@ -170,10 +170,19 @@ python audio2wave_live.py -d "<entree>" --gui
 ici il n'y a pas de boucle Python par image a relire en direct — le producteur ffmpeg
 et l'afficheur ffplay sont relies par un tube direct, delibere pour la latence (voir
 CLAUDE.md). Un reglage change dans la fenetre ne prend donc effet **qu'au clic sur
-"Appliquer"**, qui relance tout le pipeline avec les nouvelles valeurs : la fenetre
-video se referme et se rouvre, contrairement au changement instantane de
-`--ridge-spacing` ou `--line-width` dans les deux autres scripts. Les curseurs seuls
-(sans clic sur Appliquer) ne redemarrent rien.
+"Appliquer"**, qui relance le pipeline avec les nouvelles valeurs, contrairement au
+changement instantane de `--ridge-spacing` ou `--line-width` dans les deux autres
+scripts. Les curseurs seuls (sans clic sur Appliquer) ne redemarrent rien.
+
+**Le redemarrage est masque autant que possible** : la nouvelle paire ffmpeg/ffplay
+est lancee *avant* que l'ancienne ne soit fermee (les deux coexistent brievement),
+et la nouvelle fenetre reprend la position exacte de l'ancienne sur l'ecran (reperee
+via l'API Windows) — le changement se voit comme une mise a jour sur place, pas comme
+une fenetre qui se ferme puis se rouvre ailleurs. Sans effet en `--fullscreen`, deja
+seamless des deux cotes. Si le nouveau reglage fait echouer ffmpeg (peripherique
+perdu, par exemple), l'ancienne fenetre, toujours fonctionnelle, est conservee au
+lieu d'etre perdue — le probleme est signale dans le terminal et dans la fenetre de
+reglages, et il faut corriger puis re-cliquer sur Appliquer.
 
 Reglable dans la fenetre : style, forme, couleurs, barres/points, gain, lissage,
 stereo, ambiance. Fermer la fenetre de reglages arrete le programme en entier (meme

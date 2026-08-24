@@ -6,7 +6,7 @@ fenetre FFT courte, resolution reduite, pas de canal alpha, pas de pre-analyse d
 
     python audio2wave_live.py --list-devices          # nom exact des entrees disponibles
     python audio2wave_live.py -d "Line In (Realtek)" --tune    # mesure et conseille un gain
-    python audio2wave_live.py -d "Line In (Realtek)" --gain 32 --colors cyan
+    python audio2wave_live.py -d "Line In (Realtek)" --gain 32 --colors grey
     python audio2wave_live.py -d "Line In (Realtek)" --shape line --fullscreen
 
 Le son n'est pas reproduit: seul le visuel est affiche, l'ecoute reste sur la chaine hifi.
@@ -78,8 +78,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shape", choices=["bar", "line"], default="bar",
                     help="Forme du trace pour --style analyzer: bar = barres separees, "
                          "line = courbe continue. Ignore en --style radio (defaut: bar)")
-    p.add_argument("--colors", default="cyan",
-                    help="Couleur(s) du trace, separees par | (defaut: cyan)")
+    p.add_argument("--colors", default="grey",
+                    help="Couleur(s) du trace, separees par | (defaut: grey)")
     p.add_argument("--bg-color", default="black",
                     help="Couleur du fond, independante de --colors. Accepte un nom (white, navy) "
                          "ou un code 0xRRGGBB (defaut: black)")
@@ -184,6 +184,29 @@ def primary_screen_size() -> tuple[int, int] | None:
     except Exception:
         return None
     return (width, height) if width > 0 and height > 0 else None
+
+
+def find_window_position(title: str) -> tuple[int, int] | None:
+    """Position (left, top) d'une fenetre ouverte, identifiee par son titre exact.
+
+    Sert a faire apparaitre la nouvelle fenetre ffplay au meme endroit que
+    l'ancienne lors d'un redemarrage --gui : le changement se voit alors comme une
+    mise a jour de l'affichage, pas comme une fenetre qui se ferme puis se rouvre
+    ailleurs sur l'ecran. Sans effet en --fullscreen (ffplay ignore -left/-top),
+    ou le probleme ne se pose de toute facon pas.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+        hwnd = ctypes.windll.user32.FindWindowW(None, title)
+        if not hwnd:
+            return None
+        rect = ctypes.wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return rect.left, rect.top
+    except Exception:
+        return None
 
 
 def resolve_size(args: argparse.Namespace) -> tuple[int, int]:
@@ -347,27 +370,42 @@ def producer_command(args: argparse.Namespace) -> list[str]:
     )
 
 
-def viewer_command(args: argparse.Namespace, width: int, height: int) -> list[str]:
+# Delai laisse a une nouvelle paire pour demarrer avant de fermer l'ancienne (voir
+# run()) : assez pour qu'un ffmpeg qui echoue (mauvais reglage, peripherique perdu)
+# ait le temps de sortir en erreur, sans allonger un redemarrage reussi pour rien.
+RESTART_GRACE_S = 0.3
+
+
+def window_title(args: argparse.Namespace) -> str:
+    return f"audio2wave live [{describe_mode(args)}] - {args.device}"
+
+
+def viewer_command(args: argparse.Namespace, width: int, height: int,
+                   position: tuple[int, int] | None = None) -> list[str]:
     cmd = [
         "ffplay", "-hide_banner", "-loglevel", "warning",
         "-fflags", "nobuffer", "-flags", "low_delay",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", f"{width}x{height}", "-framerate", str(args.fps),
         "-i", "-", "-autoexit",
-        "-window_title", f"audio2wave live [{describe_mode(args)}] - {args.device}",
+        "-window_title", window_title(args),
     ]
     if args.fullscreen:
         cmd.append("-fs")
+    elif position:
+        # Fait apparaitre la nouvelle fenetre exactement ou etait l'ancienne, pour
+        # qu'un redemarrage --gui se voie comme une mise a jour sur place (voir run()).
+        cmd += ["-left", str(position[0]), "-top", str(position[1])]
     return cmd
 
 
-def spawn(args: argparse.Namespace, width: int, height: int
-         ) -> tuple[subprocess.Popen, subprocess.Popen]:
+def spawn(args: argparse.Namespace, width: int, height: int,
+         position: tuple[int, int] | None = None) -> tuple[subprocess.Popen, subprocess.Popen]:
     """Lance la paire producteur/afficheur, reliee par un tube direct (voir la note
     dans audio2wave_live.py/CLAUDE.md: pas de relais Python, pour la latence).
     """
     source = subprocess.Popen(producer_command(args), stdout=subprocess.PIPE)
-    display = subprocess.Popen(viewer_command(args, width, height), stdin=source.stdout)
+    display = subprocess.Popen(viewer_command(args, width, height, position), stdin=source.stdout)
     # Cote parent, laisser ffplay seul detenteur du tube: sinon ffmpeg ne verrait
     # jamais la fermeture de la fenetre et continuerait a capturer.
     source.stdout.close()
@@ -381,33 +419,72 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
     positionne (reglages changes dans --gui), s'arrete quand `stop_event` l'est ou que
     la fenetre ffplay est fermee. Tourne dans un fil separe quand --gui est actif, pour
     laisser tkinter posseder le fil principal ; appele une seule fois sinon.
+
+    Un redemarrage lance la nouvelle paire AVANT de fermer l'ancienne (a la meme
+    position d'ecran, voir window_title/find_window_position), pour que l'ancienne
+    fenetre ne disparaisse qu'une fois la nouvelle deja affichee: c'est le sens de
+    --gui sur ce script, masquer le redemarrage plutot que de juste le declencher.
+    Si la nouvelle paire echoue a demarrer (mauvais reglage, peripherique perdu),
+    l'ancienne est conservee et le probleme est signale, plutot que de tout perdre.
     """
+    source = display = None
+    current_title = None
     try:
         while not stop_event.is_set():
+            position = find_window_position(current_title) if current_title else None
             try:
-                source, display = spawn(args, width, height)
+                new_source, new_display = spawn(args, width, height, position)
             except OSError as exc:
                 status["text"] = f"echec du lancement: {exc}"
                 print(f"\nEchec du lancement: {exc}", file=sys.stderr)
                 break
-            status["text"] = (f"[{time.strftime('%H:%M:%S')}] {describe_mode(args)}, "
-                              f"{resolve_bars(args, width)} barres, gain {resolve_gain(args):+.0f} dB")
-            try:
-                while not stop_event.is_set() and not restart_event.is_set():
-                    if display.poll() is not None:
-                        # Fenetre fermee par l'utilisateur (ou -autoexit) : on arrete tout,
-                        # pas seulement ce cycle, comme en mode sans --gui.
-                        stop_event.set()
-                        break
-                    time.sleep(0.1)
-            finally:
-                source.terminate()
-                source.wait()
-                if display.poll() is None:
-                    display.terminate()
-                display.wait()
+
+            time.sleep(RESTART_GRACE_S)
+            if new_source.poll() is not None or new_display.poll() is not None:
+                new_source.terminate()
+                new_source.wait()
+                if new_display.poll() is None:
+                    new_display.terminate()
+                new_display.wait()
+                if source is None:
+                    status["text"] = "echec du lancement"
+                    break
+                status["text"] = "echec du redemarrage, reglages precedents conserves"
+                print("\nEchec du redemarrage avec les nouveaux reglages: ancienne "
+                      "fenetre conservee.", file=sys.stderr)
+                # source/display restent l'ancienne paire, toujours active: on ne
+                # retente PAS tout de suite (sinon un reglage casse ferait boucler
+                # indefiniment sur des spawn()), on attend la prochaine demande.
+            else:
+                if source is not None:
+                    source.terminate()
+                    source.wait()
+                    if display.poll() is None:
+                        display.terminate()
+                    display.wait()
+                source, display = new_source, new_display
+                current_title = window_title(args)
+                status["text"] = (f"[{time.strftime('%H:%M:%S')}] {describe_mode(args)}, "
+                                  f"{resolve_bars(args, width)} barres, "
+                                  f"gain {resolve_gain(args):+.0f} dB")
+
+            # Sert la paire courante (celle qui vient d'etre lancee, ou l'ancienne si
+            # le redemarrage a echoue) jusqu'a la prochaine demande ou la fermeture.
             restart_event.clear()
+            while not stop_event.is_set() and not restart_event.is_set():
+                if display.poll() is not None:
+                    # Fenetre fermee par l'utilisateur (ou -autoexit) : on arrete tout,
+                    # pas seulement ce cycle, comme en mode sans --gui.
+                    stop_event.set()
+                    break
+                time.sleep(0.1)
     finally:
+        if source is not None:
+            source.terminate()
+            source.wait()
+            if display.poll() is None:
+                display.terminate()
+            display.wait()
         finished_event.set()
 
 
@@ -484,7 +561,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     def apply(_evt=None) -> None:
         args.style = style_var.get()
         args.shape = shape_var.get()
-        args.colors = colors_var.get().strip() or "cyan"
+        args.colors = colors_var.get().strip() or "grey"
         args.bg_color = bg_var.get().strip() or "black"
         args.bars = int(bars_var.get())
         args.gain = gain_var.get()
