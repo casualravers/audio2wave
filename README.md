@@ -426,6 +426,7 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--scale` | `lin` \| `sqrt` \| `cbrt` \| `log` | `lin` |
 | `--filter-mode peak\|average` | crete gardee ou enveloppe lissee par colonne | `peak` |
 | `--draw-fps <n>` | fluidite du trace progressif ; `0` = affichage direct | `30` |
+| `--video <fichier>` | video jouee en boucle sous le trace, `pencil` seul (voir plus bas) | - |
 | `--gui` | ouvre une fenetre de reglages en direct (voir plus bas) | - |
 | `--save-dir <dir>` | ecrit aussi chaque photo en PNG (image entiere) | - |
 | `--size` | resolution | largeur de l'ecran, tiers de sa hauteur |
@@ -434,6 +435,39 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 
 `--colors`, `--bg-color`, `--stereo`, `--split-channels`, `--fullscreen`,
 `--dry-run` se comportent comme dans les autres scripts.
+
+## Video entre l'amplitude min et max (`--video`, `pencil` seul)
+
+```bash
+python audio2wave_snap.py -d "<entree>" --video clip.mp4
+python audio2wave_snap.py -d "<entree>" --video clip.mp4 --wave --line-width 3
+```
+
+La video remplit **la bande entre les deux traits de l'enveloppe** (amplitude min et
+max), pas au-dela : le reste de l'image — au-dessus et en dessous de la bande — reste
+au `--bg-color`, et les traits sont peints par dessus. En `--wave`, ou une seule ligne
+oscillante est tracee, la video occupe quand meme toute la bande d'enveloppe (les deux
+bornes existent toujours, meme quand une seule est encree) : la ligne ondule alors
+par-dessus la video plutot qu'a cote. Le fichier est rejoue **en boucle** tant que le
+programme tourne, et recadre en "cover" (agrandi jusqu'a couvrir, puis recadre au
+centre) : il remplit toujours la bande, sans deformation, quel que soit son format
+d'origine.
+
+**La video continue de jouer pendant le balayage.** Le trace, lui, est fige pour
+toute la photo — seul le contenu video change d'un pas a l'autre, ce qui garde le
+trait parfaitement stable pendant que l'image defile derriere. Cela coute plus cher
+qu'un simple devoilement (les colonnes deja tracees sont repeintes a chaque pas) :
+mesure a 30 img/s, **14 % du creneau en 1920x360, 19 % en plein ecran 1080p** (la
+bande etant plus etroite qu'un remplissage jusqu'au bas de l'image). Le balayage finit
+toujours a l'echeance, avec une precision qui passe de ±1-5 ms sans video a **+5 a
++12 ms** avec.
+
+Reserve a `--style pencil` : les styles `rekordbox` et `simple` composent leur image
+dans un graphe de filtres ffmpeg, pas sur un canevas Python, donc y injecter la video
+demanderait un masque (`alphamerge`) — une toute autre mecanique. L'option est
+refusee avec un message clair plutot que silencieusement ignoree.
+
+Les PNG de `--save-dir` contiennent la video telle qu'elle etait au debut de la photo.
 
 ## Fenetre de reglages en direct (`--gui`)
 
