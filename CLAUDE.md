@@ -112,6 +112,25 @@ resolution de chemins.
   Exception)` pour qu'un reglage temporairement invalide (crossover mal forme,
   etc. — ces fonctions font `sys.exit(2)` en ligne de commande) saute une photo au
   lieu de tuer le fil de rendu.
+  **`--video`** (pencil seul) remplit la bande entre les deux traits de l'enveloppe
+  (amplitude min/max) avec une video jouee en boucle — pas jusqu'au bord bas de
+  l'image. `VideoSource` reprend le modele de `LiveCapture` (un fil vide le tube,
+  seule la derniere image est gardee) ; `-stream_loop -1` reboucle sans relancer de
+  processus et `-re` decode a la vitesse reelle, sans quoi ffmpeg irait a fond et le
+  fil jetterait la quasi-totalite des images. `pencil_heights` calcule desormais
+  systematiquement les deux bornes de l'enveloppe (`env_top`/`env_bottom`) en plus des
+  hauteurs a encrer (`draw`, un seul point en `--wave`) : la video suit toujours ces
+  bornes, meme quand une seule ligne oscillante est tracee dedans — sans ca, `--wave`
+  et `--video` n'auraient rien a se dire. Decoupe en `pencil_heights` (calcul, fige
+  pour toute la photo) et `paint_pencil_columns` (peinture d'une plage de colonnes)
+  precisement parce que la video doit continuer a bouger pendant le balayage :
+  `draw_pencil_video_progressively` repeint **toutes** les colonnes deja revelees a
+  chaque pas, la ou `draw_progressively` se contente de devoiler une image figee.
+  Cout mesure a 30 img/s : 14 % du creneau en 1920x360, 19 % en 1080p (la bande etant
+  plus etroite qu'un remplissage jusqu'au bas), precision de fin de balayage +5 a
+  +12 ms contre ±1-5 ms sans video. Refuse explicitement hors `pencil` :
+  `rekordbox`/`simple` composent dans un graphe ffmpeg, il faudrait un masque
+  `alphamerge`.
 - [audio2wave_ridge.py](audio2wave_ridge.py) — vagues empilees facon "ridge plot"
   (Joy Division) : meme cadence/capture qu'`audio2wave_snap.py`, mais **le canevas ne
   repart jamais du fond**. A chaque rafraichissement : `shift_canvas` decale tout le

@@ -254,6 +254,11 @@ def parse_args() -> argparse.Namespace:
                          f"d'un coup: elle se dessine de gauche a droite, et le trait atteint le "
                          f"bord droit pile au moment ou la photo suivante la remplace. "
                          f"0 = affichage direct (defaut: {DEFAULT_DRAW_FPS})")
+    p.add_argument("--video", type=Path, default=None,
+                    help="Fichier video joue en boucle entre les deux traits de "
+                         "l'enveloppe (amplitude min/max), pas au-dela: le reste de "
+                         "l'image reste au fond. Cadre en 'cover' (agrandi puis recadre) "
+                         "pour remplir sans deformer. --style pencil seul")
     p.add_argument("--gui", action="store_true",
                     help="Ouvre une petite fenetre de reglages (tkinter) pour modifier le "
                          "style, les couleurs, l'epaisseur, --wave, les points/colonnes, "
@@ -304,6 +309,14 @@ def parse_args() -> argparse.Namespace:
         args.interval = args.beats * 60.0 / args.bpm
     if args.wave is not None and args.wave < 1:
         p.error("--wave demande au moins une oscillation")
+    if args.video is not None:
+        # Les styles ffmpeg composent leur image dans un graphe de filtres, pas sur un
+        # canevas Python: y injecter la video demanderait un masque (alphamerge), une
+        # tout autre mecanique. Ici on refuse plutot que de faire semblant.
+        if args.style != "pencil":
+            p.error("--video n'est disponible qu'en --style pencil")
+        if not args.video.exists():
+            p.error(f"--video introuvable: {args.video}")
     # None = a decider face au peripherique; un entier = impose par l'utilisateur.
     if str(args.rate).strip().lower() == "auto":
         args.rate = None
@@ -634,6 +647,59 @@ class LiveCapture:
             return bytes(self._buf) if len(self._buf) >= self._window else None
 
 
+class VideoSource:
+    """Decode une video en boucle a la taille exacte du canevas, et garde la derniere
+    image sous la main.
+
+    Meme principe que LiveCapture: un fil vide le tube en permanence et ne conserve
+    que la derniere image, pour que le rendu prenne toujours l'image courante sans
+    jamais bloquer sur le decodage.
+
+    Deux options portent le gros du travail dans ffmpeg plutot qu'ici:
+    - `-stream_loop -1` reboucle le fichier indefiniment, sans relancer de processus;
+    - `-re` decode a la vitesse reelle de la video. Sans lui ffmpeg irait aussi vite
+      que possible et le fil de lecture tournerait a fond pour jeter la quasi-totalite
+      des images.
+    Le cadrage est un 'cover' (agrandir jusqu'a couvrir, puis recadrer au centre): la
+    video remplit toujours le canevas sans bandes ni deformation, quel que soit son
+    format d'origine.
+    """
+
+    def __init__(self, path: Path, size: tuple[int, int], fps: int, loglevel: str) -> None:
+        width, height = size
+        self.frame_bytes = width * height * 3
+        self._latest: bytes | None = None
+        self._lock = threading.Lock()
+        self.ended = False
+        self.proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", loglevel, "-nostdin",
+             "-stream_loop", "-1", "-re", "-i", str(path),
+             "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},fps={max(1, fps)}",
+             "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            stdout=subprocess.PIPE,
+        )
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        while True:
+            frame = self.proc.stdout.read(self.frame_bytes)
+            if len(frame) < self.frame_bytes:
+                self.ended = True
+                return
+            with self._lock:
+                self._latest = frame
+
+    def latest(self) -> bytes | None:
+        """La derniere image decodee, ou None tant que la premiere n'est pas arrivee."""
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        self.proc.wait()
+
+
 def peak_dbfs(pcm: bytes) -> float | None:
     """Crete du bloc en dBFS, ou None s'il est vide ou parfaitement silencieux."""
     samples = array.array("h")
@@ -688,30 +754,25 @@ def amplitude_envelope(pcm: bytes, points: int, channels: int) -> list[float]:
     return smoothed
 
 
-def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
-                  background: bytes, ink: bytes) -> bytes:
-    """Trace l'enveloppe au trait, sans passer par ffmpeg.
+def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int]
+                   ) -> list[tuple[int, int, tuple[int, ...]]]:
+    """Pour chaque colonne: (haut de l'enveloppe, bas de l'enveloppe, hauteurs a encrer).
 
-    Aucun filtre ffmpeg ne dessine une polyligne d'enveloppe: showwavespic remplit une
-    silhouette, showwaves trace la forme d'onde elle-meme. Le trait est donc rasterise
-    ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
-
-    Pour chaque colonne, on peint le segment vertical qui relie la hauteur precedente a
-    la nouvelle: le trait reste continu meme quand l'enveloppe saute, la ou un simple
-    point par colonne laisserait des trous sur les attaques. C'est aussi ce qui rend
-    --wave possible, ou le trait devient franchement raide entre deux colonnes.
+    Le haut/bas de l'enveloppe (amplitude min/max, symetriques autour du centre) sert
+    de zone video: c'est la meme chose que "hauteurs a encrer" en contour normal, mais
+    pas en --wave, ou une seule ligne oscillante est tracee alors que l'enveloppe garde
+    ses deux bornes — la video occupe alors toute la bande, la ligne ondule dedans.
+    Calcule a part du dessin parce qu'avec --video il faut repeindre les memes colonnes
+    a chaque pas du trace progressif, sans refaire l'enveloppe.
     """
     width, height = size
-    stride = width * 3
-    canvas = bytearray(background * (width * height))
-
     env = amplitude_envelope(pcm, resolve_points(args, width), channel_count(args))
     factor = 10 ** (gain / 20)
     thickness = max(1, args.line_width)
     center = (height - thickness) / 2
     reach = center  # le trait touche le bord a amplitude pleine, epaisseur comprise
 
-    previous = None
+    columns = []
     for x in range(width):
         # Position continue dans l'enveloppe, interpolee entre deux points: c'est ce
         # qui donne des segments droits entre points, et non un escalier.
@@ -721,24 +782,81 @@ def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple
         value = env[left] + (env[right] - env[left]) * (pos - left)
         offset = min(1.0, value * factor) * reach
 
+        env_top = int(round(center - offset))
+        env_bottom = int(round(center + offset))
         if args.wave:
             # Une seule ligne qui oscille, bornee par l'enveloppe au lieu de la suivre.
             # La phase ne depend que de x: d'une photo a l'autre les cretes restent en
             # place et seule leur hauteur bouge, ce qui evite un scintillement.
             swing = offset * math.sin(2 * math.pi * args.wave * x / width)
-            heights = (int(round(center + swing)),)
+            draw = (int(round(center + swing)),)
         else:
-            heights = (int(round(center - offset)), int(round(center + offset)))
+            draw = (env_top, env_bottom)
+        columns.append((env_top, env_bottom, draw))
+    return columns
+
+
+def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
+                         columns: list[tuple[int, int, tuple[int, ...]]], ink: bytes,
+                         thickness: int, video: bytes | None, start: int, end: int) -> None:
+    """Peint les colonnes [start, end) du canevas: la video entre les bornes de
+    l'enveloppe, puis le trait.
+
+    Pour chaque colonne, on peint le segment vertical qui relie la hauteur precedente a
+    la nouvelle: le trait reste continu meme quand l'enveloppe saute, la ou un simple
+    point par colonne laisserait des trous sur les attaques. C'est aussi ce qui rend
+    --wave possible, ou le trait devient franchement raide entre deux colonnes.
+
+    La video, elle, remplit la bande entre l'amplitude min et l'amplitude max (pas
+    jusqu'au bord bas de l'image). Ses bords haut/bas partent des bornes les plus
+    larges entre colonne courante et precedente, pour epouser exactement l'enveloppe
+    sans dent de scie sur une attaque (meme raison que le trait lui-meme). Elle
+    s'ecrit par tranches a pas fixe (une par canal R/G/B): une colonne n'est pas
+    contigue en memoire, elle saute de `stride` octets a chaque rangee.
+    """
+    width, height = size
+    stride = width * 3
+    for x in range(start, end):
+        env_top, env_bottom, heights = columns[x]
+        prev_top, prev_bottom, previous = columns[x - 1] if x > 0 else columns[x]
+
+        if video is not None:
+            top = max(0, min(env_top, prev_top))
+            bottom = min(height - 1, max(env_bottom, prev_bottom))
+            rows = bottom - top + 1
+            if rows > 0:
+                col0 = top * stride + x * 3
+                for c in range(3):
+                    canvas[col0 + c:col0 + c + rows * stride:stride] = \
+                        video[col0 + c:col0 + c + rows * stride:stride]
 
         for index, y_now in enumerate(heights):
-            y_prev = previous[index] if previous else y_now
+            y_prev = previous[index]
             for y in range(min(y_now, y_prev), max(y_now, y_prev) + thickness):
                 if 0 <= y < height:
                     base = y * stride + x * 3
                     canvas[base:base + 3] = ink
-        previous = heights
 
+
+def compose_pencil(size: tuple[int, int], columns: list[tuple[int, ...]], background: bytes,
+                   ink: bytes, thickness: int, video: bytes | None = None) -> bytes:
+    """Image complete du style pencil, fond compris."""
+    width, height = size
+    canvas = bytearray(background * (width * height))
+    paint_pencil_columns(canvas, size, columns, ink, thickness, video, 0, width)
     return bytes(canvas)
+
+
+def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
+                  background: bytes, ink: bytes, video: bytes | None = None) -> bytes:
+    """Trace l'enveloppe au trait, sans passer par ffmpeg.
+
+    Aucun filtre ffmpeg ne dessine une polyligne d'enveloppe: showwavespic remplit une
+    silhouette, showwaves trace la forme d'onde elle-meme. Le trait est donc rasterise
+    ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
+    """
+    columns = pencil_heights(args, pcm, gain, size)
+    return compose_pencil(size, columns, background, ink, max(1, args.line_width), video)
 
 
 def write_png(size: tuple[int, int], frame: bytes, png: Path) -> None:
@@ -825,6 +943,51 @@ def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, 
         for y in range(height):
             base = y * stride
             canvas[base + drawn * 3:base + target * 3] = frame[base + drawn * 3:base + target * 3]
+        drawn = target
+        if not send_frame(viewer, canvas):
+            return False
+    return True
+
+
+def draw_pencil_video_progressively(viewer: subprocess.Popen, columns: list[tuple[int, ...]],
+                                    size: tuple[int, int], background: bytes, ink: bytes,
+                                    thickness: int, video: VideoSource, deadline: float,
+                                    fps: int) -> bool:
+    """Variante de draw_progressively pour --video: la video continue de jouer pendant
+    le balayage.
+
+    draw_progressively revele une image figee, donc une colonne deja tracee ne change
+    plus. Ici la video doit bouger sous le trait, y compris la ou il est deja passe:
+    on repeint donc toutes les colonnes revelees a chaque pas, avec l'image video du
+    moment. Le trace lui-meme (`columns`) est fige pour toute la photo, seul le
+    contenu video change — c'est ce qui garde le trait parfaitement stable pendant que
+    la video defile derriere.
+
+    Plus cher qu'un simple devoilement, mais borne: le cout croit avec la portion
+    deja revelee, donc il vaut en moyenne la moitie d'une image pleine.
+    """
+    width, height = size
+    span = deadline - time.monotonic()
+    canvas = bytearray(background * (width * height))
+    if fps <= 0 or span <= 0:  # pas le temps de dessiner: image d'un coup
+        paint_pencil_columns(canvas, size, columns, ink, thickness, video.latest(), 0, width)
+        return send_frame(viewer, canvas)
+
+    start = time.monotonic()
+    drawn = 0
+    period = 1.0 / fps
+
+    if not send_frame(viewer, canvas):  # efface la photo precedente
+        return False
+    while drawn < width:
+        time.sleep(max(0.0, min(period, deadline - time.monotonic())))
+        progress = (time.monotonic() - start) / span
+        target = width if progress >= 1 else max(drawn, int(width * progress))
+        if target == drawn:
+            continue
+        # Depuis 0 et non depuis `drawn`: les colonnes deja tracees doivent elles aussi
+        # recevoir la nouvelle image video, sinon seule la portion en cours bougerait.
+        paint_pencil_columns(canvas, size, columns, ink, thickness, video.latest(), 0, target)
         drawn = target
         if not send_frame(viewer, canvas):
             return False
@@ -984,6 +1147,9 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     """
     last_bg = resolve_bg(args)
     last_colors = resolve_colors(args)[0]
+    # Un seul decodeur pour toute la session, qui reboucle tout seul (-stream_loop -1).
+    video = (VideoSource(args.video, size, args.draw_fps, args.loglevel)
+             if getattr(args, "video", None) else None)
 
     # Cadence calee sur l'horloge, et non sur la fin du rendu: sinon chaque photo
     # arriverait avec le retard cumule des rendus precedents et glisserait par rapport
@@ -1041,8 +1207,14 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                     ink = probe_color(color_resolved)
                     last_colors = color_resolved
 
+                columns = None
                 if args.style == "pencil":
-                    frame = render_pencil(args, pcm, gain, size, background, ink)
+                    # Le trace est fige pour toute la photo; seule la video, si elle
+                    # est active, continuera de bouger dessous pendant le balayage.
+                    columns = pencil_heights(args, pcm, gain, size)
+                    frame = compose_pencil(size, columns, background, ink,
+                                           max(1, args.line_width),
+                                           video.latest() if video else None)
                     if png:
                         write_png(size, frame, png)
                 else:
@@ -1070,7 +1242,14 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
 
             # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
             # bord droit au moment ou la photo suivante prend sa place.
-            if not draw_progressively(viewer, frame, size, background, next_at, args.draw_fps):
+            if video is not None and columns is not None:
+                ok = draw_pencil_video_progressively(
+                    viewer, columns, size, background, ink, max(1, args.line_width),
+                    video, next_at, args.draw_fps)
+            else:
+                ok = draw_progressively(viewer, frame, size, background, next_at,
+                                        args.draw_fps)
+            if not ok:
                 break  # fenetre fermee
     except KeyboardInterrupt:
         pass
@@ -1078,6 +1257,8 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
         print(flush=True)
         capture_proc.terminate()
         capture_proc.wait()
+        if video is not None:
+            video.stop()
         try:
             viewer.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
         except OSError:
@@ -1132,6 +1313,9 @@ def main() -> None:
             print(f"  (trace rasterise en Python: {forme} sur "
                   f"{resolve_points(args, size[0])} points, trait de {args.line_width} px "
                   f"en {resolve_colors(args)[0]} sur {resolve_bg(args)})")
+            if args.video:
+                print(f"  (video entre l'amplitude min et max: {args.video}, en boucle, "
+                      f"recadree en {size[0]}x{size[1]})")
         else:
             print(" ".join(f'"{c}"' if " " in c else c for c in
                            render_command(args, 0.0, size, sample_png)))
@@ -1166,6 +1350,9 @@ def main() -> None:
         columns = resolve_columns(args, size[0])
         print(f"{columns} colonnes, soit {args.interval * 1000 / columns:.2f} ms d'audio "
               f"par colonne.", flush=True)
+    if args.video:
+        print(f"Video entre l'amplitude min et max: {args.video.name}, en boucle, "
+              f"recadree en {size[0]}x{size[1]}.", flush=True)
     if args.draw_fps > 0:
         print(f"Trace progressif a {args.draw_fps} img/s, termine pile au rafraichissement.",
               flush=True)
