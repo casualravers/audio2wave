@@ -20,6 +20,7 @@ python audio2wave_live.py --list-devices         # nom exact des entrees DirectS
 python audio2wave_live.py -d "<entree>" --tune   # mesure le niveau, conseille un --gain
 python audio2wave_live.py -d "<entree>" --dry-run
 python audio2wave_snap.py -d "<entree>" --dry-run
+python audio2wave_snap.py --list-presets                # jeux d'options nommes
 ```
 
 Sans peripherique sous la main, `audio2wave_snap.py` est le seul des trois dont le
@@ -45,8 +46,9 @@ resolution de chemins.
   `Popen(stdin=source.stdout)` et **pas** via un pipe shell, qui corromprait le flux
   binaire sous PowerShell ; le parent doit fermer `source.stdout` pour que ffmpeg voie
   la fermeture de la fenetre.
-- [audio2wave_snap.py](audio2wave_snap.py) — photo fixe d'un temps, rafraichie a chaque
-  temps et tracee progressivement. Deux familles de rendu: `--style pencil` (defaut)
+- [audio2wave_snap.py](audio2wave_snap.py) — photo fixe, rafraichie au meme rythme que sa
+  duree, tracee progressivement. Duree en temps plutot qu'en secondes (`--bpm`/`--beats`,
+  defaut 4 temps soit une mesure a 4/4). Deux familles de rendu: `--style pencil` (defaut)
   rasterise une polyligne d'enveloppe **en Python**, `rekordbox`/`simple` passent par
   ffmpeg. `render_command` refuse explicitement `pencil`, la frontiere est la.
   **Trois processus, pas deux** : un ffmpeg de capture permanent (dshow -> PCM `s16le`
@@ -118,16 +120,18 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   et c'est aussi ce qui rend `--wave` possible, ou le trait devient raide entre deux
   colonnes. `--wave` remplace les deux hauteurs du contour par une seule, oscillante;
   sa phase ne depend que de x, sinon les cretes sauteraient d'une photo a l'autre.
-  Consequence a garder en tete: le rendu passe de ~95 ms a ~6 ms, ce qui rallonge
-  d'autant le trace progressif (463 ms de balayage sur 469 au lieu de 375).
+  Consequence a garder en tete: le rendu passe de ~95 ms a ~6-8 ms, ce qui rallonge
+  d'autant le trace progressif (exemple a un temps, 128 BPM: 463 ms de balayage sur
+  469 au lieu de 375; l'effet est le meme, mesure a l'echelle, sur le defaut 4 temps).
 - **Deux regimes de colonnes, jamais l'entre-deux** (styles ffmpeg) : au-dessus de `TARGET_COLUMN_MS`
   (10 ms, un cycle de basse) chaque colonne resume une crete et l'onde est pleine ;
   en dessous de `RESOLVED_COLUMN_MS` (1 ms/pixel) la forme d'onde est dessinee en
   entier. Entre les deux, une colonne attrape un bout de cycle au hasard et le trace
   part en peigne. `resolve_columns` choisit le regime selon la duree de la photo — a
-  un temps sur 1920 px on est a 0,24 ms, donc pleine resolution. Quand il y a
-  agrandissement, le rapport est arrondi a un entier, sinon les colonnes alternent
-  4 px et 5 px.
+  un temps sur 1920 px on est a 0,24 ms, au defaut (4 temps) a 0,98 ms: les deux sous
+  le seuil de `RESOLVED_COLUMN_MS`, donc pleine resolution, mais de justesse au defaut.
+  Quand il y a agrandissement, le rapport est arrondi a un entier, sinon les colonnes
+  alternent 4 px et 5 px.
 - **`format=rgb24` explicite sur la source `color` sondee** par `background_pixel` :
   sans lui elle passe par du yuv et rend une couleur decalee d'un cran (`0x14161c` ->
   `(21,22,28)` au lieu de `(20,22,28)`), donc differente du fond de la photo que le
@@ -142,6 +146,17 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   `primary_screen_size`).
 - **En live, `--averaging` est le poste de latence principal** ; `report_latency()` doit
   refleter tout changement de la chaine (capture + fenetre FFT + lissage).
+
+### Presets
+
+`PRESETS`/`PRESET_ALIASES` dans `audio2wave_snap.py` sont des dicts nom -> overrides
+de `dest` argparse (`style`, `wave`, `line_width`, ...). `--preset` les applique via
+`p.set_defaults(**overrides)` suivi d'un second `p.parse_args()` : argparse relit
+`sys.argv`, donc toute option deja presente sur la ligne de commande garde sa valeur
+explicite, seules celles absentes recoivent la valeur du preset. C'est le mecanisme a
+reutiliser pour ajouter un preset, pas une fusion manuelle de `vars(args)` qui
+ecraserait aussi les options explicites. `--list-presets` s'evalue et quitte **avant**
+`require_tools()`, comme `-h` : c'est une aide statique, elle ne doit pas exiger ffmpeg.
 
 ### Frequence d'echantillonnage
 

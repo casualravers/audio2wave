@@ -201,19 +201,22 @@ prend sa place.
 
 ```bash
 python audio2wave_snap.py --list-devices              # nom exact des entrees
-python audio2wave_snap.py -d "<entree>"               # 1 temps a 128 BPM
+python audio2wave_snap.py -d "<entree>"               # 4 temps a 128 BPM (une mesure)
 python audio2wave_snap.py -d "<entree>" --bpm 174     # dnb
-python audio2wave_snap.py -d "<entree>" --beats 4     # une mesure par photo
+python audio2wave_snap.py -d "<entree>" --beats 1     # rafraichit a chaque temps
 python audio2wave_snap.py -d "<entree>" --interval 10 # ou en secondes
 python audio2wave_snap.py -d "<entree>" --save-dir output --fullscreen
+python audio2wave_snap.py -d "<entree>" --preset club                # voir Presets plus bas
 ```
 
 ## Duree d'une photo
 
-Elle se donne en temps, pas en secondes : `--beats 1 --bpm 128` par defaut, soit
-**469 ms**. C'est aussi le rythme de rafraichissement — a 1 temps, la fenetre se
-renouvelle a chaque temps. Un flux live n'annonce aucun tempo, d'ou le `--bpm` a
-regler sur la musique jouee ; `--interval <s>` court-circuite les deux.
+Elle se donne en temps, pas en secondes : `--beats 4 --bpm 128` par defaut, soit
+**1,875 s**, une mesure a 4/4. C'est aussi le rythme de rafraichissement. Une mesure
+laisse le temps de lire le trace avant qu'il ne change ; `--beats 1` rafraichit a
+chaque temps, plus nerveux mais plus dur a suivre a l'oeil. Un flux live n'annonce
+aucun tempo, d'ou le `--bpm` a regler sur la musique jouee ; `--interval <s>`
+court-circuite les deux.
 
 La cadence est calee sur l'horloge et non sur la fin du rendu, sinon chaque photo
 arriverait avec le retard cumule des rendus precedents. Si le rendu deborde de
@@ -256,33 +259,60 @@ apres avoir ete relachee, c'est l'echappatoire.
 ## Trace progressif
 
 L'image n'apparait pas d'un coup : elle se dessine colonne par colonne, et **le trait
-atteint le bord droit exactement au rafraichissement suivant**. Un creneau se deroule
-ainsi, a 128 BPM :
+atteint le bord droit exactement au rafraichissement suivant**. Deux creneaux mesures
+a 128 BPM, aux exemples `--beats 1` et `--beats 4` (le defaut) :
 
-| | `pencil` | styles ffmpeg |
+| | `--beats 1` (469 ms) | `--beats 4` (1,875 s, defaut) |
 |---|---|---|
-| rendu de la photo | ~6 ms | ~95 ms |
-| balayage de gauche a droite | ~463 ms | ~375 ms |
-| **total** | **469 ms, un temps** | **469 ms, un temps** |
+| rendu de la photo (`pencil`) | ~6 ms | ~8 ms |
+| balayage de gauche a droite | ~463 ms, 12-14 images | ~1867 ms, ~57 images |
+| ecart mesure a l'echeance | +1 a +5 ms | +1,6 a +2,2 ms |
 
 Le balayage occupe donc tout le temps disponible et se termine sur le temps, a
-quelques millisecondes pres (mesure : +1 a +5 ms, la granularite des pauses sous
-Windows). Il ne couvre pas tout a fait un temps entier parce que le rendu occupe le
-debut du creneau — en `pencil` il n'en reste presque rien.
+quelques millisecondes pres — la granularite des pauses sous Windows. Il ne couvre pas
+tout a fait le creneau entier parce que le rendu en occupe le debut ; en `pencil`
+c'est negligeable (moins de 0,5 % du creneau par defaut), plus sensible avec les
+styles ffmpeg (`rekordbox`/`simple`, ~95 ms de rendu quelle que soit la duree couverte).
 
 L'avancee est calculee sur l'horloge et non sur le numero d'image : si un pas traine,
 le suivant rattrape au lieu de decaler la fin. Le canevas est persistant et seules les
 colonnes nouvellement decouvertes y sont recopiees — 0,4 ms par pas en 1920x360, 1 ms
 en 1080p, contre trois fois plus si l'image entiere etait reconstruite a chaque fois.
 
-`--draw-fps` regle la fluidite (30 img/s par defaut, soit 12 a 14 images par temps) ;
-`--draw-fps 0` revient a l'affichage direct de la photo entiere.
+`--draw-fps` regle la fluidite (30 img/s par defaut) ; `--draw-fps 0` revient a
+l'affichage direct de la photo entiere.
 
 Chaque photo est annoncee dans le terminal avec sa crete et le gain applique :
 
 ```
 [21:04:12] crete -14.3 dBFS -> gain +13.8 dB
 ```
+
+## Presets (`--preset`)
+
+Un preset regroupe plusieurs options sous un nom court, pour ne pas avoir a recopier
+la meme ligne de commande a chaque lancement. `--list-presets` en detaille le contenu :
+
+```bash
+python audio2wave_snap.py --list-presets
+python audio2wave_snap.py -d "<entree>" --preset club
+python audio2wave_snap.py -d "<entree>" --preset c            # alias
+python audio2wave_snap.py -d "<entree>" --preset club --wave 8  # ecrase le preset
+```
+
+| preset (alias) | contenu |
+|---|---|
+| `wave` (`w`) | `--style pencil --wave` : le contour anime en sinusoide plutot qu'en silhouette figee |
+| `club` (`c`) | `--style pencil --wave --line-width 3 --fullscreen --colors 0x39c9ff` : plein ecran pour une projection, trait epais et vif pour rester lisible de loin |
+| `rekordbox` (`rb`) | `--style rekordbox` : le look d'un ecran de platine |
+| `editor` (`e`) | `--style simple --scale sqrt` : onde pleine facon editeur audio, passages faibles remontes |
+
+**Une option passee en plus sur la ligne de commande garde toujours la priorite sur le
+preset**, presets compris : `--preset club --style simple` applique le fullscreen et la
+couleur de `club`, mais rend en `simple` plutot qu'en `pencil`. C'est un mecanisme
+d'argparse (`set_defaults` puis reparsing de la ligne de commande), pas une fusion de
+dictionnaires : seules les options *absentes* de la ligne de commande prennent la
+valeur du preset.
 
 ## Styles (`--style`)
 
@@ -322,8 +352,9 @@ polyligne d'enveloppe, `showwavespic` remplit une silhouette et `showwaves` trac
 forme d'onde elle-meme. Pour chaque colonne, le segment vertical reliant la hauteur
 precedente a la nouvelle est peint, ce qui garde le trait continu meme sur une
 attaque, la ou un point par colonne laisserait des trous. Effet de bord notable : le
-rendu tombe de ~95 ms a **~6 ms** par photo, et le trace progressif recupere ce temps
-(463 ms de balayage sur un temps de 469 ms, contre 375 ms avec les styles ffmpeg).
+rendu tombe de ~95 ms a **~6-8 ms** par photo, et le trace progressif recupere ce
+temps quel que soit `--beats` (exemple a un temps, 469 ms a 128 BPM : 463 ms de
+balayage, contre 375 ms avec les styles ffmpeg).
 
 ### `rekordbox`
 
@@ -349,8 +380,10 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | option | role | defaut |
 |---|---|---|
 | `-d`, `--device` | entree DirectShow a capturer | requis |
+| `--preset <nom>` | charge un jeu d'options nomme (voir plus haut) | - |
+| `--list-presets` | detaille les presets disponibles et quitte | - |
 | `--bpm <n>` | tempo de reference | `128` |
-| `--beats <n>` | temps par photo **et** delai entre deux photos | `1` |
+| `--beats <n>` | temps par photo **et** delai entre deux photos | `4` |
 | `--interval <s>` | la meme duree en secondes, a la place de `--bpm/--beats` | - |
 | `--style` | `pencil` \| `rekordbox` \| `simple` | `pencil` |
 | `--columns <n>` | points de la polyligne en `pencil`, colonnes dessinees sinon | `96` en `pencil` |
@@ -374,8 +407,9 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 Le rendu se fait par defaut a la **largeur entiere de l'ecran** (la hauteur n'est
 reduite qu'en mode fenetre, pour que la fenetre tienne avec sa barre de titre) : c'est
 la largeur qui porte le detail temporel, et les PNG de `--save-dir` en profitent aussi.
-Cout mesure a 1920 px : 95 ms par photo en fenetre, 150 ms en plein ecran 1080p, soit
-20 a 30 % d'un temps a 128 BPM.
+Cout mesure a 1920 px : 95 ms par photo en fenetre, 150 ms en plein ecran 1080p — a
+128 BPM, 20 a 30 % d'un temps si `--beats 1`, 5 a 8 % d'une mesure au defaut
+(`--beats 4`).
 
 Une colonne resume une tranche d'audio par sa crete, et deux regimes donnent un bon
 resultat aux deux extremes :
@@ -387,8 +421,10 @@ resultat aux deux extremes :
 | **< 1 ms** | des dizaines de colonnes par cycle : la forme d'onde elle-meme est dessinee |
 
 Le programme vise donc l'un ou l'autre selon la duree de la photo. A un temps sur
-1920 px on est a 0,24 ms par colonne : plein detail, une colonne par pixel. A partir
-de 4 s environ, il repasse a une colonne par 10 ms puis agrandit — avec un rapport
+1920 px on est a 0,24 ms par colonne, et au defaut (`--beats 4`, une mesure) a
+0,98 ms : dans les deux cas sous le seuil d'1 ms, donc plein detail, une colonne par
+pixel — la marge devient fine au-dela de 4 temps environ. Passe ce seuil, le
+programme repasse a une colonne par 10 ms puis agrandit — avec un rapport
 d'agrandissement arrondi a un entier, sinon `neighbor` donnerait des colonnes de 4 px
 et d'autres de 5.
 
