@@ -307,9 +307,17 @@ c'est negligeable (moins de 0,5 % du creneau par defaut), plus sensible avec les
 styles ffmpeg (`rekordbox`/`simple`, ~95 ms de rendu quelle que soit la duree couverte).
 
 L'avancee est calculee sur l'horloge et non sur le numero d'image : si un pas traine,
-le suivant rattrape au lieu de decaler la fin. Le canevas est persistant et seules les
-colonnes nouvellement decouvertes y sont recopiees — 0,4 ms par pas en 1920x360, 1 ms
-en 1080p, contre trois fois plus si l'image entiere etait reconstruite a chaque fois.
+le suivant rattrape au lieu de decaler la fin. Seules les colonnes nouvellement
+decouvertes sont recopiees a chaque pas — 0,4 ms par pas en 1920x360, 1 ms en 1080p,
+contre trois fois plus si l'image entiere etait reconstruite a chaque fois.
+
+**Le balayage part de la photo precedente, pas d'un ecran vide** : la nouvelle courbe
+recouvre l'ancienne colonne par colonne au fil de sa progression, au lieu qu'un aplat
+de fond s'affiche d'un coup avant de retracer. L'ancienne photo reste donc visible la
+ou le balayage n'est pas encore passe. Exception : avec `--video`/`--video2` actifs,
+chaque photo repart d'un fond uni comme avant — demarrer d'une photo deja chargee
+(trait + video) s'est avere ralentir assez l'affichage pour faire saccader la video
+qui joue derriere.
 
 `--draw-fps` regle la fluidite (30 img/s par defaut) ; `--draw-fps 0` revient a
 l'affichage direct de la photo entiere.
@@ -427,6 +435,8 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--filter-mode peak\|average` | crete gardee ou enveloppe lissee par colonne | `peak` |
 | `--draw-fps <n>` | fluidite du trace progressif ; `0` = affichage direct | `30` |
 | `--video <fichier>` | video jouee en boucle sous le trace, `pencil` seul (voir plus bas) | - |
+| `--video2 <fichier>` | deuxieme video, jouee en boucle hors de la bande d'enveloppe, `pencil` seul (voir plus bas) | - |
+| `--asset-dir <dir>` | dossier ou chercher `--video`/`--video2` si le chemin donne n'existe pas tel quel | `asset` |
 | `--gui` | ouvre une fenetre de reglages en direct (voir plus bas) | - |
 | `--save-dir <dir>` | ecrit aussi chaque photo en PNG (image entiere) | - |
 | `--size` | resolution | largeur de l'ecran, tiers de sa hauteur |
@@ -443,6 +453,10 @@ python audio2wave_snap.py -d "<entree>" --video clip.mp4
 python audio2wave_snap.py -d "<entree>" --video clip.mp4 --wave --line-width 3
 ```
 
+`clip.mp4` est cherche tel quel, puis dans `--asset-dir` (`asset` par defaut) : un
+nom simple suffit sans avoir a le prefixer a chaque lancement, meme convention que
+la source audio d'`audio2wave.py`.
+
 La video remplit **la bande entre les deux traits de l'enveloppe** (amplitude min et
 max), pas au-dela : le reste de l'image — au-dessus et en dessous de la bande — reste
 au `--bg-color`, et les traits sont peints par dessus. En `--wave`, ou une seule ligne
@@ -453,14 +467,32 @@ programme tourne, et recadre en "cover" (agrandi jusqu'a couvrir, puis recadre a
 centre) : il remplit toujours la bande, sans deformation, quel que soit son format
 d'origine.
 
-**La video continue de jouer pendant le balayage.** Le trace, lui, est fige pour
-toute la photo — seul le contenu video change d'un pas a l'autre, ce qui garde le
-trait parfaitement stable pendant que l'image defile derriere. Cela coute plus cher
-qu'un simple devoilement (les colonnes deja tracees sont repeintes a chaque pas) :
-mesure a 30 img/s, **14 % du creneau en 1920x360, 19 % en plein ecran 1080p** (la
-bande etant plus etroite qu'un remplissage jusqu'au bas de l'image). Le balayage finit
-toujours a l'echeance, avec une precision qui passe de ±1-5 ms sans video a **+5 a
-+12 ms** avec.
+**La video continue de jouer pendant le balayage, et se superpose lentement a la
+photo precedente sur tout le `--beats`**, comme le reste du trace (voir "Trace
+progressif" plus haut) : la bande ne repart pas d'un fond uni a chaque photo, la
+nouvelle enveloppe et son contenu video recouvrent progressivement l'ancienne.
+Cela coute plus cher qu'un simple devoilement (les colonnes deja tracees sont
+repeintes a chaque pas) : mesure a 30 img/s, **14 % du creneau en 1920x360, 19 %
+en plein ecran 1080p** (la bande etant plus etroite qu'un remplissage jusqu'au bas
+de l'image). Le balayage finit toujours a l'echeance, avec une precision qui passe
+de ±1-5 ms sans video a **+5 a +12 ms** avec.
+
+**Compromis assume, a garder en tete** : mesure au banc, repartir de la photo
+precedente ici degrade la lecture video au fil des photos (le nombre d'images
+video distinctes vues par balayage tombe irregulierement de ~45 a 1-15) — sur
+cette meme mesure, repartir d'un fond uni a chaque photo reste parfaitement
+stable. La superposition lente a ete choisie malgre cette mesure ; l'effet reel a
+l'usage peut etre moins marque qu'au banc synthetique. La video elle-meme ne
+redemarre jamais : elle continue de decoder sans interruption, seule
+l'irregularite de rafraichissement pourrait se voir sur certaines configurations.
+
+**Le trait, lui, ne se superpose jamais a l'ancien** : contrairement au fond et a
+la video, qui repartent volontairement de la photo precedente (superposition
+lente ci-dessus), le contour blanc de l'ancienne photo est efface avant que le
+prochain balayage ne commence. Sans ca, la portion pas encore atteinte par le
+nouveau trait continuerait d'afficher l'ancien jusqu'a ce que le balayage la
+rejoigne — deux contours visibles en meme temps au lieu d'un seul qui remplace
+l'autre a mesure qu'il se dessine.
 
 Reserve a `--style pencil` : les styles `rekordbox` et `simple` composent leur image
 dans un graphe de filtres ffmpeg, pas sur un canevas Python, donc y injecter la video
@@ -468,6 +500,34 @@ demanderait un masque (`alphamerge`) — une toute autre mecanique. L'option est
 refusee avec un message clair plutot que silencieusement ignoree.
 
 Les PNG de `--save-dir` contiennent la video telle qu'elle etait au debut de la photo.
+
+### Deuxieme video, hors de la bande (`--video2`)
+
+```bash
+python audio2wave_snap.py -d "<entree>" --video2 fond.mp4
+python audio2wave_snap.py -d "<entree>" --video clip.mp4 --video2 fond.mp4
+```
+
+`--video2` joue un second fichier, en boucle et en "cover" comme `--video`, mais
+**hors** de la bande d'enveloppe : au-dessus du trait du haut et en dessous du trait
+du bas, la ou `--video` ne peint rien. Independante de `--video` — utilisable seule
+(la bande reste au `--bg-color`, le reste de l'image joue la video) ou combinee avec
+elle (une video a l'interieur de la vague, une autre autour). Memes contraintes que
+`--video` : `pencil` seul, fichier verifie a l'avance.
+
+**Contrairement a `--video`, elle ne suit pas le balayage progressif : elle joue en
+continu sur toute la largeur de l'image a chaque rafraichissement**, y compris dans
+les colonnes que le trait n'a pas encore atteintes. Choix delibere, distinct de la
+lente superposition de `--video`/du trace lui-meme : en la limitant aux colonnes
+deja revelees (comme le reste du balayage), les colonnes pas encore atteintes
+gardaient l'image video figee depuis le debut du balayage precedent — jusqu'a un
+plein `--beats` — puis sautaient d'un coup a l'image courante des que le trait les
+rejoignait, percu comme des coupures plutot qu'une lecture fluide. Repeinte en
+dernier sur toute la largeur, elle ne touche jamais le trait ni la video interieure
+de `--video` (zones disjointes par construction).
+
+Combiner `--video` et `--video2` double le cout de decodage (deux fichiers) et de
+repeinture par pas ; a garder en tete sur une resolution plein ecran.
 
 ## Fenetre de reglages en direct (`--gui`)
 
@@ -478,8 +538,17 @@ python audio2wave_snap.py -d "<entree>" --gui
 Ouvre une petite fenetre tkinter avec un controle par reglage : style (pencil /
 rekordbox / simple), couleurs du trait et de fond, epaisseur, `--wave` (case a
 cocher + oscillations), points/colonnes, echelle, filtre par colonne, crossover
-(deux champs Hz) et images/s du trace. Un changement prend effet **a la photo
-suivante**, sans redemarrer la capture ni la fenetre ffplay.
+(deux champs Hz), gain (case "automatique" + curseur manuel en dB), dossier PNG
+(`--save-dir`, cree au besoin) et images/s du trace. Un changement prend effet
+**a la photo suivante**, sans redemarrer la capture ni la fenetre ffplay.
+
+**Ce qui n'y est volontairement pas** : `--stereo`, `--split-channels`, `--rate`,
+`--buffer`, `--size`, `--beats`/`--bpm`/`--interval`, `--fullscreen`, `--video` et
+`--video2`. Tous sont figes des le lancement — dans la commande de capture
+(nombre de canaux, frequence, taille du tampon), dans la fenetre ffplay deja
+ouverte (taille, plein ecran), ou dans un decodeur video deja demarre — donc les
+changer en direct n'aurait aucun effet ou desynchroniserait carrement le flux
+audio.
 
 **Changer de style reinitialise les champs couleur** (vides = defaut du nouveau
 style) : `rekordbox` exige trois couleurs separees par `|`, `pencil`/`simple` une

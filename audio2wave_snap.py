@@ -259,11 +259,20 @@ def parse_args() -> argparse.Namespace:
                          "l'enveloppe (amplitude min/max), pas au-dela: le reste de "
                          "l'image reste au fond. Cadre en 'cover' (agrandi puis recadre) "
                          "pour remplir sans deformer. --style pencil seul")
+    p.add_argument("--video2", type=Path, default=None,
+                    help="Deuxieme fichier video, joue en boucle hors de la bande "
+                         "d'enveloppe (amplitude min/max): au-dessus du trait du haut "
+                         "et en dessous du trait du bas, la ou --video ne peint rien. "
+                         "Independant de --video, les deux peuvent etre combines. "
+                         "Meme cadrage 'cover'. --style pencil seul")
+    p.add_argument("--asset-dir", type=Path, default=Path("asset"),
+                    help="Dossier ou chercher --video/--video2 quand le chemin donne "
+                         "n'existe pas tel quel (defaut: asset)")
     p.add_argument("--gui", action="store_true",
                     help="Ouvre une petite fenetre de reglages (tkinter) pour modifier le "
                          "style, les couleurs, l'epaisseur, --wave, les points/colonnes, "
-                         "l'echelle, le crossover et la cadence du trace pendant que le "
-                         "programme tourne, sans le relancer")
+                         "l'echelle, le crossover, le gain, le dossier PNG et la cadence "
+                         "du trace pendant que le programme tourne, sans le relancer")
     p.add_argument("--save-dir", type=Path, default=None,
                     help="Enregistre aussi chaque photo en PNG dans ce dossier, cree au besoin")
     p.add_argument("--rate", default="auto",
@@ -309,14 +318,23 @@ def parse_args() -> argparse.Namespace:
         args.interval = args.beats * 60.0 / args.bpm
     if args.wave is not None and args.wave < 1:
         p.error("--wave demande au moins une oscillation")
-    if args.video is not None:
-        # Les styles ffmpeg composent leur image dans un graphe de filtres, pas sur un
-        # canevas Python: y injecter la video demanderait un masque (alphamerge), une
-        # tout autre mecanique. Ici on refuse plutot que de faire semblant.
-        if args.style != "pencil":
-            p.error("--video n'est disponible qu'en --style pencil")
-        if not args.video.exists():
-            p.error(f"--video introuvable: {args.video}")
+    for opt in ("video", "video2"):
+        path = getattr(args, opt)
+        if path is not None:
+            # Les styles ffmpeg composent leur image dans un graphe de filtres, pas sur
+            # un canevas Python: y injecter la video demanderait un masque (alphamerge),
+            # une tout autre mecanique. Ici on refuse plutot que de faire semblant.
+            if args.style != "pencil":
+                p.error(f"--{opt} n'est disponible qu'en --style pencil")
+            # Cherche tel quel, puis dans --asset-dir (meme logique que le fichier
+            # source d'audio2wave.py): un nom simple comme "clip.mp4" atterrit dans
+            # asset/ sans avoir a le prefixer a chaque lancement.
+            if not path.exists():
+                in_assets = args.asset_dir / path
+                if in_assets.exists():
+                    setattr(args, opt, in_assets)
+                else:
+                    p.error(f"--{opt} introuvable: {path} (ni dans {args.asset_dir})")
     # None = a decider face au peripherique; un entier = impose par l'utilisateur.
     if str(args.rate).strip().lower() == "auto":
         args.rate = None
@@ -797,32 +815,63 @@ def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tupl
 
 
 def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
-                         columns: list[tuple[int, int, tuple[int, ...]]], ink: bytes,
-                         thickness: int, video: bytes | None, start: int, end: int) -> None:
-    """Peint les colonnes [start, end) du canevas: la video entre les bornes de
-    l'enveloppe, puis le trait.
+                         columns: list[tuple[int, int, tuple[int, ...]]], background: bytes,
+                         ink: bytes, thickness: int, video: bytes | None,
+                         video_out: bytes | None, start: int, end: int,
+                         full: bool = True, draw_ink: bool = True) -> None:
+    """Peint les colonnes [start, end) du canevas: le fond d'abord (le canevas peut
+    porter une photo precedente), la video interieure entre les bornes de l'enveloppe,
+    la video exterieure au-dela, puis le trait.
 
-    Pour chaque colonne, on peint le segment vertical qui relie la hauteur precedente a
-    la nouvelle: le trait reste continu meme quand l'enveloppe saute, la ou un simple
-    point par colonne laisserait des trous sur les attaques. C'est aussi ce qui rend
-    --wave possible, ou le trait devient franchement raide entre deux colonnes.
+    `full=True` (compose_pencil, et premiere apparition d'une colonne dans le
+    balayage progressif) repeint aussi le fond. `full=False` (colonnes deja
+    revelees, repeintes uniquement pour faire avancer la video derriere un trait
+    deja stable) le saute: le fond a deja ete pose la premiere fois que la colonne a
+    ete revelee dans ce balayage, inutile de le refaire a chaque pas. Le trait, lui,
+    est repeint dans les deux cas: il est fin (quelques rangees pres du haut/bas de
+    la bande) donc peu couteux, et surtout il chevauche exactement les bords de la
+    bande video — sans le repeindre a chaque pas, le prochain repeint de la video
+    l'effacerait silencieusement des que la colonne est repassee en `full=False`.
 
-    La video, elle, remplit la bande entre l'amplitude min et l'amplitude max (pas
-    jusqu'au bord bas de l'image). Ses bords haut/bas partent des bornes les plus
-    larges entre colonne courante et precedente, pour epouser exactement l'enveloppe
-    sans dent de scie sur une attaque (meme raison que le trait lui-meme). Elle
-    s'ecrit par tranches a pas fixe (une par canal R/G/B): une colonne n'est pas
-    contigue en memoire, elle saute de `stride` octets a chaque rangee.
+    Le fond, quand repeint, l'est sur toute la hauteur de la colonne avant le reste:
+    le canevas part de la photo precedente, pas d'un aplat de fond (voir
+    draw_progressively/draw_pencil_video_progressively), donc sans ce reset une
+    colonne fraichement balayee garderait des restes de l'ancienne photo la ou ni
+    video ni trait ne la recouvrent.
+
+    Le trait, quand peint, relie la hauteur precedente a la nouvelle pour chaque
+    colonne: il reste continu meme quand l'enveloppe saute, la ou un simple point par
+    colonne laisserait des trous sur les attaques. C'est aussi ce qui rend --wave
+    possible, ou le trait devient franchement raide entre deux colonnes.
+
+    `video` remplit la bande entre l'amplitude min et l'amplitude max (pas jusqu'au
+    bord bas de l'image); `video_out` remplit tout le reste, au-dessus et en dessous
+    de cette meme bande. Les bornes de la bande partent du plus large entre colonne
+    courante et precedente, pour epouser exactement l'enveloppe sans dent de scie sur
+    une attaque (meme raison que le trait lui-meme) — et donc aussi sans laisser de
+    liseret de video_out apparaitre puis disparaitre a chaque attaque. Ecriture par
+    tranches a pas fixe (une par canal R/G/B): une colonne n'est pas contigue en
+    memoire, elle saute de `stride` octets a chaque rangee.
+
+    `draw_ink=False` saute le trait entierement (fond/video seuls) : sert a batir le
+    canevas de depart du balayage suivant dans run(), pour que le contour d'une
+    photo ne survive jamais au-dela d'elle (voir draw_pencil_video_progressively).
     """
     width, height = size
     stride = width * 3
     for x in range(start, end):
         env_top, env_bottom, heights = columns[x]
         prev_top, prev_bottom, previous = columns[x - 1] if x > 0 else columns[x]
+        top = max(0, min(env_top, prev_top))
+        bottom = min(height - 1, max(env_bottom, prev_bottom))
+
+        if full:
+            col0 = x * 3
+            for c in range(3):
+                canvas[col0 + c:col0 + c + height * stride:stride] = \
+                    bytes([background[c]]) * height
 
         if video is not None:
-            top = max(0, min(env_top, prev_top))
-            bottom = min(height - 1, max(env_bottom, prev_bottom))
             rows = bottom - top + 1
             if rows > 0:
                 col0 = top * stride + x * 3
@@ -830,25 +879,47 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
                     canvas[col0 + c:col0 + c + rows * stride:stride] = \
                         video[col0 + c:col0 + c + rows * stride:stride]
 
-        for index, y_now in enumerate(heights):
-            y_prev = previous[index]
-            for y in range(min(y_now, y_prev), max(y_now, y_prev) + thickness):
-                if 0 <= y < height:
-                    base = y * stride + x * 3
-                    canvas[base:base + 3] = ink
+        if video_out is not None:
+            if top > 0:
+                col0 = x * 3
+                for c in range(3):
+                    canvas[col0 + c:col0 + c + top * stride:stride] = \
+                        video_out[col0 + c:col0 + c + top * stride:stride]
+            if bottom < height - 1:
+                rows = height - 1 - bottom
+                col0 = (bottom + 1) * stride + x * 3
+                for c in range(3):
+                    canvas[col0 + c:col0 + c + rows * stride:stride] = \
+                        video_out[col0 + c:col0 + c + rows * stride:stride]
+
+        if draw_ink:
+            for index, y_now in enumerate(heights):
+                y_prev = previous[index]
+                for y in range(min(y_now, y_prev), max(y_now, y_prev) + thickness):
+                    if 0 <= y < height:
+                        base = y * stride + x * 3
+                        canvas[base:base + 3] = ink
 
 
 def compose_pencil(size: tuple[int, int], columns: list[tuple[int, ...]], background: bytes,
-                   ink: bytes, thickness: int, video: bytes | None = None) -> bytes:
-    """Image complete du style pencil, fond compris."""
+                   ink: bytes, thickness: int, video: bytes | None = None,
+                   video_out: bytes | None = None, draw_ink: bool = True) -> bytes:
+    """Image complete du style pencil, fond compris.
+
+    `draw_ink=False` omet le trait (fond + video seuls) : sert a construire le
+    canevas de depart du balayage suivant dans run(), pour que l'ancien contour ne
+    survive jamais au-dela de sa propre photo (voir draw_pencil_video_progressively).
+    """
     width, height = size
     canvas = bytearray(background * (width * height))
-    paint_pencil_columns(canvas, size, columns, ink, thickness, video, 0, width)
+    paint_pencil_columns(canvas, size, columns, background, ink, thickness, video, video_out,
+                         0, width, draw_ink=draw_ink)
     return bytes(canvas)
 
 
 def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
-                  background: bytes, ink: bytes, video: bytes | None = None) -> bytes:
+                  background: bytes, ink: bytes, video: bytes | None = None,
+                  video_out: bytes | None = None) -> bytes:
     """Trace l'enveloppe au trait, sans passer par ffmpeg.
 
     Aucun filtre ffmpeg ne dessine une polyligne d'enveloppe: showwavespic remplit une
@@ -856,7 +927,8 @@ def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple
     ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
     """
     columns = pencil_heights(args, pcm, gain, size)
-    return compose_pencil(size, columns, background, ink, max(1, args.line_width), video)
+    return compose_pencil(size, columns, background, ink, max(1, args.line_width), video,
+                          video_out)
 
 
 def write_png(size: tuple[int, int], frame: bytes, png: Path) -> None:
@@ -910,13 +982,23 @@ def send_frame(viewer: subprocess.Popen, frame) -> bool:
         return False
 
 
-def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, int],
-                       background: bytes, deadline: float, fps: int) -> bool:
+def draw_progressively(viewer: subprocess.Popen, previous: bytes, frame: bytes,
+                       size: tuple[int, int], deadline: float, fps: int) -> bool:
     """Dessine l'image de gauche a droite, pour atteindre le bord droit a l'echeance.
 
-    Le canevas est persistant et seules les colonnes nouvellement decouvertes y sont
-    recopiees: un pas ne coute alors que quelques dixiemes de milliseconde, contre une
-    reconstruction complete de l'image a chaque fois.
+    Part de `previous` (la photo precedente, deja affichee) plutot que d'un aplat de
+    fond: la nouvelle courbe efface donc l'ancienne progressivement, colonne par
+    colonne, au fil du balayage, plutot qu'un aplat de fond s'affichant d'un coup
+    avant le trace. Chaque colonne recopiee depuis `frame` porte deja son propre fond,
+    donc une simple recopie suffit a remplacer entierement l'ancien contenu de la
+    colonne.
+
+    `canvas` est reconstruit a chaque appel (une copie de `previous`), et non reutilise
+    d'un appel a l'autre: mesure en pratique, un `bytearray` unique reutilise pendant
+    toute la session, mute des centaines de fois, finit par affamer le fil de lecture
+    de `VideoSource` (voir draw_pencil_video_progressively) au bout de quelques photos
+    -- une simple reallocation par appel restaure un partage correct du GIL entre les
+    fils. Cout mesure negligeable (recopie d'un bloc deja existant, pas un remplissage).
 
     L'avancee est calculee sur l'horloge et non sur le numero de pas, pour que le trait
     arrive au bout au bon moment meme si un pas a traine.
@@ -924,16 +1006,14 @@ def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, 
     width, height = size
     stride = width * 3
     span = deadline - time.monotonic()
-    if fps <= 0 or span <= 0:
-        return send_frame(viewer, frame)  # pas le temps de dessiner: image d'un coup
+    if fps <= 0 or span <= 0:  # pas le temps de dessiner: image d'un coup
+        return send_frame(viewer, frame)
 
-    canvas = bytearray(background * (width * height))
+    canvas = bytearray(previous)
     start = time.monotonic()
     drawn = 0
     period = 1.0 / fps
 
-    if not send_frame(viewer, canvas):  # efface la photo precedente
-        return False
     while drawn < width:
         time.sleep(max(0.0, min(period, deadline - time.monotonic())))
         progress = (time.monotonic() - start) / span
@@ -949,46 +1029,106 @@ def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, 
     return True
 
 
-def draw_pencil_video_progressively(viewer: subprocess.Popen, columns: list[tuple[int, ...]],
-                                    size: tuple[int, int], background: bytes, ink: bytes,
-                                    thickness: int, video: VideoSource, deadline: float,
-                                    fps: int) -> bool:
-    """Variante de draw_progressively pour --video: la video continue de jouer pendant
-    le balayage.
+def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
+                                    columns: list[tuple[int, ...]], size: tuple[int, int],
+                                    background: bytes, ink: bytes, thickness: int,
+                                    video: VideoSource | None, video_out: VideoSource | None,
+                                    deadline: float, fps: int) -> bool:
+    """Variante de draw_progressively pour --video/--video2: la video continue de
+    jouer pendant le balayage, et se superpose lentement a la photo precedente sur
+    tout le creneau, comme le reste du trace (voir draw_progressively).
 
-    draw_progressively revele une image figee, donc une colonne deja tracee ne change
-    plus. Ici la video doit bouger sous le trait, y compris la ou il est deja passe:
-    on repeint donc toutes les colonnes revelees a chaque pas, avec l'image video du
-    moment. Le trace lui-meme (`columns`) est fige pour toute la photo, seul le
-    contenu video change — c'est ce qui garde le trait parfaitement stable pendant que
-    la video defile derriere.
+    ATTENTION — mesure au banc: repartir de la photo precedente ici (plutot que
+    d'un aplat de fond a chaque photo) degrade la lecture video au fil des photos
+    (~45 images video distinctes par balayage tombent a 1-15, de facon inegale)
+    sur cette machine — quelle que soit la frequence de repeinture, y compris avec
+    un court aplat de fond au tout debut du balayage pour laisser souffler
+    VideoSource. La cause n'est pas le cout de repeindre cote Python mais celui,
+    cote ffplay, de recevoir en continu des images dont la zone hors balayage
+    reste chargee de contenu reel (trait + video) plutot que d'un aplat uniforme.
+    Choisi malgre tout, a la demande explicite: le devoilement lent (superposition
+    sur tout le `--beats`) prime sur la fluidite video mesuree ici — a verifier a
+    l'usage reel, la mesure synthetique peut exagerer l'effet percu.
 
-    Plus cher qu'un simple devoilement, mais borne: le cout croit avec la portion
-    deja revelee, donc il vaut en moyenne la moitie d'une image pleine.
+    Comme draw_progressively: `canvas` est reconstruit (`bytearray(previous)`) a
+    chaque appel, jamais reutilise d'une photo a l'autre. Une colonne deja revelee
+    doit en plus continuer a changer ici (la video interieure defile derriere le
+    trait fige): on repeint donc a chaque pas toutes les colonnes revelees depuis
+    le debut du balayage, pas seulement les nouvelles — mais en deux passes
+    distinctes, pas un seul appel `full=True` sur 0..target: les colonnes deja
+    revelees (`full=False`) n'ont besoin que de la video interieure et du trait
+    (voir paint_pencil_columns), pas d'un nouveau reset du fond; seules les
+    colonnes tout juste decouvertes (`full=True`) ont besoin du fond en plus, pour
+    effacer ce que la bande montrait a l'ancienne position de l'enveloppe. Le
+    trait est repeint dans les deux cas: sans ca il se ferait recouvrir par la
+    video des le premier rafraichissement d'une colonne deja revelee, rendant la
+    delimitation de la bande invisible au bout de quelques pas.
+
+    `video_out` (hors bande) est traite a part, DECOUPLE du front du balayage:
+    peint sur toute la largeur [0, width) a chaque pas, pas seulement sur les
+    colonnes deja revelees. Bug observe en usage reel: en le limitant a [0, drawn)
+    comme le reste, les colonnes pas encore atteintes par le balayage gardaient la
+    derniere image video capturee AVANT le debut de ce balayage (figee jusqu'a un
+    plein intervalle), puis sautaient d'un coup a l'image courante des que le
+    front les atteignait — percu comme des coupures plutot qu'une lecture
+    continue. video_out ne delimitant que la zone hors bande (jamais le trait ni
+    la video interieure), le repeindre en dernier sur toute la largeur ne peut pas
+    effacer ce que les deux passes precedentes viennent de poser.
+
+    `previous` porte le fond et la video de la photo precedente, mais PAS son
+    trait: c'est run() qui garantit ca, en rebatissant `previous_frame` avec
+    `compose_pencil(..., draw_ink=False)` apres chaque balayage plutot que de
+    reutiliser le dernier canevas envoye (qui contient le trait). Sans cette
+    exclusion, la portion pas encore atteinte par LE FRONT DE CE balayage
+    afficherait encore l'ancien trait, coexistant avec le nouveau qui se dessine
+    par dessus depuis la gauche — deux contours visibles a la fois au lieu d'un
+    seul qui remplace l'autre. Le fond/la video, eux, restent bien celui de la
+    photo precedente (c'est le point de draw_progressively/superposition lente
+    ci-dessus) ; seul le trait est exclu de ce qui est transmis d'un balayage a
+    l'autre.
     """
     width, height = size
     span = deadline - time.monotonic()
-    canvas = bytearray(background * (width * height))
     if fps <= 0 or span <= 0:  # pas le temps de dessiner: image d'un coup
-        paint_pencil_columns(canvas, size, columns, ink, thickness, video.latest(), 0, width)
+        canvas = bytearray(previous)
+        paint_pencil_columns(canvas, size, columns, background, ink, thickness,
+                             video.latest() if video else None,
+                             video_out.latest() if video_out else None, 0, width)
         return send_frame(viewer, canvas)
 
+    canvas = bytearray(previous)
     start = time.monotonic()
     drawn = 0
     period = 1.0 / fps
 
-    if not send_frame(viewer, canvas):  # efface la photo precedente
-        return False
     while drawn < width:
         time.sleep(max(0.0, min(period, deadline - time.monotonic())))
         progress = (time.monotonic() - start) / span
         target = width if progress >= 1 else max(drawn, int(width * progress))
-        if target == drawn:
+        frame_video = video.latest() if video else None
+        frame_video_out = video_out.latest() if video_out else None
+        if target != drawn:
+            # Colonnes deja revelees: seule la video interieure bouge, fond et
+            # trait restent tels quels (poses lors de leur premiere apparition).
+            if drawn > 0:
+                paint_pencil_columns(canvas, size, columns, background, ink, thickness,
+                                     frame_video, None, 0, drawn, full=False)
+            # Colonnes tout juste decouvertes: fond, video interieure et trait.
+            paint_pencil_columns(canvas, size, columns, background, ink, thickness,
+                                 frame_video, None, drawn, target, full=True)
+            drawn = target
+        elif frame_video_out is None:
             continue
-        # Depuis 0 et non depuis `drawn`: les colonnes deja tracees doivent elles aussi
-        # recevoir la nouvelle image video, sinon seule la portion en cours bougerait.
-        paint_pencil_columns(canvas, size, columns, ink, thickness, video.latest(), 0, target)
-        drawn = target
+        if frame_video_out is not None:
+            # video_out (hors bande) ne suit PAS le front du balayage: repeinte sur
+            # toute la largeur a chaque pas, y compris au-dela des colonnes deja
+            # revelees, sinon elle resterait figee sur l'image de la photo
+            # precedente la ou le trait n'est pas encore passe, jusqu'a un plein
+            # intervalle -- percu comme des coupures/gels plutot qu'une lecture
+            # continue. Peinte en dernier, par-dessus le reste: elle ne touche que
+            # la zone hors bande, jamais le trait ni la video interieure.
+            paint_pencil_columns(canvas, size, columns, background, ink, thickness,
+                                 None, frame_video_out, 0, width, full=False)
         if not send_frame(viewer, canvas):
             return False
     return True
@@ -1003,6 +1143,17 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     la photo suivante, sans redemarrer la capture ni la fenetre ffplay. Aucun verrou:
     une simple affectation d'attribut (int/float/str) est atomique sous le GIL, ce qui
     suffit ici.
+
+    Tout ce qui est expose ici est relu par `run()` a chaque photo (`resolve_gain`,
+    `pencil_heights`, l'ecriture PNG...) sans jamais toucher a `capture_command` ni a
+    `viewer_command` : c'est la frontiere qui decide ce qui peut entrer dans cette
+    fenetre. `--stereo`/`--split-channels`/`--rate`/`--buffer`/`--size`/`--beats`/
+    `--bpm`/`--interval`/`--fullscreen`/`--video`/`--video2` en sont volontairement
+    exclus, parce qu'ils sont figes dans la commande de capture au lancement
+    (nombre de canaux, frequence, taille du tampon), dans la fenetre ffplay deja
+    ouverte (taille, plein ecran), ou dans un decodeur `VideoSource` deja demarre :
+    les changer en direct desynchroniserait le flux ou n'aurait tout simplement
+    aucun effet sur un processus deja en cours.
     """
     width = size[0]
     root = tk.Tk()
@@ -1118,7 +1269,48 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         entry.bind("<Return>", apply_crossover)
         entry.bind("<FocusOut>", apply_crossover)
 
+    # Gain: "auto" (str) ou un nombre en dB (float), voir gain_value(). Case a cocher
+    # + curseur plutot que deux widgets independants, pour eviter qu'un utilisateur
+    # regle le curseur en pensant qu'il s'applique alors que "auto" est toujours actif.
+    gain_auto_var = tk.BooleanVar(value=(args.gain == "auto"))
+    gain_db_var = tk.DoubleVar(value=(float(args.gain) if args.gain != "auto" else 0.0))
+
+    def on_gain_change() -> None:
+        args.gain = "auto" if gain_auto_var.get() else round(gain_db_var.get(), 1)
+
+    r = next_row()
+    tk.Checkbutton(root, text="Gain automatique (crete de chaque photo)",
+                  variable=gain_auto_var, command=on_gain_change,
+                  ).grid(row=r, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+    r = next_row()
+    tk.Label(root, text="Gain manuel (dB)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
+            length=220, showvalue=True, command=lambda _v: on_gain_change(),
+            ).grid(row=r, column=1, padx=8, pady=4)
+
     add_slider("Images/s du trace", "draw_fps", 0, 60, 1)
+
+    # --save-dir: le dossier initial est deja cree par main() avant l'ouverture de la
+    # fenetre; un dossier saisi ici doit l'etre aussi, sinon write_png (qui ne cree pas
+    # ses dossiers parents) echouerait des la premiere photo.
+    save_var = tk.StringVar(value=str(args.save_dir) if args.save_dir else "")
+
+    def apply_save_dir(_evt=None) -> None:
+        raw = save_var.get().strip()
+        if not raw:
+            args.save_dir = None
+            return
+        save_dir = Path(raw)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        args.save_dir = save_dir
+
+    r = next_row()
+    tk.Label(root, text="Dossier PNG (vide = desactive)").grid(row=r, column=0, sticky="w",
+                                                               padx=8, pady=4)
+    save_entry = tk.Entry(root, textvariable=save_var, width=20)
+    save_entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    save_entry.bind("<Return>", apply_save_dir)
+    save_entry.bind("<FocusOut>", apply_save_dir)
 
     status_label = tk.Label(root, text="", justify="left", anchor="w")
     status_label.grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 8))
@@ -1147,9 +1339,18 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     """
     last_bg = resolve_bg(args)
     last_colors = resolve_colors(args)[0]
-    # Un seul decodeur pour toute la session, qui reboucle tout seul (-stream_loop -1).
+    # Un seul decodeur par video pour toute la session, qui reboucle tout seul
+    # (-stream_loop -1).
     video = (VideoSource(args.video, size, args.draw_fps, args.loglevel)
              if getattr(args, "video", None) else None)
+    video_out = (VideoSource(args.video2, size, args.draw_fps, args.loglevel)
+                 if getattr(args, "video2", None) else None)
+    # La derniere photo entierement affichee: point de depart du balayage suivant
+    # (draw_progressively/draw_pencil_video_progressively), qui la recouvre colonne
+    # par colonne au lieu d'afficher un aplat de fond d'un coup avant de retracer.
+    # bytes (pas bytearray): les fonctions en repartent a chaque appel plutot que de
+    # muter un canevas partage entre les photos (voir leur docstring).
+    previous_frame = background * (size[0] * size[1])
 
     # Cadence calee sur l'horloge, et non sur la fin du rendu: sinon chaque photo
     # arriverait avec le retard cumule des rendus precedents et glisserait par rapport
@@ -1214,7 +1415,8 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                     columns = pencil_heights(args, pcm, gain, size)
                     frame = compose_pencil(size, columns, background, ink,
                                            max(1, args.line_width),
-                                           video.latest() if video else None)
+                                           video.latest() if video else None,
+                                           video_out.latest() if video_out else None)
                     if png:
                         write_png(size, frame, png)
                 else:
@@ -1242,15 +1444,30 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
 
             # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
             # bord droit au moment ou la photo suivante prend sa place.
-            if video is not None and columns is not None:
+            if (video is not None or video_out is not None) and columns is not None:
                 ok = draw_pencil_video_progressively(
-                    viewer, columns, size, background, ink, max(1, args.line_width),
-                    video, next_at, args.draw_fps)
+                    viewer, previous_frame, columns, size, background, ink,
+                    max(1, args.line_width), video, video_out, next_at, args.draw_fps)
+                if not ok:
+                    break  # fenetre fermee
+                # Le canevas de depart du PROCHAIN balayage ne doit jamais porter ce
+                # contour: sinon il resterait visible sur la portion pas encore
+                # balayee du prochain trace, coexistant avec le nouveau contour qui
+                # se dessine par dessus (deux traits simultanes au lieu d'un seul qui
+                # remplace l'autre). Fond et video, eux, continuent de porter leur
+                # etat courant (photo precedente) comme avant: seul le trait est
+                # exclu de ce qui est transmis au balayage suivant.
+                previous_frame = compose_pencil(size, columns, background, ink,
+                                                max(1, args.line_width),
+                                                video.latest() if video else None,
+                                                video_out.latest() if video_out else None,
+                                                draw_ink=False)
             else:
-                ok = draw_progressively(viewer, frame, size, background, next_at,
+                ok = draw_progressively(viewer, previous_frame, frame, size, next_at,
                                         args.draw_fps)
-            if not ok:
-                break  # fenetre fermee
+                if not ok:
+                    break  # fenetre fermee
+                previous_frame = frame
     except KeyboardInterrupt:
         pass
     finally:
@@ -1259,6 +1476,8 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
         capture_proc.wait()
         if video is not None:
             video.stop()
+        if video_out is not None:
+            video_out.stop()
         try:
             viewer.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
         except OSError:
@@ -1316,6 +1535,9 @@ def main() -> None:
             if args.video:
                 print(f"  (video entre l'amplitude min et max: {args.video}, en boucle, "
                       f"recadree en {size[0]}x{size[1]})")
+            if args.video2:
+                print(f"  (video hors de l'amplitude min et max: {args.video2}, en boucle, "
+                      f"recadree en {size[0]}x{size[1]})")
         else:
             print(" ".join(f'"{c}"' if " " in c else c for c in
                            render_command(args, 0.0, size, sample_png)))
@@ -1352,6 +1574,9 @@ def main() -> None:
               f"par colonne.", flush=True)
     if args.video:
         print(f"Video entre l'amplitude min et max: {args.video.name}, en boucle, "
+              f"recadree en {size[0]}x{size[1]}.", flush=True)
+    if args.video2:
+        print(f"Video hors de l'amplitude min et max: {args.video2.name}, en boucle, "
               f"recadree en {size[0]}x{size[1]}.", flush=True)
     if args.draw_fps > 0:
         print(f"Trace progressif a {args.draw_fps} img/s, termine pile au rafraichissement.",

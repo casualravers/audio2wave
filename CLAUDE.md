@@ -97,10 +97,47 @@ resolution de chemins.
   photo derive par rapport a la musique. La cadence annoncee a ffplay vaut le double
   du rythme des images, sinon sa file se remplit et l'affichage retarde.
   Le trace progressif (`draw_progressively`) se fait **cote Python**, pas dans ffmpeg :
-  canevas persistant, seules les colonnes nouvellement decouvertes y sont recopiees
-  (0,4 ms par pas en 1920x360 contre 1,1 ms en reconstruisant l'image). L'avancee est
-  calculee sur l'horloge et non sur le numero d'image, pour finir a l'echeance meme
-  si un pas traine. Mesure: fin a +1 a +5 ms de l'echeance.
+  seules les colonnes nouvellement decouvertes y sont recopiees (0,4 ms par pas en
+  1920x360 contre 1,1 ms en reconstruisant l'image). L'avancee est calculee sur
+  l'horloge et non sur le numero d'image, pour finir a l'echeance meme si un pas
+  traine. Mesure: fin a +1 a +5 ms de l'echeance.
+  **Le balayage part de la photo precedente (`previous`), pas d'un aplat de fond** :
+  `run()` garde `previous_frame`, la derniere photo entierement affichee, et la
+  passe au balayage suivant, qui la recouvre colonne par colonne au fil de la
+  progression au lieu d'afficher un fond uni d'un coup avant de retracer — la
+  nouvelle courbe "efface" l'ancienne au lieu de faire clignoter l'ecran. `canvas`
+  est reconstruit (`bytearray(previous)`) a chaque appel de `draw_progressively`,
+  jamais reutilise d'une photo a l'autre : un `bytearray` unique mute pendant toute
+  la session s'est avere, a la mesure, affamer le fil de lecture de `VideoSource`
+  (voir plus bas) au bout de quelques photos — une reallocation par appel (cout
+  negligeable, une recopie d'un bloc deja existant) restaure un partage correct du
+  GIL entre les fils.
+  **`--video`/`--video2` se superposent lentement a la photo precedente sur tout
+  le `--beats`, comme `draw_progressively`** — a la demande explicite, malgre un
+  cout de stabilite video mesure et documente ci-dessous : plusieurs variantes ont
+  ete comparees (aplat de fond a chaque photo ; canevas persistant pour toute la
+  session ; devoilement rapide isole en 0,25 s puis maintien plein-cadre ; bref
+  aplat suivi d'un devoilement lent depuis la precedente) et **seul l'aplat de
+  fond a chaque photo s'est avere stable sur la duree** (mesure : ~45 images video
+  distinctes par balayage, aucune degradation sur 8 photos consecutives).
+  Repartir de la photo precedente degrade la lecture video des la deuxieme photo,
+  meme avec un court aplat initial ou un devoilement compresse en 0,25 s (mesure :
+  ~45 images distinctes tombent a 1-15, de facon inegale, quelle que soit la
+  frequence de repeinture). La cause n'est pas le cout de repeindre cote Python
+  mais celui, cote ffplay, de recevoir en continu des images dont la zone hors
+  balayage reste chargee de contenu reel (trait + video) plutot que d'un aplat
+  uniforme — l'image entiere est de toute facon renvoyee a chaque fois (rawvideo
+  brut, pas de diff possible), donc repeindre moins ne change rien au cout de
+  reception. **Choisi malgre tout** : la fluidite de la superposition prime ici
+  sur la fluidite video mesuree au banc synthetique, qui peut exagerer l'effet
+  percu a l'usage reel.
+  A chaque pas, les colonnes deja revelees (`full=False`) n'ont besoin que de la
+  video et du trait (voir paint_pencil_columns), pas d'un nouveau reset du fond;
+  seules les colonnes tout juste decouvertes (`full=True`) ont besoin du fond en
+  plus, pour effacer ce que la bande montrait a l'ancienne position de
+  l'enveloppe. Le trait est repeint dans les deux cas, sinon la video l'effacerait
+  au premier rafraichissement d'une colonne deja revelee (bug corrige : la
+  delimitation de la bande devenait invisible au bout de quelques pas).
   **`--gui`** : meme mecanisme que `audio2wave_ridge.py` (fil separe pour `run()`,
   fenetre tkinter qui ne fait que muter `args`). Particularite ici : les couleurs
   resolues dependent du **style**, pas seulement de `args.colors`/`args.bg_color`
@@ -111,7 +148,19 @@ resolution de chemins.
   encadre aussi tout le calcul d'une photo dans un `try/except (SystemExit,
   Exception)` pour qu'un reglage temporairement invalide (crossover mal forme,
   etc. — ces fonctions font `sys.exit(2)` en ligne de commande) saute une photo au
-  lieu de tuer le fil de rendu.
+  lieu de tuer le fil de rendu. Expose tout ce que `run()` relit deja frais a
+  chaque photo (style, couleurs, epaisseur, `--wave`, points/colonnes, echelle,
+  filtre, crossover, **gain** — case "auto" + curseur manuel en dB, `resolve_gain`
+  lu chaque photo — et **`--save-dir`** — champ texte, `mkdir(parents=True,
+  exist_ok=True)` a la validation puisque `write_png` ne cree pas ses dossiers
+  parents — en plus des images/s). Exclut deliberement tout ce qui est fige dans
+  un sous-processus deja lance au demarrage et jamais rouvert : `--stereo`/
+  `--split-channels` (nombre de canaux fige dans `capture_command`, dont
+  `channel_count(args)` deriverait sinon d'une commande de capture different de
+  ce qu'elle affiche reellement), `--rate`/`--buffer` (capture), `--size`/
+  `--fullscreen` (fenetre ffplay), `--beats`/`--bpm`/`--interval` (cadence de
+  `run()`), `--video`/`--video2` (un seul `VideoSource` cree avant la boucle,
+  jamais recree).
   **`--video`** (pencil seul) remplit la bande entre les deux traits de l'enveloppe
   (amplitude min/max) avec une video jouee en boucle — pas jusqu'au bord bas de
   l'image. `VideoSource` reprend le modele de `LiveCapture` (un fil vide le tube,
@@ -131,6 +180,44 @@ resolution de chemins.
   +12 ms contre ±1-5 ms sans video. Refuse explicitement hors `pencil` :
   `rekordbox`/`simple` composent dans un graphe ffmpeg, il faudrait un masque
   `alphamerge`.
+  **`--video2`** joue une deuxieme `VideoSource` (meme fichier ou non), independante
+  de `--video`, mais peinte **hors** de la bande d'enveloppe plutot que dedans : la
+  meme paire `(top, bottom)` deja calculee dans `paint_pencil_columns` pour `video`
+  sert de frontiere, `video_out` remplit tout ce qui reste au-dessus (`[0, top)`) et
+  en dessous (`(bottom, height)`). Les deux sont facultatives et independantes l'une
+  de l'autre (`video`/`video_out` peuvent valoir `None` separement dans
+  `paint_pencil_columns`/`compose_pencil`/`draw_pencil_video_progressively`), donc
+  `--video2` fonctionne seule (bande au `--bg-color`, reste en video) ou combinee a
+  `--video`. Meme frontiere `top`/`bottom` que la bande interieure : pas de liseret
+  de fond qui apparaitrait entre les deux videos sur une attaque. Le dispatch dans
+  `run()` bascule sur `draw_pencil_video_progressively` des que l'une des deux est
+  active (`video is not None or video_out is not None`), pas seulement `video`.
+  **`video_out` est deliberement DECOUPLE du front du balayage progressif**, a la
+  difference de tout le reste de `draw_pencil_video_progressively` (trait, video
+  interieure) : peint sur toute la largeur `[0, width)` a chaque pas de la boucle,
+  jamais limite a `[0, drawn)`. Bug observe en usage reel avec la version couplee :
+  les colonnes que le trait n'avait pas encore atteintes gardaient l'image video
+  capturee avant le DEBUT du balayage (figee jusqu'a un plein `--beats`), puis
+  sautaient d'un coup a l'image courante des que le front les rejoignait — perceptible
+  comme des coupures plutot qu'une lecture continue. Correction : `video_out` peint en
+  dernier dans la boucle, sur toute la largeur, par-dessus les deux passes
+  `full=True`/`full=False` du reste ; sans risque de recouvrir le trait ou la video
+  interieure puisqu'il ne touche jamais leur zone (`[0, top)` et `(bottom, height)`
+  uniquement). `video` (interieure), elle, reste couplee au front — c'est elle qui
+  porte la lente superposition demandee sur `--video` (voir plus haut), video_out n'a
+  pas cette contrainte puisqu'elle n'est pas cense "se reveler" avec le trait.
+  **Le trait ne survit jamais d'une photo a l'autre, meme pendant le balayage** :
+  `run()` reconstruit `previous_frame` apres chaque balayage via
+  `compose_pencil(..., draw_ink=False)` (fond + video, sans trait) plutot que de
+  reutiliser le dernier canevas envoye par `draw_pencil_video_progressively` (qui,
+  lui, contient le trait). Bug observe en usage reel sans cette exclusion : la
+  portion du prochain balayage pas encore atteinte par le front affichait encore
+  le trait de la photo precedente, coexistant avec le nouveau trait qui se
+  dessine par dessus depuis la gauche — deux contours simultanement visibles au
+  lieu d'un seul qui remplace l'autre. `paint_pencil_columns`/`compose_pencil`
+  prennent un parametre `draw_ink` (defaut `True`) pour ca ; fond et video, eux,
+  restent bien ceux de la photo precedente (c'est tout le sens de la
+  superposition lente ci-dessus), seul le trait en est exclu.
 - [audio2wave_ridge.py](audio2wave_ridge.py) — vagues empilees facon "ridge plot"
   (Joy Division) : meme cadence/capture qu'`audio2wave_snap.py`, mais **le canevas ne
   repart jamais du fond**. A chaque rafraichissement : `shift_canvas` decale tout le
@@ -305,4 +392,7 @@ a crete normalisee le trace touche les bords quelle que soit `--scale`
 
 `asset/` (sources) et `output/` (rendus) sont gitignores. Une source est cherchee telle
 quelle puis dans `--asset-dir` ; un nom de sortie sans dossier atterrit dans `--output-dir`,
-un chemin explicite est respecte. L'extension est forcee selon `--format`.
+un chemin explicite est respecte. L'extension est forcee selon `--format`. Meme
+convention pour `--video`/`--video2` d'`audio2wave_snap.py` : cherches tels quels puis
+dans `--asset-dir` (defaut `asset`, pas de `--output-dir` cote snap puisqu'il n'ecrit
+pas de fichier video).
