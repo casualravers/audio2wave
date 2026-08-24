@@ -4,13 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Contexte
 
-Trois scripts Python autonomes (stdlib seulement, Python 3.10+ pour `X | Y`) qui pilotent
+Quatre scripts Python autonomes (stdlib seulement, Python 3.10+ pour `X | Y`) qui pilotent
 ffmpeg. Pas de packaging, pas de dependances, pas de suite de tests.
 
 **Toute la documentation, les commentaires et les messages CLI sont en francais sans
 accents** (compatibilite console Windows). Garder cette convention dans tout ajout.
 
 Prerequis externe : `ffmpeg`, `ffprobe` et `ffplay` dans le PATH.
+
+**`--gui`** (les trois scripts interactifs) ouvre une fenetre de reglages tkinter
+(stdlib, importee en `try/except ImportError` pour rester optionnelle). Meme
+squelette partout : `run()` tourne dans un fil separe pendant que tkinter possede le
+fil principal, `build_gui()` ne fait que muter `args`/declencher un evenement,
+`stop_event`/`finished_event` orchestrent un arret propre dans les deux sens (fenetre
+de reglages fermee, ou fenetre video fermee/Ctrl+C). Ce que "en direct" veut dire
+differe selon l'architecture de chaque script — voir les puces ci-dessous.
 
 ## Commandes
 
@@ -21,12 +29,14 @@ python audio2wave_live.py -d "<entree>" --tune   # mesure le niveau, conseille u
 python audio2wave_live.py -d "<entree>" --dry-run
 python audio2wave_snap.py -d "<entree>" --dry-run
 python audio2wave_snap.py --list-presets                # jeux d'options nommes
+python audio2wave_ridge.py -d "<entree>" --dry-run
 ```
 
-Sans peripherique sous la main, `audio2wave_snap.py` est le seul des trois dont le
-rendu se teste sans capture : `render_command`/`render_photo` prennent du PCM `s16le`
-sur stdin, donc un bloc synthetique genere en Python suffit a exercer le vrai chemin
-de code et a verifier l'image produite (taille exacte = `width * height * 3`).
+Sans peripherique sous la main, `audio2wave_snap.py` et `audio2wave_ridge.py` sont
+les seuls dont le rendu se teste sans capture : leurs fonctions de rendu prennent du
+PCM `s16le` directement (en argument ou sur stdin), donc un bloc synthetique genere
+en Python suffit a exercer le vrai chemin de code et a verifier l'image produite
+(taille exacte = `width * height * 3`).
 
 `--dry-run` est le principal outil de verification : il imprime la chaine de filtres
 generee. C'est la maniere de valider un changement de `build_filter` sans audio ni
@@ -46,6 +56,18 @@ resolution de chemins.
   `Popen(stdin=source.stdout)` et **pas** via un pipe shell, qui corromprait le flux
   binaire sous PowerShell ; le parent doit fermer `source.stdout` pour que ffmpeg voie
   la fermeture de la fenetre.
+  **`--gui`** ne peut pas muter des attributs relus en direct comme les deux autres
+  scripts : il n'y a pas de boucle Python par image ici, le tube `source.stdout ->
+  display.stdin` est direct (voir ci-dessus, deliberement pour la latence). `run()`
+  supervise donc un cycle spawn/attente/nettoyage (`spawn()`, factoree de l'ancien
+  `main()`) et le rejoue entierement quand `restart_event` est positionne (clic sur
+  "Appliquer" dans `build_gui()`) : ancienne paire terminee, nouvelle paire lancee
+  avec les `args` a jour. `stop_event` sort de la boucle definitivement ; il est aussi
+  positionne automatiquement des que `display.poll()` n'est plus `None` (fenetre
+  fermee par l'utilisateur), pour que ce cas arrete tout au lieu de relancer. Verifie
+  sans peripherique reel en substituant `spawn()` par une paire `ffmpeg -f lavfi
+  testsrc -> ffplay` : redemarrage confirme par des PID differents a chaque cycle,
+  fermeture de fenetre confirmee par `stop_event` sans nouvelle paire.
 - [audio2wave_snap.py](audio2wave_snap.py) — photo fixe, rafraichie au meme rythme que sa
   duree, tracee progressivement. Duree en temps plutot qu'en secondes (`--bpm`/`--beats`,
   defaut 4 temps soit une mesure a 4/4). Deux familles de rendu: `--style pencil` (defaut)
@@ -65,12 +87,68 @@ resolution de chemins.
   (0,4 ms par pas en 1920x360 contre 1,1 ms en reconstruisant l'image). L'avancee est
   calculee sur l'horloge et non sur le numero d'image, pour finir a l'echeance meme
   si un pas traine. Mesure: fin a +1 a +5 ms de l'echeance.
+  **`--gui`** : meme mecanisme que `audio2wave_ridge.py` (fil separe pour `run()`,
+  fenetre tkinter qui ne fait que muter `args`). Particularite ici : les couleurs
+  resolues dependent du **style**, pas seulement de `args.colors`/`args.bg_color`
+  (`resolve_colors`/`resolve_bg`), donc `run()` compare les valeurs *resolues* d'un
+  tour a l'autre, pas les attributs bruts, pour savoir quand resonder. Changer de
+  style dans la fenetre reinitialise les champs couleur (`resolve_colors` sort en
+  erreur si `rekordbox` recoit une seule couleur, ou `pencil` un `|`) ; `run()`
+  encadre aussi tout le calcul d'une photo dans un `try/except (SystemExit,
+  Exception)` pour qu'un reglage temporairement invalide (crossover mal forme,
+  etc. — ces fonctions font `sys.exit(2)` en ligne de commande) saute une photo au
+  lieu de tuer le fil de rendu.
+- [audio2wave_ridge.py](audio2wave_ridge.py) — vagues empilees facon "ridge plot"
+  (Joy Division) : meme cadence/capture qu'`audio2wave_snap.py`, mais **le canevas ne
+  repart jamais du fond**. A chaque rafraichissement : `shift_canvas` decale tout le
+  contenu existant vers le haut de `--ridge-spacing` px (une seule affectation de
+  tranche, pas de boucle pixel), puis `paint_ridge_line` peint la nouvelle ligne —
+  fond repeint de la crete jusqu'a la base pour chaque colonne (occulte tout ce qui
+  deborde dans cette zone, decale la, sans comparaison de hauteur entre lignes),
+  trait d'encre par dessus. `deform_envelope` ajoute un bruit synthetique lisse
+  (peu de points de controle interpoles, pas un bruit par colonne) pour qu'un signal
+  stable ne produise jamais deux lignes identiques. `draw_ridge_progressively` est la
+  variante persistante de `draw_progressively` (`audio2wave_snap.py`) : revele la
+  ligne nouvellement peinte colonne par colonne dans le meme `canvas` qui survit
+  d'un rafraichissement a l'autre, jamais reconstruit depuis le fond. Fichier separe
+  plutot qu'un `--style` de plus dans `audio2wave_snap.py`, a la demande explicite :
+  il reutilise par import la plomberie generique de ce dernier (`LiveCapture`,
+  `amplitude_envelope`, `resolve_gain`, `probe_color`, `resolve_size`, `resolve_points`,
+  `capture_command`, `chunk_size`, `describe_window`, `write_png`, `send_frame`) plutot
+  que de la dupliquer, exactement comme `audio2wave_snap.py` le fait deja vis-a-vis
+  d'`audio2wave.py`/`audio2wave_live.py`. Mesure : `render_ridge_line` + `shift_canvas`
+  + `paint_ridge_line` sous les 25 ms en 1920x360 et 1920x1080, loin sous le budget
+  d'un rafraichissement meme au minimum (`--beats 1`). `RidgeGain` remplace
+  `resolve_gain` (qui normalise chaque photo independamment, correct pour
+  `audio2wave_snap.py` ou une seule image est visible a la fois) : ici des dizaines
+  de lignes restent affichees ensemble, donc `--gain auto` calibre sa reference sur
+  le plus fort pic des `--gain-window` dernieres lignes (8 par defaut), pas sur la
+  ligne courante seule. Bug observe et corrige en usage reel : sans ce lissage,
+  chaque passage calme entre deux temps se normalise au meme plafond qu'un passage
+  fort, et l'occultation efface le relief accumule a chaque rafraichissement —
+  rendu plat, colle en haut de l'ecran, "signal carre".
+  **`--gui` lance une fenetre tkinter de reglages en direct**, dans un fil separe de
+  la boucle de capture/rendu (`run()`), pour laisser tkinter posseder le fil
+  principal. La fenetre ne fait que muter les attributs de `args` ; `run()` les
+  relit a chaque ligne, donc un changement s'applique au rafraichissement suivant
+  sans redemarrer capture ni fenetre ffplay. Pas de verrou entre les deux fils :
+  une affectation d'attribut simple (int/float/str) est atomique sous le GIL,
+  suffisant ici. Exception : les couleurs (`ink`/`background`) sont sondees une
+  fois en octets RGB avant la boucle (cout d'un sous-processus ffmpeg) ; `run()`
+  compare `args.colors`/`args.bg_color` a la valeur vue au tour precedent et ne
+  resonde que si elle a change. `--beats`/`--bpm`/`--interval`/`--size`/
+  `--fullscreen` ne sont volontairement pas exposes dans la fenetre : ils
+  determinent la taille du bloc de capture ou de la fenetre ffplay, pas juste le
+  rendu d'une ligne, et les changer demanderait de redemarrer capture/canevas/
+  ffplay plutot que de simplement relire un attribut.
 
 ### Couplage entre les fichiers
 
 `audio2wave_live.py` importe `auto_win_size` et `parse_size` depuis `audio2wave.py` ;
 `audio2wave_snap.py` importe `gain_value`/`parse_size` du premier et
-`require_tools`/`list_audio_devices`/`primary_screen_size` du second — modifier ces
+`require_tools`/`list_audio_devices`/`primary_screen_size` du second ;
+`audio2wave_ridge.py` importe ces trois derniers en plus d'une dizaine de fonctions
+et constantes d'`audio2wave_snap.py` (voir la liste ci-dessus) — modifier ces
 signatures casse les scripts en aval. Sont en revanche **dupliques et doivent
 rester synchronises a la main** :
 
@@ -137,6 +215,15 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   `(21,22,28)` au lieu de `(20,22,28)`), donc differente du fond de la photo que le
   trace progressif doit prolonger. Dans le graphe de rendu le probleme ne se pose pas,
   `overlay=format=auto` y force deja le rgb.
+- **`audio2wave_ridge.py` occulte par ordre de peinture, pas par profondeur explicite** :
+  `shift_canvas` decale tout le contenu existant vers le haut avant que
+  `paint_ridge_line` ne peigne la nouvelle ligne — remplir le fond entre le pic et la
+  base occulte donc automatiquement tout contenu plus ancien qui deborde dans cette
+  zone, sans comparer les hauteurs entre lignes. Une ligne plus ancienne mais plus
+  haute que la nouvelle reste visible au-dessus d'elle, une ligne plus basse est
+  recouverte — c'est le decalage prealable qui rend ca correct "gratuitement". Le
+  remplissage et le trait s'ecrivent par tranches a pas fixe (une par canal), pas par
+  pixel : une colonne du canevas n'est pas contigue en memoire.
 - **`format=rgba` explicite avant la sortie PNG** quand le fond doit rester transparent :
   des qu'un `scale` precede, l'encodeur png accepte rgb24 comme rgba et la negociation
   laisse tomber l'alpha. Regression attrapee au test, invisible a l'oeil.

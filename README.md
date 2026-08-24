@@ -1,6 +1,6 @@
 # audio2wave
 
-Trois programmes autour des filtres de visualisation audio de ffmpeg :
+Quatre programmes autour des filtres de visualisation audio de ffmpeg :
 
 - **`audio2wave.py`** — rendu fichier. Un `.wav` en entree, une video en sortie, fond
   transparent (ProRes 4444 ou WebM/VP9) pour overlay direct dans un montage.
@@ -9,6 +9,9 @@ Trois programmes autour des filtres de visualisation audio de ffmpeg :
   pour l'exactitude.
 - **`audio2wave_snap.py`** — photo de waveform. Meme entree live, mais une image fixe
   des N dernieres secondes, rafraichie toutes les N secondes. Rien ne defile.
+- **`audio2wave_ridge.py`** — vagues empilees. Meme principe que la photo, mais rien
+  n'est efface au rafraichissement : chaque nouvelle ligne s'empile devant les
+  precedentes, qui defilent et sortent par le haut comme un sismographe.
 
 ## Prerequis
 
@@ -152,9 +155,29 @@ touche deja les bords a crete normalisee, alors qu'une barre reste loin du plafo
 | `--theme` | ambiance (voir plus haut) ; `--glow 0` si ca saccade | `flat` |
 | `--size` | resolution de rendu | `960x540`, ou l'ecran avec `--fullscreen` |
 | `--fullscreen` | plein ecran | - |
+| `--gui` | ouvre une fenetre de reglages (voir plus bas) | - |
 
 `--shape`, `--colors`, `--bars`, `--bar-gap`, `--max-freq`, `--freq-scale`,
 `--amp-scale`, `--stereo`, `--glow`, `--hue-cycle` se comportent comme en mode fichier.
+
+## Fenetre de reglages (`--gui`)
+
+```bash
+python audio2wave_live.py -d "<entree>" --gui
+```
+
+**Different des deux autres scripts** (`audio2wave_snap.py`/`audio2wave_ridge.py`) :
+ici il n'y a pas de boucle Python par image a relire en direct — le producteur ffmpeg
+et l'afficheur ffplay sont relies par un tube direct, delibere pour la latence (voir
+CLAUDE.md). Un reglage change dans la fenetre ne prend donc effet **qu'au clic sur
+"Appliquer"**, qui relance tout le pipeline avec les nouvelles valeurs : la fenetre
+video se referme et se rouvre, contrairement au changement instantane de
+`--ridge-spacing` ou `--line-width` dans les deux autres scripts. Les curseurs seuls
+(sans clic sur Appliquer) ne redemarrent rien.
+
+Reglable dans la fenetre : style, forme, couleurs, barres/points, gain, lissage,
+stereo, ambiance. Fermer la fenetre de reglages arrete le programme en entier (meme
+effet que Ctrl+C) ; fermer la fenetre video le fait aussi, comme sans `--gui`.
 
 Pour une projection :
 
@@ -394,6 +417,7 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--scale` | `lin` \| `sqrt` \| `cbrt` \| `log` | `lin` |
 | `--filter-mode peak\|average` | crete gardee ou enveloppe lissee par colonne | `peak` |
 | `--draw-fps <n>` | fluidite du trace progressif ; `0` = affichage direct | `30` |
+| `--gui` | ouvre une fenetre de reglages en direct (voir plus bas) | - |
 | `--save-dir <dir>` | ecrit aussi chaque photo en PNG (image entiere) | - |
 | `--size` | resolution | largeur de l'ecran, tiers de sa hauteur |
 | `--rate auto\|<Hz>` | frequence d'echantillonnage de la capture | `auto` |
@@ -401,6 +425,30 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 
 `--colors`, `--bg-color`, `--stereo`, `--split-channels`, `--fullscreen`,
 `--dry-run` se comportent comme dans les autres scripts.
+
+## Fenetre de reglages en direct (`--gui`)
+
+```bash
+python audio2wave_snap.py -d "<entree>" --gui
+```
+
+Ouvre une petite fenetre tkinter avec un controle par reglage : style (pencil /
+rekordbox / simple), couleurs du trait et de fond, epaisseur, `--wave` (case a
+cocher + oscillations), points/colonnes, echelle, filtre par colonne, crossover
+(deux champs Hz) et images/s du trace. Un changement prend effet **a la photo
+suivante**, sans redemarrer la capture ni la fenetre ffplay.
+
+**Changer de style reinitialise les champs couleur** (vides = defaut du nouveau
+style) : `rekordbox` exige trois couleurs separees par `|`, `pencil`/`simple` une
+seule, donc garder la couleur de l'ancien style planterait le rendu de la photo
+suivante. Plus generalement, un reglage temporairement invalide (crossover mal
+forme, par exemple) fait sauter une seule photo — avec un message d'erreur — plutot
+que d'arreter le programme.
+
+Comme pour `audio2wave_ridge.py`, la boucle de capture/rendu tourne dans un fil
+separe pendant que tkinter possede le fil principal ; aucun verrou, une affectation
+d'attribut simple est atomique en Python. Fermer la fenetre de reglages arrete le
+programme en entier (meme effet que Ctrl+C).
 
 ## Resolution et largeur des colonnes
 
@@ -480,3 +528,133 @@ look, et `black` en `simple`. **`--bg-color black` garde l'alpha des filtres** :
 a l'ecran, mais les PNG de `--save-dir` sortent en RGBA a fond transparent, prets a
 etre poses sur un montage. Toute autre couleur est composee dans l'image et remplit
 le PNG.
+
+---
+
+# Vagues empilees — `audio2wave_ridge.py`
+
+Meme principe que `audio2wave_snap.py` (une ligne d'amplitude tracee a chaque
+rafraichissement), mais **rien n'est efface** : chaque nouvelle ligne s'empile devant
+les precedentes, qui defilent vers le haut et sortent de l'ecran comme un
+sismographe. L'effet recherche est celui d'un "ridge plot" facon pochette *Unknown
+Pleasures* de Joy Division — un champ de vagues qui approche.
+
+## Usage
+
+```bash
+python audio2wave_ridge.py --list-devices              # nom exact des entrees
+python audio2wave_ridge.py -d "<entree>"                # 4 temps a 128 BPM
+python audio2wave_ridge.py -d "<entree>" --fullscreen --ridge-spacing 4
+python audio2wave_ridge.py -d "<entree>" --colors "0x39c9ff" --ridge-noise 0.2
+```
+
+## Comment les lignes s'empilent
+
+A chaque rafraichissement (meme cadence `--beats`/`--bpm`/`--interval` que
+`audio2wave_snap.py`) :
+
+1. Le canevas entier **remonte** de `--ridge-spacing` pixels (`--ridge-spacing 6`
+   par defaut). Les rangees qui sortent par le haut sont perdues, les rangees
+   liberees en bas repassent au fond.
+2. La nouvelle ligne "nait" tout en bas et son pic remonte selon l'amplitude du
+   nouvel intervalle. Pour chaque colonne, le fond est repeint de la crete jusqu'a
+   la base **avant** de tracer le trait : c'est ce remplissage, fait apres le
+   decalage, qui occulte automatiquement tout ce qui deborde dans cette zone — sans
+   comparaison de hauteur entre lignes. Une ligne plus ancienne, plus haute que la
+   nouvelle, reste donc visible au-dessus d'elle ; une ligne plus basse est
+   recouverte.
+
+Comme pour `audio2wave_snap.py`, le trace n'apparait pas d'un coup : il se dessine
+de gauche a droite et atteint le bord droit pile au rafraichissement suivant
+(`--draw-fps`, `0` pour un affichage direct).
+
+## Deformation
+
+Chaque ligne recoit un peu de bruit synthetique lisse (`--ridge-noise 0.12` par
+defaut, en fraction de la portee des pics) en plus de l'enveloppe reelle du signal :
+sans ca, un passage audio tres stable produirait des lignes visuellement
+identiques, empilees les unes sur les autres sans aucun relief. Le bruit est
+interpole sur quelques points de controle seulement (pas un point par colonne), pour
+se lire comme une ondulation large et lente — une vague, pas un grain. `0` desactive
+la deformation.
+
+## Options specifiques
+
+| option | role | defaut |
+|---|---|---|
+| `-d`, `--device` | entree DirectShow a capturer | requis |
+| `--ridge-spacing <px>` | espacement vertical entre deux lignes | `6` |
+| `--ridge-noise <0..1>` | deformation synthetique, en fraction de la portee des pics | `0.12` |
+| `--colors` | couleur du trait | `white` |
+| `--bg-color` | couleur de fond et d'occultation | `black` |
+| `--columns <n>` | points de la polyligne de chaque ligne | `96` |
+| `--line-width <n>` | epaisseur du trait | `2` |
+| `--gain auto\|<dB>` | `auto` normalise sur les lignes recentes (voir `--gain-window`) | `auto` |
+| `--gain-window <n>` | nombre de lignes recentes sur lesquelles `--gain auto` lisse sa reference | `8` |
+| `--gui` | ouvre une fenetre de reglages en direct (voir plus bas) | - |
+| `--save-dir <dir>` | ecrit le canevas accumule en PNG a chaque ligne | - |
+
+`--bpm`, `--beats`, `--interval`, `--size`, `--fullscreen`, `--draw-fps`, `--rate`,
+`--buffer`, `--dry-run` se comportent comme dans `audio2wave_snap.py`. Pas de
+`--stereo`/`--split-channels` : ce programme ne trace jamais qu'un seul trait par
+ligne, la capture reste mono.
+
+## Cout et precision
+
+`render_ridge_line` (calcul de l'enveloppe), `shift_canvas` (decalage du canevas) et
+`paint_ridge_line` (occultation + trace) sont mesures ensemble a moins de 25 ms par
+ligne, aux deux tailles usuelles (1920x360 fenetre, 1920x1080 plein ecran) — largement
+sous le budget d'un rafraichissement, meme au minimum (`--beats 1`, ~470 ms a
+128 BPM). Le decalage est une seule affectation de tranche (pas de boucle pixel par
+pixel) ; l'occultation ecrit par tranches a pas fixe (une par canal R/G/B), pas
+colonne par colonne pixel a pixel.
+
+## Gain : lisse sur plusieurs lignes, pas photo par photo
+
+Contrairement a `audio2wave_snap.py` (une seule photo affichee a la fois, normalisee
+independamment a chaque rafraichissement — correct dans ce cas), `audio2wave_ridge.py`
+garde des dizaines de lignes visibles simultanement. Normaliser chaque ligne sur sa
+propre crete, independamment des autres, ecraserait donc le relief : un passage
+quasi silencieux entre deux temps serait remonte au meme plafond qu'un kick, et
+l'occultation effacerait l'historique accumule a chaque rafraichissement — un trace
+plat qui semble tronque, colle en haut de l'ecran, comme un signal carre.
+
+`--gain auto` (defaut) calibre donc sa reference sur **le pic le plus fort des
+`--gain-window` dernieres lignes** (8 par defaut), pas sur la ligne courante seule :
+un passage calme apparait alors nettement plus bas qu'un passage fort recent, ce qui
+est precisement le relief recherche. `--gain-window 1` retrouve le comportement
+instantane (une reference par ligne, comme une photo isolee) ; une fenetre plus
+large lisse davantage mais reagit plus lentement a un vrai changement de niveau.
+
+```bash
+python audio2wave_ridge.py -d "<entree>" --gain-window 16   # lissage plus large
+python audio2wave_ridge.py -d "<entree>" --gain 20          # ou une valeur fixe
+```
+
+## Fenetre de reglages en direct (`--gui`)
+
+```bash
+python audio2wave_ridge.py -d "<entree>" --gui
+```
+
+Ouvre une petite fenetre tkinter a cote de la fenetre de vagues, avec un curseur par
+reglage : espacement, deformation, lissage du gain, epaisseur, points par ligne,
+images/s du trace, plus deux champs texte pour les couleurs (memes noms/valeurs
+hexadecimales qu'en ligne de commande, valides avec Entree ou en changeant de champ).
+Un changement prend effet **a la ligne suivante**, sans redemarrer la capture ni
+rouvrir la fenetre ffplay — seul le rendu en aval bouge, l'historique deja trace
+reste tel quel.
+
+**Ce qui n'est pas reglable en direct** : `--beats`/`--bpm`/`--interval` (change la
+taille du bloc audio capture), `--size`/`--fullscreen` (change la taille de la
+fenetre ffplay et du canevas). Ces reglages determinent la topologie du pipeline
+(capture, canevas, fenetre), pas juste le rendu d'une ligne ; les changer demanderait
+de redemarrer ces trois pieces. Relance le programme pour les changer.
+
+Techniquement, la boucle de capture/rendu tourne dans un fil separe pendant que
+tkinter possede le fil principal (necessaire sur certaines plateformes, prudent sur
+toutes). La fenetre de reglages ne fait que modifier les attributs lus a chaque
+ligne — pas de verrou : une affectation d'un entier/flottant/texte est atomique en
+Python, largement suffisant pour un outil visuel qui n'a pas besoin d'une
+coherence stricte image par image. Fermer la fenetre de reglages arrete le programme
+en entier (meme effet que Ctrl+C).
