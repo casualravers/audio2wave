@@ -46,10 +46,12 @@ SAMPLE_BYTES = 2  # s16le
 # evite juste que la photo soit rasee en haut et en bas.
 AUTO_GAIN_MARGIN_DB = -0.5
 
-# Une photo par temps: la fenetre suit la musique au lieu d'en resumer un passage.
-# Un tempo de reference est indispensable, un flux live n'en annonce aucun.
+# La fenetre suit la musique au lieu d'en resumer un passage, en temps plutot qu'en
+# secondes. Un tempo de reference est indispensable, un flux live n'en annonce aucun.
+# 4 temps (une mesure a 4/4) laisse le temps de lire le trace avant qu'il ne change,
+# la ou 1 seul rafraichit trop vite pour suivre a l'oeil.
 DEFAULT_BPM = 128.0
-DEFAULT_BEATS = 1.0
+DEFAULT_BEATS = 4.0
 
 # Repli si la resolution de l'ecran n'est pas lisible. Une photo de waveform se lit
 # en long: large et basse, comme sur une platine.
@@ -108,6 +110,54 @@ DEFAULT_BUFFER_MS = 50
 # a le rendre fluide; au-dela on n'ajoute que du debit dans le tube.
 DEFAULT_DRAW_FPS = 30
 
+# Couleur du style club: nettement plus vive que le blanc par defaut de pencil, pour se
+# detacher d'un ecran de projection ambiant plutot que se fondre dans une esquisse.
+CLUB_COLOR = "0x39c9ff"
+
+# Jeux d'options nommes, pour lancer le programme sans recopier la meme ligne de
+# commande a chaque fois. Un --preset fixe des defauts: toute option passee en plus sur
+# la ligne de commande garde la priorite, y compris sur un preset. Les cles sont les
+# noms longs des options (avec des _), tels qu'argparse les stocke.
+PRESETS: dict[str, dict[str, object]] = {
+    # Contour anime en sinusoide plutot qu'en silhouette figee.
+    "wave": dict(style="pencil", wave=WAVE_CYCLES),
+    # Plein ecran pour une projection: trait plus epais et couleur vive pour rester
+    # lisible de loin, sinusoide pour l'aspect vivant.
+    "club": dict(style="pencil", wave=WAVE_CYCLES, line_width=3, fullscreen=True,
+                colors=CLUB_COLOR),
+    # Le look d'un ecran de platine, tel quel.
+    "rekordbox": dict(style="rekordbox"),
+    # Onde pleine d'une seule couleur, echelle qui remonte les passages faibles: la
+    # lecture d'un editeur audio plutot que d'un contour au crayon.
+    "editor": dict(style="simple", scale="sqrt"),
+}
+
+# Raccourcis vers les presets ci-dessus, resolus insensibles a la casse. Un nom de
+# preset entier reste toujours accepte tel quel.
+PRESET_ALIASES: dict[str, str] = {
+    "w": "wave",
+    "c": "club",
+    "rb": "rekordbox",
+    "e": "editor",
+}
+
+
+def describe_presets() -> str:
+    reverse_alias = {name: alias for alias, name in PRESET_ALIASES.items()}
+    return ", ".join(
+        f"{name} ({reverse_alias[name]})" if name in reverse_alias else name
+        for name in PRESETS
+    )
+
+
+def preset_value(raw: str) -> str:
+    key = raw.strip().lower()
+    if key in PRESETS:
+        return key
+    if key in PRESET_ALIASES:
+        return PRESET_ALIASES[key]
+    raise argparse.ArgumentTypeError(f"preset inconnu: {raw} (disponibles: {describe_presets()})")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -119,6 +169,13 @@ def parse_args() -> argparse.Namespace:
                     help="Nom exact du peripherique d'entree DirectShow (voir --list-devices)")
     p.add_argument("--list-devices", action="store_true",
                     help="Liste les entrees audio disponibles et quitte")
+    p.add_argument("--preset", type=preset_value, default=None,
+                    help=f"Charge un jeu d'options nomme (voir --list-presets pour le detail). "
+                         f"Alias entre parentheses, tous deux acceptes. Toute option passee en "
+                         f"plus sur la ligne de commande garde la priorite sur le preset "
+                         f"(disponibles: {describe_presets()})")
+    p.add_argument("--list-presets", action="store_true",
+                    help="Detaille les presets disponibles et quitte")
 
     p.add_argument("--bpm", type=float, default=DEFAULT_BPM,
                     help=f"Tempo de reference, pour exprimer la duree d'une photo en temps. "
@@ -208,6 +265,26 @@ def parse_args() -> argparse.Namespace:
                     help="Affiche les commandes ffmpeg/ffplay sans les executer")
 
     args = p.parse_args()
+
+    if args.list_presets:
+        reverse_alias = {name: alias for alias, name in PRESET_ALIASES.items()}
+        print("Presets disponibles (--preset <nom ou alias>):\n")
+        for name, overrides in PRESETS.items():
+            alias = reverse_alias.get(name)
+            print(f"  {name}" + (f" ({alias})" if alias else ""))
+            for key, value in overrides.items():
+                flag = f"--{key.replace('_', '-')}"
+                print(f"      {flag}" if value is True else f"      {flag} {value}")
+            print()
+        sys.exit(0)
+
+    if args.preset:
+        # set_defaults() ne change que la valeur prise en l'absence de l'option sur la
+        # ligne de commande: reparser sys.argv derriere garde la priorite a toute option
+        # explicite, preset ou pas. C'est le sens du "en plus" annonce dans l'aide.
+        p.set_defaults(**PRESETS[args.preset])
+        args = p.parse_args()  # re-parse: --preset est deja resolu, refait a l'identique
+
     # --interval reste la mesure de reference partout dans le programme; --bpm/--beats
     # ne sont qu'une facon plus musicale de le fixer.
     args.interval_from_beats = args.interval is None
@@ -747,6 +824,10 @@ def draw_progressively(viewer: subprocess.Popen, frame: bytes, size: tuple[int, 
 def main() -> None:
     args = parse_args()
     require_tools()
+
+    if args.preset:
+        print(f"Preset '{args.preset}' applique (les options passees en plus restent "
+              f"prioritaires).", flush=True)
 
     if args.list_devices:
         devices = list_audio_devices()
