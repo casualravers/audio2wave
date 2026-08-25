@@ -26,6 +26,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common import (
+    GUI_ACCENT, GUI_ACCENT_FG, GUI_BG, GUI_FG, GUI_FONT, GUI_FONT_BOLD, GUI_FONT_HEADING,
+    GUI_FONT_MONO, GUI_MUTED_FG, GUI_PANEL_BG, auto_win_size, gain_value, parse_size,
+    style_gui, style_option_menu,
+)
+
 # Correction appliquee au-dessus d'une normalisation de crete, pour que le trace
 # remplisse l'image sans la deborder. Les echelles cbrt etant multiplicatives, ce
 # terme agit comme un facteur d'echelle constant sur la hauteur.
@@ -95,15 +101,6 @@ def compose_scene(trace: str, background: str | None, glow: float,
         + f"{background}[bg];[bg][halo]overlay=shortest=1[lit];"
           f"[lit][sharp]overlay=shortest=1[v]"
     )
-
-
-def gain_value(raw: str) -> float | str:
-    if raw.strip().lower() == "auto":
-        return "auto"
-    try:
-        return float(raw)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"gain invalide: {raw} (un nombre en dB, ou 'auto')")
 
 
 def parse_args() -> argparse.Namespace:
@@ -273,26 +270,6 @@ def resolve_analysis_rate(args: argparse.Namespace, source: Path) -> tuple[int |
     if source_rate <= target:
         return None, source_rate  # deja plus etroit que demande, rien a gagner
     return target, target
-
-
-def auto_win_size(rate: int, fps: int) -> int:
-    """Plus grande fenetre FFT qui produit encore fps images par seconde.
-
-    showfreqs sort environ 2*rate/win_size images par seconde. Si c'est moins que
-    fps, il en manque et la video sort tronquee au lieu d'etre simplement moins fine.
-    """
-    limit = int(2 * rate / max(fps, 1))
-    size = 1 << max(limit, 1).bit_length() - 1  # puissance de deux inferieure ou egale
-    return max(256, min(size, 65536))
-
-
-def parse_size(size: str) -> tuple[int, int]:
-    try:
-        width, height = (int(part) for part in size.lower().split("x", 1))
-    except ValueError:
-        print(f"Resolution invalide: {size} (attendu WIDTHxHEIGHT, ex. 1920x1080)", file=sys.stderr)
-        sys.exit(2)
-    return width, height
 
 
 def build_filter(args: argparse.Namespace, gain: float = 0.0,
