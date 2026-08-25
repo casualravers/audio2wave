@@ -20,6 +20,20 @@ fil principal, `build_gui()` ne fait que muter `args`/declencher un evenement,
 de reglages fermee, ou fenetre video fermee/Ctrl+C). Ce que "en direct" veut dire
 differe selon l'architecture de chaque script — voir les puces ci-dessous.
 
+Meme theme visuel partout aussi : `style_gui(root)` (dans `audio2wave.py`, importee
+par les trois) pose une palette sombre coherente via `root.option_add(...)`, qui
+cascade a tout widget Tk classique cree APRES l'appel — un seul point de reglage
+plutot que redupliquer bg/fg/font sur chaque `tk.Label`/`tk.Entry`/`tk.Scale` des
+trois fichiers. `audio2wave.py` lui-meme n'a pas de `--gui` et n'importe pas
+tkinter ; `style_gui`/`style_option_menu` acceptent `root` en duck-typing (aucune
+reference a `tk.*`) pour ne pas lui donner cette dependance. Exception notable :
+`tk.OptionMenu` fixe ses propres couleurs a la construction et ignore la palette
+posee par `option_add` — `style_option_menu(menu_widget)` doit etre appelee juste
+apres chaque `tk.OptionMenu(...)` pour rattraper le bouton et son menu deroulant
+(`["menu"]`, une fenetre Tk separee). Les indicateurs natifs de `Radiobutton`/
+`Checkbutton` (le cercle/la case a cocher) restent dessines par le theme Windows
+et ne suivent pas la palette, cote OS et hors de portee de Tk.
+
 ## Commandes
 
 ```bash
@@ -82,6 +96,77 @@ resolution de chemins.
   pendant que la nouvelle tourne deja), position reprise confirmee via
   `find_window_position`, paire precedente preservee sur un echec simule, fermeture
   de fenetre confirmee par `stop_event` sans nouvelle paire.
+  **Tout parametre est exposable dans `build_gui()`**, a la difference de
+  `audio2wave_snap.py`/`audio2wave_ridge.py` : comme `apply()` redemarre tout le
+  pipeline (rien n'est relu en direct par un `run()` par-image, voir ci-dessus), il
+  n'y a pas de commande de capture ou de fenetre deja figee a proteger — la seule
+  limite est de ne pas surcharger la fenetre. `--glow`/`--hue-cycle` (halo et derive
+  de teinte de `--theme`), `--bar-gap` et `--freq-scale`/`--amp-scale` (forme du
+  spectre) sont ainsi exposes en plus du strict minimum initial. `--glow`/
+  `--hue-cycle` valent `None` par defaut (c'est alors `--theme` qui les fixe, voir
+  `resolve_theme`) : leurs curseurs affichent la valeur deja resolue pour le theme
+  courant a l'ouverture, mais comme `--bars` (valeur par defaut selon le style),
+  les toucher fige une valeur explicite dans `args` pour tous les "Appliquer"
+  suivants, y compris apres un changement de `--theme`.
+  **`--reactive`** fait "respirer" `--glow` avec le niveau audio mesure, par
+  redemarrages seamless automatiques (meme mecanisme que le bouton Appliquer,
+  voir plus haut) plutot que par une modulation continue. Exploration menee avant
+  d'ecrire le moindre code : ffmpeg n'expose qu'un seul canal pour piloter un
+  filtre (`gblur`) en cours de route sans redemarrer, le filtre `zmq` — confirme
+  fonctionnel (`sendcmd` scripte sur `gblur@nom`/`hue@nom`, la valeur moyenne des
+  pixels change exactement a l'image programmee) mais **le client ne peut venir
+  que de `pyzmq`, absent de la stdlib** (aucun `zmqsend` fourni avec ce build
+  ffmpeg Windows), ce qui violerait "stdlib seulement" en tete de ce document —
+  d'ou le choix du redemarrage plutot qu'un client ZMTP ecrit a la main.
+  Le niveau est mesure via `add_reactive_metering` : scinde `[0:a]` (`asplit`)
+  avant que `build_filter()` ne s'en empare, une derivation traverse
+  `astats=metadata=1,ametadata=print:...:direct=1` puis `anullsink`. Deux ecueils
+  mesures avant de se fixer sur cette forme : `file=-` (stdout) semblait ecrire
+  sur stderr dans un test isole (`-af` + `-f null -`), mais dans le vrai graphe a
+  plusieurs branches il ecrit sur le MEME stdout que le muxer rawvideo — confirme
+  en observant le texte entrelace dans les octets de trame, flux video corrompu ;
+  un fichier est donc la seule sortie sure. Et sans `direct=1`, l'ecriture reste
+  bufferisee par la libc et n'apparait qu'a la fermeture du processus (mesure via
+  `-re`, cadence temps reel : aucune ligne visible avant la toute fin sans
+  `direct=1`, incrementales avec). Chemin de fichier RELATIF uniquement (`cwd` du
+  sous-processus fixe a son dossier parent dans `spawn()`) : un chemin absolu
+  Windows (`C:\...`) casse le parseur d'options de filtre a cause du `:` du
+  lecteur — `\:` echappe et guillemets simples autour de la valeur testes,
+  echouent aussi.
+  **Chaque `spawn()` utilise un nom de fichier NEUF**, jamais reutilise : sur
+  Windows, effacer/recreer un meme fichier alors que l'ancien producteur (encore
+  actif pendant le court chevauchement du redemarrage seamless) le tient encore
+  ouvert leve `WinError 32` — contrairement a POSIX ou `unlink()` sur un fichier
+  ouvert reste silencieux. `read_reactive_level` (un seul fil pour toute la
+  session) suit donc le chemin COURANT via `level_state["path"]`, mis a jour par
+  `run()` apres chaque redemarrage reussi ; l'ancien fichier n'est efface qu'une
+  fois l'ancien producteur confirme termine (`wait()` deja passe). Meme ce
+  `wait()` ne garantit pas toujours que Windows a deja relache le fichier
+  (`PermissionError` constate malgre tout, vraisemblablement un antivirus/filtre
+  systeme qui garde la main un instant de plus) : `discard_level_file` avale
+  `OSError` plutot que de laisser une suppression best-effort planter tout le fil
+  de supervision pour un fichier temporaire sans consequence.
+  **Bug corrige, distinct de --reactive mais qui l'a rendu visible** : la
+  demande de redemarrage (`restart_event.set()`) etait effacee par un
+  `restart_event.clear()` qui tournait juste APRES un spawn reussi. Un `set()`
+  arrivant dans cette fenetre (le bouton Appliquer d'un humain n'y tombe presque
+  jamais, un fil automatique qui sonde toutes les REACTIVE_POLL_S si) etait perdu
+  en silence : aucun redemarrage n'avait lieu alors qu'un changement l'exigeait.
+  Deplace en tete de boucle, avant `spawn()` : rien n'efface plus la demande
+  jusqu'au prochain passage, un `set()` pendant le spawn/le delai de grace ou
+  pendant la boucle de service reste donc vu.
+  **`REACTIVE_SMOOTH` doit couvrir plusieurs secondes, pas juste quelques
+  lectures** : a 5 lectures (1,5 s a `REACTIVE_POLL_S=0.3`), un seul coup fort
+  isole (un kick, une attaque breve) suffisait a deplacer la moyenne glissante
+  au-dela de `REACTIVE_GLOW_DELTA` — observe en usage reel, la fenetre "se
+  rouvre" (le redemarrage reste visible, meme "seamless") au moindre changement
+  soudain, pas seulement sur un vrai changement d'ambiance. Passe a 20 lectures
+  (6 s) : un coup bref pese alors trop peu dans la moyenne pour a lui seul
+  franchir le seuil, il faut un changement de niveau SOUTENU (un couplet qui
+  monte, une transition) pour declencher un redemarrage. Verifie en isolant
+  l'algorithme de `reactive_watcher` d'un vrai ffmpeg (level_state pilote a la
+  main) : un pic d'une seule lecture ne redemarre rien, un changement plus long
+  que la fenetre de lissage si.
 - [audio2wave_snap.py](audio2wave_snap.py) — photo fixe, rafraichie au meme rythme que sa
   duree, tracee progressivement. Duree en temps plutot qu'en secondes (`--bpm`/`--beats`,
   defaut 4 temps soit une mesure a 4/4). Deux familles de rendu: `--style pencil` (defaut)
@@ -260,16 +345,42 @@ resolution de chemins.
   `--fullscreen` ne sont volontairement pas exposes dans la fenetre : ils
   determinent la taille du bloc de capture ou de la fenetre ffplay, pas juste le
   rendu d'une ligne, et les changer demanderait de redemarrer capture/canevas/
-  ffplay plutot que de simplement relire un attribut.
+  ffplay plutot que de simplement relire un attribut. Expose aussi **`--gain`**
+  (case "auto" + curseur manuel en dB, meme mecanique que `audio2wave_snap.py`,
+  mais lu par `RidgeGain.resolve` plutot que `resolve_gain`, voir plus haut) et
+  **`--save-dir`** (`mkdir(parents=True, exist_ok=True)` a la validation, `run()`
+  relit `args.save_dir` a chaque ligne pour le chemin du PNG) : les deux
+  manquaient face a `audio2wave_snap.py --gui` sans raison technique, seulement
+  pas encore ajoutes.
 
 ### Couplage entre les fichiers
 
-`audio2wave_live.py` importe `auto_win_size` et `parse_size` depuis `audio2wave.py` ;
-`audio2wave_snap.py` importe `gain_value`/`parse_size` du premier et
+[common.py](common.py) porte la plomberie qui ne depend d'aucun style visuel :
+capture DirectShow (`capture_input_args`, `list_audio_devices`, `measure_level`),
+tube ffmpeg -> ffplay (`pipe_to_ffplay`, avec le `source.stdout.close()` — voir sa
+docstring), utilitaires ecran (`primary_screen_size`, `find_window_position`),
+verification des outils (`require_tools`), et le socle des reglages `--gui`
+(`parse_size`, `auto_win_size`, `gain_value`, palette `GUI_*`, `style_gui`,
+`style_option_menu`). Extrait pour etre importable **sans** tirer la logique de
+rendu d'`audio2wave.py` (THEMES/compose_scene/gradient_source/resolve_theme
+restent la, propres au style visuel) — c'est ce point d'entree qu'importe
+`audioreactive-warp` (depot separe), qui a besoin de la capture et du tube mais
+pas du rendu de waveform.
+
+`audio2wave.py` et `audio2wave_live.py` **reexportent** ce qu'ils important de
+`common.py` (un simple `from common import ...` suffit : les noms deviennent
+bien attributs du module) pour que les imports existants d'`audio2wave_snap.py`/
+`audio2wave_ridge.py` continuent de fonctionner sans modification :
+`audio2wave_live.py` importe `auto_win_size` et `parse_size` depuis
+`audio2wave.py`, plus `style_gui`/`style_option_menu` et la palette `GUI_*`
+(theme de `--gui`, voir plus haut) ; `audio2wave_snap.py` importe
+`gain_value`/`parse_size`/`style_gui`/`style_option_menu`/`GUI_*` du premier et
 `require_tools`/`list_audio_devices`/`primary_screen_size` du second ;
-`audio2wave_ridge.py` importe ces trois derniers en plus d'une dizaine de fonctions
-et constantes d'`audio2wave_snap.py` (voir la liste ci-dessus) — modifier ces
-signatures casse les scripts en aval. Sont en revanche **dupliques et doivent
+`audio2wave_ridge.py` importe ces trois derniers et `style_gui`/`GUI_*` (pas
+`style_option_menu`, ridge n'a pas d'`OptionMenu`) directement d'`audio2wave.py`,
+en plus d'une dizaine de fonctions et constantes d'`audio2wave_snap.py` (voir la
+liste ci-dessus) — modifier ces signatures casse les scripts en aval. Sont en
+revanche **dupliques et doivent
 rester synchronises a la main** :
 
 | notion | fichier | live |
