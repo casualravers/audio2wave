@@ -32,7 +32,10 @@ try:
 except ImportError:  # tkinter absent de certaines installations minimales de Python
     tk = None
 
-from audio2wave import gain_value, parse_size
+from audio2wave import (
+    GUI_ACCENT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_MUTED_FG, GUI_PANEL_BG, gain_value,
+    parse_size, style_gui, style_option_menu,
+)
 from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
@@ -1159,12 +1162,16 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     root = tk.Tk()
     root.title("audio2wave snap - reglages")
     root.resizable(False, False)
+    style_gui(root)
     row = 0
 
     def next_row() -> int:
         nonlocal row
         row += 1
         return row - 1
+
+    tk.Label(root, text="Reglages photo", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
+            ).grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
 
     style_var = tk.StringVar(value=args.style)
 
@@ -1223,7 +1230,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             setattr(args, attr, var.get())
 
         var.trace_add("write", on_change)
-        tk.OptionMenu(root, var, *choices).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        menu = tk.OptionMenu(root, var, *choices)
+        style_option_menu(menu)
+        menu.grid(row=r, column=1, sticky="w", padx=8, pady=4)
 
     colors_var = add_entry("Couleur(s) (vide = defaut)", "colors")
     bg_var = add_entry("Couleur de fond (vide = defaut)", "bg_color")
@@ -1312,8 +1321,12 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     save_entry.bind("<Return>", apply_save_dir)
     save_entry.bind("<FocusOut>", apply_save_dir)
 
-    status_label = tk.Label(root, text="", justify="left", anchor="w")
-    status_label.grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 8))
+    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
+
+    status_label = tk.Label(root, text="", justify="left", anchor="w", fg=GUI_ACCENT,
+                            font=GUI_FONT_MONO)
+    status_label.grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 10))
 
     def refresh() -> None:
         status_label.config(text=status.get("text", ""))

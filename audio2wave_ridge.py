@@ -31,7 +31,10 @@ try:
 except ImportError:  # tkinter absent de certaines installations minimales de Python
     tk = None
 
-from audio2wave import gain_value, parse_size
+from audio2wave import (
+    GUI_ACCENT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_MUTED_FG, GUI_PANEL_BG, gain_value,
+    parse_size, style_gui,
+)
 from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
 # Reutilise la plomberie generique d'audio2wave_snap.py (capture, fil de lecture,
 # enveloppe d'amplitude, sonde de couleur) plutot que de la dupliquer: c'est le meme
@@ -421,6 +424,10 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     root = tk.Tk()
     root.title("audio2wave vagues - reglages")
     root.resizable(False, False)
+    style_gui(root)
+
+    tk.Label(root, text="Reglages vagues", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
 
     def add_slider(row: int, label: str, attr: str, lo: float, hi: float, step: float,
                   initial: float | None = None) -> None:
@@ -435,16 +442,16 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                 variable=var, length=220, showvalue=True, command=on_change,
                 ).grid(row=row, column=1, padx=8, pady=4)
 
-    add_slider(0, "Espacement (px)", "ridge_spacing", 1, 40, 1)
-    add_slider(1, "Deformation", "ridge_noise", 0.0, 1.0, 0.01)
-    add_slider(2, "Lissage du gain (lignes)", "gain_window", 1, 60, 1)
-    add_slider(3, "Epaisseur du trait (px)", "line_width", 1, 10, 1)
+    add_slider(1, "Espacement (px)", "ridge_spacing", 1, 40, 1)
+    add_slider(2, "Deformation", "ridge_noise", 0.0, 1.0, 0.01)
+    add_slider(3, "Lissage du gain (lignes)", "gain_window", 1, 60, 1)
+    add_slider(4, "Epaisseur du trait (px)", "line_width", 1, 10, 1)
     # args.columns peut valoir None (auto): on affiche alors la valeur effective
     # (resolve_points) plutot que None, mais des qu'on touche le curseur la valeur
     # devient explicite, comme --columns en ligne de commande.
-    add_slider(4, "Points par ligne (0=plein)", "columns", 0, 400, 4,
+    add_slider(5, "Points par ligne (0=plein)", "columns", 0, 400, 4,
               initial=resolve_points(args, size[0]))
-    add_slider(5, "Images/s du trace", "draw_fps", 0, 60, 1)
+    add_slider(6, "Images/s du trace", "draw_fps", 0, 60, 1)
 
     def add_color_entry(row: int, label: str, attr: str) -> None:
         tk.Label(root, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=4)
@@ -458,13 +465,58 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         entry.bind("<Return>", apply)
         entry.bind("<FocusOut>", apply)
 
-    add_color_entry(6, "Couleur du trait", "colors")
-    add_color_entry(7, "Couleur de fond", "bg_color")
+    add_color_entry(7, "Couleur du trait", "colors")
+    add_color_entry(8, "Couleur de fond", "bg_color")
     tk.Label(root, text="Valider une couleur : Entree ou clic ailleurs",
-            fg="gray40").grid(row=8, column=0, columnspan=2, sticky="w", padx=8)
+            fg=GUI_MUTED_FG).grid(row=9, column=0, columnspan=2, sticky="w", padx=8)
 
-    status_label = tk.Label(root, text="", justify="left", anchor="w")
-    status_label.grid(row=9, column=0, columnspan=2, sticky="w", padx=8, pady=(10, 8))
+    # Gain: "auto" (str) ou un nombre en dB (float), voir gain_value(). Case a cocher
+    # + curseur plutot que deux widgets independants, meme mecanique que sur
+    # audio2wave_snap.py --gui, pour eviter qu'un curseur laisse croire qu'il
+    # s'applique alors que "auto" est toujours actif. A la difference de
+    # audio2wave_snap.py, "auto" recalibre sur les RIDGE_GAIN_WINDOW dernieres
+    # lignes (RidgeGain), pas sur la ligne courante seule (voir plus haut).
+    gain_auto_var = tk.BooleanVar(value=(args.gain == "auto"))
+    gain_db_var = tk.DoubleVar(value=(float(args.gain) if args.gain != "auto" else 0.0))
+
+    def on_gain_change() -> None:
+        args.gain = "auto" if gain_auto_var.get() else round(gain_db_var.get(), 1)
+
+    tk.Checkbutton(root, text="Gain automatique (crete glissante, voir Lissage)",
+                  variable=gain_auto_var, command=on_gain_change,
+                  ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+    tk.Label(root, text="Gain manuel (dB)").grid(row=11, column=0, sticky="w", padx=8, pady=4)
+    tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
+            length=220, showvalue=True, command=lambda _v: on_gain_change(),
+            ).grid(row=11, column=1, padx=8, pady=4)
+
+    # --save-dir: le dossier initial est deja cree par main() avant l'ouverture de la
+    # fenetre; un dossier saisi ici doit l'etre aussi, sinon write_png (qui ne cree pas
+    # ses dossiers parents) echouerait a la prochaine ligne.
+    save_var = tk.StringVar(value=str(args.save_dir) if args.save_dir else "")
+
+    def apply_save_dir(_evt=None) -> None:
+        raw = save_var.get().strip()
+        if not raw:
+            args.save_dir = None
+            return
+        save_dir = Path(raw)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        args.save_dir = save_dir
+
+    tk.Label(root, text="Dossier PNG (vide = desactive)").grid(row=12, column=0, sticky="w",
+                                                               padx=8, pady=4)
+    save_entry = tk.Entry(root, textvariable=save_var, width=20)
+    save_entry.grid(row=12, column=1, sticky="w", padx=8, pady=4)
+    save_entry.bind("<Return>", apply_save_dir)
+    save_entry.bind("<FocusOut>", apply_save_dir)
+
+    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+        row=13, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
+
+    status_label = tk.Label(root, text="", justify="left", anchor="w", fg=GUI_ACCENT,
+                            font=GUI_FONT_MONO)
+    status_label.grid(row=14, column=0, columnspan=2, sticky="w", padx=8, pady=(10, 10))
 
     def refresh() -> None:
         status_label.config(text=status.get("text", ""))

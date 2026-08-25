@@ -153,6 +153,7 @@ touche deja les bords a crete normalisee, alors qu'une barre reste loin du plafo
 | `--win-size <n>` | fenetre FFT ; plus petit = plus reactif, moins precis | auto (max 512) |
 | `--bg-color` | couleur du fond, independante de `--colors` | `black` |
 | `--theme` | ambiance (voir plus haut) ; `--glow 0` si ca saccade | `flat` |
+| `--reactive` | fait varier `--glow` avec le niveau audio (voir plus bas) | - |
 | `--size` | resolution de rendu | `960x540`, ou l'ecran avec `--fullscreen` |
 | `--fullscreen` | plein ecran | - |
 | `--gui` | ouvre une fenetre de reglages (voir plus bas) | - |
@@ -174,6 +175,9 @@ CLAUDE.md). Un reglage change dans la fenetre ne prend donc effet **qu'au clic s
 changement instantane de `--ridge-spacing` ou `--line-width` dans les deux autres
 scripts. Les curseurs seuls (sans clic sur Appliquer) ne redemarrent rien.
 
+Meme theme sombre (fond ardoise, accent cyan) que les deux autres fenetres `--gui`,
+partage via `style_gui()` dans `audio2wave.py`.
+
 **Le redemarrage est masque autant que possible** : la nouvelle paire ffmpeg/ffplay
 est lancee *avant* que l'ancienne ne soit fermee (les deux coexistent brievement),
 et la nouvelle fenetre reprend la position exacte de l'ancienne sur l'ecran (reperee
@@ -185,8 +189,13 @@ lieu d'etre perdue — le probleme est signale dans le terminal et dans la fenet
 reglages, et il faut corriger puis re-cliquer sur Appliquer.
 
 Reglable dans la fenetre : style, forme, couleurs, barres/points, gain, lissage,
-stereo, ambiance. Fermer la fenetre de reglages arrete le programme en entier (meme
-effet que Ctrl+C) ; fermer la fenetre video le fait aussi, comme sans `--gui`.
+espace entre barres, echelle des frequences et de l'amplitude, stereo, ambiance,
+halo (`--glow`) et derive de teinte (`--hue-cycle`). Ces deux derniers valent
+`None` par defaut (fixes par l'ambiance choisie) : le curseur affiche la valeur du
+theme courant a l'ouverture, mais la toucher fige une valeur explicite pour tous
+les "Appliquer" suivants, meme apres avoir change d'ambiance. Fermer la fenetre de
+reglages arrete le programme en entier (meme effet que Ctrl+C) ; fermer la fenetre
+video le fait aussi, comme sans `--gui`.
 
 Pour une projection :
 
@@ -197,6 +206,44 @@ python audio2wave_live.py -d "<entree>" --style radio --theme nebula --fullscree
 Les ambiances tiennent le temps reel en 1920x1080 : mesure sur 30 s d'audio, entre
 22 et 26 s de traitement selon le theme, halo compris. Le halo est l'effet le plus
 couteux — `--glow 0` le desactive si la machine peine.
+
+## Halo reactif au niveau audio (`--reactive`)
+
+```bash
+python audio2wave_live.py -d "<entree>" --reactive
+python audio2wave_live.py -d "<entree>" --theme aurora --reactive
+```
+
+Fait grossir/retomber `--glow` avec le niveau audio mesure, plutot que de le garder
+fixe (ou anime sur une horloge independante, comme les ambiances seules). **Pas une
+modulation image par image** : ffmpeg n'expose de canal pour changer un filtre
+(`gblur`) en cours de route sans redemarrer que via son filtre `zmq`, qui demande un
+client ZeroMQ absent de la bibliotheque standard Python — hors de portee pour ce
+projet ("stdlib seulement", voir CLAUDE.md). `--reactive` redemarre donc le pipeline
+par a-coups (meme mecanisme "seamless" que le bouton Appliquer du `--gui`, coexistence
+breve le temps de la transition), quelques secondes au minimum entre deux
+redemarrages — pas un pouls continu, plutot une ambiance qui se recalibre par
+paliers avec les passages forts/calmes.
+
+Le niveau est mesure sur le signal capture (avant `--gain`), via une derivation
+interne du graphe ffmpeg qui n'affecte ni le son ni l'image. La plage par defaut
+(-50 a -15 dBFS pour couvrir tout `--glow`) depend du peripherique, comme `--gain` :
+si le halo reste toujours au minimum ou au maximum, c'est a ajuster (constantes
+`REACTIVE_FLOOR_DB`/`REACTIVE_CEIL_DB` dans le fichier, pas encore exposees en
+option).
+
+**Le niveau est lisse sur 6 secondes avant de decider quoi que ce soit** (une
+moyenne glissante, pas juste la derniere mesure) : un coup isole (un kick, une
+attaque breve) ne pese presque rien dans cette moyenne, il faut un changement
+SOUTENU (un couplet qui monte, une transition) pour justifier un redemarrage.
+Observe en usage reel avant ce reglage : sur une fenetre plus courte, un seul
+changement soudain de dynamique suffisait a faire "rouvrir" la fenetre (le
+redemarrage, meme seamless, reste visible) pour un evenement trop bref pour
+meriter un ajustement d'ambiance.
+
+Combinable avec `--gui` (les deux pilotent les memes redemarrages, sans conflit) ;
+utilisable seule (sans `--theme`) pour un halo autour du trace qui repond au niveau,
+sur fond uni.
 
 ## Latence
 
@@ -542,6 +589,10 @@ cocher + oscillations), points/colonnes, echelle, filtre par colonne, crossover
 (`--save-dir`, cree au besoin) et images/s du trace. Un changement prend effet
 **a la photo suivante**, sans redemarrer la capture ni la fenetre ffplay.
 
+Theme sombre coherent (fond ardoise, accent cyan), partage avec les deux autres
+fenetres `--gui` (`audio2wave_live.py`, `audio2wave_ridge.py`) via `style_gui()`
+dans `audio2wave.py`.
+
 **Ce qui n'y est volontairement pas** : `--stereo`, `--split-channels`, `--rate`,
 `--buffer`, `--size`, `--beats`/`--bpm`/`--interval`, `--fullscreen`, `--video` et
 `--video2`. Tous sont figes des le lancement — dans la commande de capture
@@ -751,11 +802,14 @@ python audio2wave_ridge.py -d "<entree>" --gui
 
 Ouvre une petite fenetre tkinter a cote de la fenetre de vagues, avec un curseur par
 reglage : espacement, deformation, lissage du gain, epaisseur, points par ligne,
-images/s du trace, plus deux champs texte pour les couleurs (memes noms/valeurs
-hexadecimales qu'en ligne de commande, valides avec Entree ou en changeant de champ).
-Un changement prend effet **a la ligne suivante**, sans redemarrer la capture ni
-rouvrir la fenetre ffplay — seul le rendu en aval bouge, l'historique deja trace
-reste tel quel.
+images/s du trace, gain (case "automatique" + curseur manuel en dB), dossier PNG
+(`--save-dir`, cree au besoin), plus deux champs texte pour les couleurs (memes
+noms/valeurs hexadecimales qu'en ligne de commande, valides avec Entree ou en
+changeant de champ). Un changement prend effet **a la ligne suivante**, sans
+redemarrer la capture ni rouvrir la fenetre ffplay — seul le rendu en aval bouge,
+l'historique deja trace
+reste tel quel. Meme theme sombre que les deux autres fenetres `--gui` (voir
+`audio2wave_snap.py` plus haut).
 
 **Ce qui n'est pas reglable en direct** : `--beats`/`--bpm`/`--interval` (change la
 taille du bloc audio capture), `--size`/`--fullscreen` (change la taille de la
