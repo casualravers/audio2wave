@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import json
 import math
 import os
 import re
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 try:
     import tkinter as tk
@@ -53,6 +55,12 @@ SAMPLE_BYTES = 2  # s16le
 # correction quasi nulle, contrairement aux styles des autres scripts. La marge
 # evite juste que la photo soit rasee en haut et en bas.
 AUTO_GAIN_MARGIN_DB = -0.5
+
+# Seuils d'ecretage pour le bouton "Mesurer" de --gui, memes valeurs que --tune dans
+# audio2wave_live.py: une crete proche de 0 dBFS ou un facteur de crete faible (signal
+# quasi plat) signalent un ecretage AVANT capture, que --gain ne peut pas reparer.
+TUNE_CLIP_PEAK_DB = -1.0
+TUNE_CLIP_CREST_DB = 3.0
 
 # La fenetre suit la musique au lieu d'en resumer un passage, en temps plutot qu'en
 # secondes. Un tempo de reference est indispensable, un flux live n'en annonce aucun.
@@ -150,17 +158,65 @@ PRESET_ALIASES: dict[str, str] = {
 }
 
 
+# Presets sauvegardes depuis --gui (voir build_gui), distincts de PRESETS: ceux-la
+# sont integres au code (relus, versionnes avec le reste), ceux-ci vivent dans le
+# profil de l'utilisateur pour survivre d'une session a l'autre sans toucher au
+# depot. Un nom identique a un preset integre le surcharge (voir all_presets).
+USER_PRESETS_PATH = Path.home() / ".audio2wave" / "snap_presets.json"
+
+
+def load_user_presets() -> dict[str, dict]:
+    """Fichier absent, illisible ou mal forme = aucun preset utilisateur, jamais
+    une erreur bloquante: ce fichier est un confort, pas une donnee critique."""
+    if not USER_PRESETS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(USER_PRESETS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_user_preset(name: str, overrides: dict) -> None:
+    presets = load_user_presets()
+    presets[name] = overrides
+    USER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_PRESETS_PATH.write_text(
+        json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+
+def all_presets() -> dict[str, dict]:
+    """PRESETS integres + presets utilisateur, ces derniers prioritaires en cas de
+    nom identique (l'utilisateur re-sauvegarde volontairement par-dessus)."""
+    merged = dict(PRESETS)
+    merged.update(load_user_presets())
+    return merged
+
+
 def describe_presets() -> str:
     reverse_alias = {name: alias for alias, name in PRESET_ALIASES.items()}
+    names = list(PRESETS) + [name for name in load_user_presets() if name not in PRESETS]
     return ", ".join(
         f"{name} ({reverse_alias[name]})" if name in reverse_alias else name
-        for name in PRESETS
+        for name in names
     )
+
+
+def find_asset(path: Path, asset_dir: Path) -> Path | None:
+    """Resout un chemin de media (--video/--video2): tel quel, puis dans asset_dir
+    (meme convention que la source d'audio2wave.py). None si introuvable des deux
+    facons -- l'appelant decide s'il s'agit d'une erreur bloquante (parse_args) ou
+    d'un simple message de statut (build_gui, ou retaper au clavier ne doit pas
+    interrompre la fenetre)."""
+    if path.exists():
+        return path
+    in_assets = asset_dir / path
+    return in_assets if in_assets.exists() else None
 
 
 def preset_value(raw: str) -> str:
     key = raw.strip().lower()
-    if key in PRESETS:
+    if key in all_presets():
         return key
     if key in PRESET_ALIASES:
         return PRESET_ALIASES[key]
@@ -295,21 +351,38 @@ def parse_args() -> argparse.Namespace:
 
     if args.list_presets:
         reverse_alias = {name: alias for alias, name in PRESET_ALIASES.items()}
-        print("Presets disponibles (--preset <nom ou alias>):\n")
-        for name, overrides in PRESETS.items():
+
+        def print_preset_block(name: str, overrides: dict) -> None:
             alias = reverse_alias.get(name)
             print(f"  {name}" + (f" ({alias})" if alias else ""))
             for key, value in overrides.items():
                 flag = f"--{key.replace('_', '-')}"
                 print(f"      {flag}" if value is True else f"      {flag} {value}")
             print()
+
+        print("Presets disponibles (--preset <nom ou alias>):\n")
+        for name, overrides in PRESETS.items():
+            print_preset_block(name, overrides)
+        user_presets = load_user_presets()
+        if user_presets:
+            print(f"Presets utilisateur (sauvegardes depuis --gui, {USER_PRESETS_PATH}):\n")
+            for name, overrides in user_presets.items():
+                print_preset_block(name, overrides)
         sys.exit(0)
 
     if args.preset:
         # set_defaults() ne change que la valeur prise en l'absence de l'option sur la
         # ligne de commande: reparser sys.argv derriere garde la priorite a toute option
         # explicite, preset ou pas. C'est le sens du "en plus" annonce dans l'aide.
-        p.set_defaults(**PRESETS[args.preset])
+        overrides = dict(all_presets()[args.preset])
+        # set_defaults() ne repasse pas les valeurs par type=... de l'argument (ca ne
+        # s'applique qu'aux valeurs effectivement lues sur la ligne de commande) : un
+        # preset sauvegarde depuis --gui stocke save_dir en texte (JSON n'a pas de
+        # type Path), a reconvertir a la main pour retomber sur le meme type qu'une
+        # vraie --save-dir.
+        if overrides.get("save_dir") is not None:
+            overrides["save_dir"] = Path(overrides["save_dir"])
+        p.set_defaults(**overrides)
         args = p.parse_args()  # re-parse: --preset est deja resolu, refait a l'identique
 
     # --interval reste la mesure de reference partout dans le programme; --bpm/--beats
@@ -329,15 +402,10 @@ def parse_args() -> argparse.Namespace:
             # une tout autre mecanique. Ici on refuse plutot que de faire semblant.
             if args.style != "pencil":
                 p.error(f"--{opt} n'est disponible qu'en --style pencil")
-            # Cherche tel quel, puis dans --asset-dir (meme logique que le fichier
-            # source d'audio2wave.py): un nom simple comme "clip.mp4" atterrit dans
-            # asset/ sans avoir a le prefixer a chaque lancement.
-            if not path.exists():
-                in_assets = args.asset_dir / path
-                if in_assets.exists():
-                    setattr(args, opt, in_assets)
-                else:
-                    p.error(f"--{opt} introuvable: {path} (ni dans {args.asset_dir})")
+            resolved = find_asset(path, args.asset_dir)
+            if resolved is None:
+                p.error(f"--{opt} introuvable: {path} (ni dans {args.asset_dir})")
+            setattr(args, opt, resolved)
     # None = a decider face au peripherique; un entier = impose par l'utilisateur.
     if str(args.rate).strip().lower() == "auto":
         args.rate = None
@@ -667,6 +735,19 @@ class LiveCapture:
         with self._lock:
             return bytes(self._buf) if len(self._buf) >= self._window else None
 
+    def set_window(self, window_bytes: int) -> None:
+        """Redimensionne la fenetre glissante en direct (--bpm/--beats depuis --gui),
+        sans recreer le fil de lecture ni le sous-processus de capture: _pump relit
+        self._window a chaque iteration, une simple affectation sous verrou suffit.
+        Si la nouvelle fenetre est plus petite que le tampon actuel, la retailler
+        tout de suite (comme le ferait le prochain _pump) evite que latest() renvoie
+        un bloc trop grand en attendant le prochain paquet lu du tube."""
+        with self._lock:
+            self._window = window_bytes
+            excess = len(self._buf) - window_bytes
+            if excess > 0:
+                del self._buf[:excess]
+
 
 class VideoSource:
     """Decode une video en boucle a la taille exacte du canevas, et garde la derniere
@@ -731,6 +812,23 @@ def peak_dbfs(pcm: bytes) -> float | None:
     if peak <= 0:
         return None
     return 20 * math.log10(peak / 32768)
+
+
+def mean_dbfs(pcm: bytes) -> float | None:
+    """Niveau RMS du bloc en dBFS, ou None s'il est vide ou parfaitement silencieux.
+
+    Sert uniquement au bouton "Mesurer" de --gui (detection d'ecretage, voir
+    TUNE_CLIP_CREST_DB): peak_dbfs seul ne distingue pas un signal fort mais sain
+    d'un signal deja tronque a la capture, il faut l'ecart crete/RMS pour ca.
+    """
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % SAMPLE_BYTES])
+    if not samples:
+        return None
+    ms = sum(s * s for s in samples) / len(samples)
+    if ms <= 0:
+        return None
+    return 20 * math.log10(math.sqrt(ms) / 32768)
 
 
 def resolve_gain(args: argparse.Namespace, pcm: bytes) -> tuple[float, float | None]:
@@ -1138,25 +1236,45 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
 
 
 def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
-             stop_event: threading.Event, finished_event: threading.Event) -> None:
+             capture_state: dict, stop_event: threading.Event,
+             finished_event: threading.Event) -> None:
     """Petite fenetre de reglages en direct.
 
-    Ne touche a rien d'autre qu'aux attributs de `args`: le fil de rendu (run(), dans
-    un thread separe) les relit a chaque photo, donc un changement ici prend effet a
-    la photo suivante, sans redemarrer la capture ni la fenetre ffplay. Aucun verrou:
-    une simple affectation d'attribut (int/float/str) est atomique sous le GIL, ce qui
-    suffit ici.
+    L'essentiel de ce qui est expose ici ne touche qu'aux attributs de `args`: le fil
+    de rendu (run(), dans un thread separe) les relit a chaque photo, donc un
+    changement prend effet a la photo suivante sans redemarrer quoi que ce soit.
+    Aucun verrou: une simple affectation d'attribut (int/float/str) est atomique sous
+    le GIL, ce qui suffit ici.
 
-    Tout ce qui est expose ici est relu par `run()` a chaque photo (`resolve_gain`,
-    `pencil_heights`, l'ecriture PNG...) sans jamais toucher a `capture_command` ni a
-    `viewer_command` : c'est la frontiere qui decide ce qui peut entrer dans cette
-    fenetre. `--stereo`/`--split-channels`/`--rate`/`--buffer`/`--size`/`--beats`/
-    `--bpm`/`--interval`/`--fullscreen`/`--video`/`--video2` en sont volontairement
-    exclus, parce qu'ils sont figes dans la commande de capture au lancement
-    (nombre de canaux, frequence, taille du tampon), dans la fenetre ffplay deja
-    ouverte (taille, plein ecran), ou dans un decodeur `VideoSource` deja demarre :
-    les changer en direct desynchroniserait le flux ou n'aurait tout simplement
-    aucun effet sur un processus deja en cours.
+    Quelques attributs supplementaires font exception et vont au-dela d'une simple
+    mutation d'`args` :
+    - `device`/`video`/`video2` REDEMARRENT un sous-processus : `run()` compare leur
+      valeur a chaque iteration, exactement comme il le fait deja pour
+      `resolve_bg`/`resolve_colors`, et respawn la capture ou le `VideoSource`
+      concerne quand elle a change -- au prix d'un court trou dans le flux (quelques
+      centaines de ms pour la capture, le temps qu'un nouveau ffmpeg dshow s'ouvre),
+      pas d'un redemarrage seamless comme --reactive dans audio2wave_live.py (pas
+      necessaire ici : `viewer`/la fenetre ffplay ne bougent pas, seule la source
+      change).
+    - `bpm`/`beats` determinent ensemble `args.interval` (revalcule a chaque
+      changement de l'un ou l'autre), qui determine a son tour la taille de la
+      fenetre glissante de `LiveCapture`. Pas de redemarrage de sous-processus ici :
+      `run()` retaille juste cette fenetre en place (`LiveCapture.set_window`) des
+      qu'il voit `args.interval` bouger.
+    `--stereo`/`--split-channels`/`--rate`/`--buffer`/`--size`/`--interval`/
+    `--fullscreen` restent hors de cette fenetre : ils determinent le format de
+    capture (`capture_command`) ou la fenetre ffplay elle-meme (taille fixee a
+    l'ouverture), et les changer en direct desynchroniserait ces deux points fixes
+    plutot que de simplement retailler une fenetre Python ou remplacer un
+    sous-processus. `--interval` en particulier resterait un troisieme controle
+    concurrent de `--bpm`/`--beats` sur la meme valeur : expose ici via ces deux-la
+    seulement, comme en ligne de commande (voir parse_args).
+
+    `capture_state` (`{"capture": LiveCapture}`) est le pont entre run() et cette
+    fenetre pour le bouton "Mesurer" (tuning) : `run()` y remet la LiveCapture
+    courante apres chaque redemarrage de capture, cette fenetre y lit toujours la
+    derniere en date plutot que de garder sa propre reference, qui deviendrait
+    perimee des le premier changement de peripherique.
     """
     width = size[0]
     root = tk.Tk()
@@ -1173,18 +1291,117 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     tk.Label(root, text="Reglages photo", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
             ).grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
 
+    # Un setter par attribut expose ici, plutot qu'un simple `var.set(...)` : charger
+    # un preset doit a la fois mettre a jour le widget ET args (et, pour style/wave/
+    # gain/crossover/save_dir, rejouer la logique associee -- reset des couleurs sur
+    # un changement de style, mkdir sur un save_dir, etc.), pas juste la moitie.
+    # Sert aussi a lister les attributs sauvegardables quand on cree un preset
+    # (`list(controls)`), le meme ensemble que ce que cette fenetre expose deja.
+    controls: dict[str, Callable[[object], None]] = {}
+
+    # --- Entree audio: seule cette section (avec video/video2 plus bas) redemarre un
+    # sous-processus au lieu de se contenter de muter args, voir la docstring. ---
+    device_var = tk.StringVar(value=args.device or "")
+
+    def on_device_change(value: object = None) -> None:
+        if value is not None:
+            device_var.set(value)
+        args.device = device_var.get()
+
+    controls["device"] = on_device_change
+
+    r = next_row()
+    tk.Label(root, text="Entree audio").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    device_frame = tk.Frame(root)
+    device_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    device_menu = tk.OptionMenu(device_frame, device_var, device_var.get())
+    style_option_menu(device_menu)
+    device_menu.pack(side="left")
+
+    def refresh_devices() -> None:
+        names = list_audio_devices()
+        if args.device and args.device not in names:
+            # Garde l'entree courante visible meme absente de la liste fraiche
+            # (peripherique momentanement debranche, nom saisi a la main...): la
+            # perdre du menu ne doit pas la changer sous les pieds de l'utilisateur.
+            names = [args.device] + names
+        menu = device_menu["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: on_device_change(n))
+        status["text"] = f"{len(names)} entree(s) audio detectee(s)"
+
+    tk.Button(device_frame, text="Actualiser", command=refresh_devices,
+             ).pack(side="left", padx=(6, 0))
+    refresh_devices()
+
+    # --bpm/--beats: comme l'entree audio, une exception qui ne se contente pas de
+    # muter args -- ils determinent ensemble args.interval (voir parse_args), donc
+    # la taille de la fenetre glissante de LiveCapture (chunk_size). Contrairement
+    # au changement d'entree/video ci-dessus, pas besoin de redemarrer quoi que ce
+    # soit cote sous-processus : run() retaille juste la fenetre en place
+    # (LiveCapture.set_window) des qu'il voit args.interval bouger, voir sa
+    # docstring. `args.interval_from_beats` repasse a True des qu'on y touche: ces
+    # curseurs prennent alors la main sur --interval, meme si la session a demarre
+    # avec un --interval explicite en ligne de commande.
+    bpm_var = tk.DoubleVar(value=args.bpm)
+    beats_var = tk.DoubleVar(value=args.beats)
+
+    def on_tempo_change(_value: object = None) -> None:
+        args.bpm = round(bpm_var.get(), 1)
+        args.beats = round(beats_var.get(), 2)
+        if args.bpm > 0 and args.beats > 0:
+            args.interval = args.beats * 60.0 / args.bpm
+            args.interval_from_beats = True
+
+    def set_bpm(value: object) -> None:
+        bpm_var.set(value)
+        on_tempo_change()
+
+    def set_beats(value: object) -> None:
+        beats_var.set(value)
+        on_tempo_change()
+
+    controls["bpm"] = set_bpm
+    controls["beats"] = set_beats
+
+    r = next_row()
+    tk.Label(root, text="BPM").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    tk.Scale(root, from_=40, to=220, resolution=1, orient="horizontal", variable=bpm_var,
+            length=220, showvalue=True, command=on_tempo_change,
+            ).grid(row=r, column=1, padx=8, pady=4)
+
+    r = next_row()
+    tk.Label(root, text="Temps par photo (--beats)").grid(row=r, column=0, sticky="w",
+                                                          padx=8, pady=4)
+    tk.Scale(root, from_=0.25, to=32, resolution=0.25, orient="horizontal", variable=beats_var,
+            length=220, showvalue=True, command=on_tempo_change,
+            ).grid(row=r, column=1, padx=8, pady=4)
+
+    # Separateur: l'entree audio est la source, tout ce qui suit jusqu'au prochain
+    # separateur decrit comment cette source est dessinee (memes separateurs fins que
+    # devant "Presets" plus bas, pour une seule et meme convention de regroupement).
+    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+
     style_var = tk.StringVar(value=args.style)
 
-    def on_style_change() -> None:
+    def on_style_change(_value: object = None) -> None:
+        if _value is not None:
+            style_var.set(_value)
         args.style = style_var.get()
         # Les couleurs par defaut dependent du style (resolve_colors/resolve_bg):
         # vider les champs laisse ces fonctions choisir la bonne valeur plutot que
         # de garder une couleur pensee pour l'ancien style (rekordbox exige trois
-        # couleurs separees par |, pencil/simple une seule).
+        # couleurs separees par |, pencil/simple une seule) -- sauf si le preset
+        # charge fournit lui-meme des couleurs, auquel cas leur propre setter les
+        # repose juste apres (controles appliques dans l'ordre du dict).
         colors_var.set("")
         bg_var.set("")
         args.colors = None
         args.bg_color = None
+
+    controls["style"] = on_style_change
 
     tk.Label(root, text="Style").grid(row=next_row(), column=0, sticky="w", padx=8, pady=4)
     style_frame = tk.Frame(root)
@@ -1200,12 +1417,18 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         var = tk.DoubleVar(value=initial if initial is not None else getattr(args, attr))
         is_int = step >= 1
 
-        def on_change(_value: str) -> None:
+        def on_change(_value: object = None) -> None:
             setattr(args, attr, int(var.get()) if is_int else round(var.get(), 3))
 
         tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal",
                 variable=var, length=220, showvalue=True, command=on_change,
                 ).grid(row=r, column=1, padx=8, pady=4)
+
+        def set_value(value: object) -> None:
+            var.set(value)
+            on_change()
+
+        controls[attr] = set_value
 
     def add_entry(label: str, attr: str, width_chars: int = 20) -> tk.StringVar:
         r = next_row()
@@ -1219,6 +1442,12 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
         entry.bind("<Return>", apply)
         entry.bind("<FocusOut>", apply)
+
+        def set_value(value: object) -> None:
+            var.set(value or "")
+            apply()
+
+        controls[attr] = set_value
         return var
 
     def add_dropdown(label: str, attr: str, choices: tuple[str, ...]) -> None:
@@ -1233,6 +1462,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         menu = tk.OptionMenu(root, var, *choices)
         style_option_menu(menu)
         menu.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        controls[attr] = var.set
 
     colors_var = add_entry("Couleur(s) (vide = defaut)", "colors")
     bg_var = add_entry("Couleur de fond (vide = defaut)", "bg_color")
@@ -1244,6 +1474,14 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     def on_wave_change() -> None:
         args.wave = wave_cycles.get() if wave_on.get() else None
 
+    def set_wave(value: object) -> None:
+        wave_on.set(value is not None)
+        if value is not None:
+            wave_cycles.set(value)
+        on_wave_change()
+
+    controls["wave"] = set_wave
+
     r = next_row()
     tk.Checkbutton(root, text="--wave (sinusoide, pencil)", variable=wave_on,
                   command=on_wave_change).grid(row=r, column=0, sticky="w", padx=8, pady=4)
@@ -1253,6 +1491,52 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     add_slider("Points / colonnes (0=plein)", "columns", 0, 400, 4,
               initial=args.columns if args.columns is not None else PENCIL_POINTS)
+
+    # Video/video2 (pencil seul): regroupees avec le reste des controles pencil
+    # ci-dessus plutot que plus bas avec le dossier PNG, purement pour la lecture de
+    # la fenetre -- elles n'ont de sens qu'en pencil, comme wave/points juste avant.
+    # A la difference des autres controles de ce bloc, un changement ici redemarre le
+    # VideoSource concerne (voir run()), pas juste une mutation d'args. Cherche tel
+    # quel puis dans --asset-dir, comme au demarrage (parse_args/find_asset); un
+    # chemin introuvable est signale en statut sans toucher a args.video, pour ne pas
+    # couper la video en cours sur une faute de frappe pas encore corrigee.
+    def make_video_field(label: str, attr: str) -> None:
+        current = getattr(args, attr)
+        var = tk.StringVar(value=str(current) if current else "")
+
+        def apply(_evt=None) -> None:
+            raw = var.get().strip()
+            if not raw:
+                setattr(args, attr, None)
+                return
+            resolved = find_asset(Path(raw), args.asset_dir)
+            if resolved is None:
+                status["text"] = f"video introuvable: {raw} (ni dans {args.asset_dir})"
+                return
+            setattr(args, attr, resolved)
+
+        def set_value(value: object) -> None:
+            var.set(str(value) if value else "")
+            apply()
+
+        controls[attr] = set_value
+
+        r = next_row()
+        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        entry = tk.Entry(root, textvariable=var, width=20)
+        entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        entry.bind("<Return>", apply)
+        entry.bind("<FocusOut>", apply)
+
+    make_video_field("Video interieure (vide = aucune, pencil)", "video")
+    make_video_field("Video exterieure (vide = aucune, pencil)", "video2")
+
+    # Separateur: bascule des controles pencil ci-dessus aux controles rekordbox/
+    # simple ci-dessous (echelle/filtre/crossover) -- deux groupes qui ne
+    # s'appliquent jamais en meme temps, autant les distinguer visuellement.
+    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+
     add_dropdown("Echelle (rekordbox/simple)", "scale", ("lin", "log", "sqrt", "cbrt"))
     add_dropdown("Filtre colonne (rekordbox/simple)", "filter_mode", ("peak", "average"))
 
@@ -1268,6 +1552,18 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     def apply_crossover(_evt=None) -> None:
         args.crossover = f"{low_var.get().strip()},{high_var.get().strip()}"
 
+    def set_crossover(value: object) -> None:
+        if value:
+            try:
+                lo, hi = (part.strip() for part in str(value).split(","))
+            except ValueError:
+                return
+            low_var.set(lo)
+            high_var.set(hi)
+        apply_crossover()
+
+    controls["crossover"] = set_crossover
+
     r = next_row()
     tk.Label(root, text="Crossover Hz (rekordbox)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
     cross_frame = tk.Frame(root)
@@ -1278,6 +1574,11 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         entry.bind("<Return>", apply_crossover)
         entry.bind("<FocusOut>", apply_crossover)
 
+    # Separateur: bascule des controles de trace (rekordbox/simple ci-dessus) au
+    # gain, qui s'applique lui a tous les styles.
+    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+
     # Gain: "auto" (str) ou un nombre en dB (float), voir gain_value(). Case a cocher
     # + curseur plutot que deux widgets independants, pour eviter qu'un utilisateur
     # regle le curseur en pensant qu'il s'applique alors que "auto" est toujours actif.
@@ -1286,6 +1587,16 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     def on_gain_change() -> None:
         args.gain = "auto" if gain_auto_var.get() else round(gain_db_var.get(), 1)
+
+    def set_gain(value: object) -> None:
+        if value == "auto":
+            gain_auto_var.set(True)
+        else:
+            gain_auto_var.set(False)
+            gain_db_var.set(float(value))
+        on_gain_change()
+
+    controls["gain"] = set_gain
 
     r = next_row()
     tk.Checkbutton(root, text="Gain automatique (crete de chaque photo)",
@@ -1296,6 +1607,41 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
             length=220, showvalue=True, command=lambda _v: on_gain_change(),
             ).grid(row=r, column=1, padx=8, pady=4)
+
+    # Tuning: mesure la crete (et le facteur de crete, pour detecter un ecretage
+    # AVANT capture, voir TUNE_CLIP_*) de la derniere fenetre pleine capturee, et
+    # bascule le gain en manuel sur la valeur conseillee -- equivalent de --tune
+    # (audio2wave_live.py) mais lu depuis la capture deja en cours ici, sans avoir a
+    # relancer le programme avec un flag separe. Lit `capture_state["capture"]`
+    # plutot qu'une reference gardee localement: elle change des que l'entree audio
+    # est changee au-dessus (voir run()).
+    def on_tune() -> None:
+        capture = capture_state.get("capture")
+        pcm = capture.latest() if capture else None
+        if pcm is None:
+            status["text"] = "capture pas encore prete, reessaie dans un instant"
+            return
+        peak = peak_dbfs(pcm)
+        if peak is None:
+            status["text"] = "silence sur la fenetre courante: rien a mesurer"
+            return
+        mean = mean_dbfs(pcm)
+        suggested = round(-peak + AUTO_GAIN_MARGIN_DB, 1)
+        controls["gain"](suggested)
+        text = f"crete mesuree {peak:+.1f} dBFS -> gain manuel {suggested:+.1f} dB applique"
+        if peak > TUNE_CLIP_PEAK_DB or (mean is not None and peak - mean < TUNE_CLIP_CREST_DB):
+            text += (
+                "\nATTENTION: signal deja au maximum numerique (ecretage probable AVANT "
+                "meme la capture) -- baisser le gain ne peut pas reparer un signal deja "
+                "deforme a la source. Baisse la sortie de la platine/table de mixage, ou "
+                "le trim d'entree de la carte son (et le niveau d'enregistrement dans les "
+                "parametres son de Windows) plutot que le gain.")
+        status["text"] = text
+
+    r = next_row()
+    tk.Label(root, text="Tuning").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    tk.Button(root, text="Mesurer", command=on_tune).grid(
+        row=r, column=1, sticky="w", padx=8, pady=4)
 
     add_slider("Images/s du trace", "draw_fps", 0, 60, 1)
 
@@ -1313,6 +1659,12 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         save_dir.mkdir(parents=True, exist_ok=True)
         args.save_dir = save_dir
 
+    def set_save_dir(value: object) -> None:
+        save_var.set(str(value) if value else "")
+        apply_save_dir()
+
+    controls["save_dir"] = set_save_dir
+
     r = next_row()
     tk.Label(root, text="Dossier PNG (vide = desactive)").grid(row=r, column=0, sticky="w",
                                                                padx=8, pady=4)
@@ -1320,6 +1672,110 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     save_entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
     save_entry.bind("<Return>", apply_save_dir)
     save_entry.bind("<FocusOut>", apply_save_dir)
+
+    # --- Presets : charger un jeu integre/sauvegarde, ou sauvegarder l'etat courant ---
+    # Placee en dernier pour que `controls` soit deja completement rempli (le bloc
+    # "Sauvegarder" en a besoin pour savoir quels attributs capturer).
+    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
+
+    tk.Label(root, text="Presets", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
+            ).grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
+
+    def apply_preset(overrides: dict) -> list[str]:
+        """Applique les cles d'un preset aux widgets+args ; renvoie celles ignorees
+        (figees au lancement, non exposees dans cette fenetre -- voir docstring)."""
+        skipped = [key for key in overrides if key not in controls]
+        if "style" in overrides:
+            controls["style"](overrides["style"])
+        for key, value in overrides.items():
+            if key != "style" and key in controls:
+                controls[key](value)
+        return skipped
+
+    preset_var = tk.StringVar(value="")
+    r = next_row()
+    tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    preset_frame = tk.Frame(root)
+    preset_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    preset_menu = tk.OptionMenu(preset_frame, preset_var, "")
+    style_option_menu(preset_menu)
+    preset_menu.pack(side="left")
+
+    def refresh_preset_menu(select: str | None = None) -> None:
+        names = sorted(all_presets())
+        menu = preset_menu["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
+        if select is not None:
+            preset_var.set(select)
+        elif names and preset_var.get() not in names:
+            preset_var.set(names[0])
+
+    refresh_preset_menu()
+
+    def on_load_preset() -> None:
+        name = preset_var.get()
+        presets = all_presets()
+        if name not in presets:
+            status["text"] = f"preset inconnu: {name}"
+            return
+        skipped = apply_preset(presets[name])
+        text = f"preset '{name}' charge"
+        if skipped:
+            # Options figees au lancement (video, capture, fenetre ffplay...): un
+            # preset --gui peut les contenir (ex. "club" a --fullscreen) mais cette
+            # fenetre ne peut pas les relancer en direct, voir la docstring.
+            text += f" (ignore, deja fige au lancement: {', '.join(skipped)})"
+        status["text"] = text
+
+    tk.Button(preset_frame, text="Charger", command=on_load_preset).pack(side="left", padx=(6, 0))
+
+    def capture_overrides() -> dict:
+        # Capture args (pas les widgets) : args est la source de verite deja tenue
+        # a jour par chaque setter, pas besoin de relire/convertir chaque widget.
+        overrides = {attr: getattr(args, attr) for attr in controls}
+        if isinstance(overrides.get("save_dir"), Path):
+            overrides["save_dir"] = str(overrides["save_dir"])  # JSON n'a pas de type Path
+        return overrides
+
+    def on_update_preset() -> None:
+        name = preset_var.get()
+        if not name:
+            status["text"] = "aucun preset selectionne"
+            return
+        if name in PRESETS:
+            status["text"] = f"'{name}' est un preset integre, ne peut pas etre modifie"
+            return
+        save_user_preset(name, capture_overrides())
+        status["text"] = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
+
+    tk.Button(preset_frame, text="Mettre a jour", command=on_update_preset,
+             ).pack(side="left", padx=(6, 0))
+
+    save_name_var = tk.StringVar(value="")
+    r = next_row()
+    tk.Label(root, text="Sauvegarder sous").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    save_preset_frame = tk.Frame(root)
+    save_preset_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    tk.Entry(save_preset_frame, textvariable=save_name_var, width=14).pack(side="left")
+
+    def on_save_preset() -> None:
+        name = save_name_var.get().strip().lower()
+        if not name:
+            status["text"] = "nom de preset vide"
+            return
+        if name in PRESETS:
+            status["text"] = f"'{name}' est un preset integre, choisis un autre nom"
+            return
+        save_user_preset(name, capture_overrides())
+        refresh_preset_menu(select=name)
+        save_name_var.set("")
+        status["text"] = f"preset '{name}' sauvegarde ({USER_PRESETS_PATH})"
+
+    tk.Button(save_preset_frame, text="Sauvegarder", command=on_save_preset,
+             ).pack(side="left", padx=(6, 0))
 
     tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
         row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
@@ -1345,19 +1801,23 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
 def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink: bytes,
        capture_proc: subprocess.Popen, viewer: subprocess.Popen, capture: LiveCapture,
-       status: dict, stop_event: threading.Event, finished_event: threading.Event) -> None:
+       status: dict, capture_state: dict, stop_event: threading.Event,
+       finished_event: threading.Event) -> None:
     """Boucle de capture/rendu/affichage. Tourne dans un fil separe quand --gui est
     actif (pour laisser tkinter posseder le fil principal), directement dans main()
     sinon.
     """
     last_bg = resolve_bg(args)
     last_colors = resolve_colors(args)[0]
-    # Un seul decodeur par video pour toute la session, qui reboucle tout seul
-    # (-stream_loop -1).
-    video = (VideoSource(args.video, size, args.draw_fps, args.loglevel)
-             if getattr(args, "video", None) else None)
-    video_out = (VideoSource(args.video2, size, args.draw_fps, args.loglevel)
-                 if getattr(args, "video2", None) else None)
+    last_device = args.device
+    last_interval = args.interval
+    last_video = getattr(args, "video", None)
+    last_video2 = getattr(args, "video2", None)
+    # Un seul decodeur par video au depart, qui reboucle tout seul (-stream_loop -1);
+    # remplace en cours de route si --gui change video/video2 (voir plus bas).
+    video = VideoSource(last_video, size, args.draw_fps, args.loglevel) if last_video else None
+    video_out = (VideoSource(last_video2, size, args.draw_fps, args.loglevel)
+                 if last_video2 else None)
     # La derniere photo entierement affichee: point de depart du balayage suivant
     # (draw_progressively/draw_pencil_video_progressively), qui la recouvre colonne
     # par colonne au lieu d'afficher un aplat de fond d'un coup avant de retracer.
@@ -1391,6 +1851,52 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
 
             if stop_event.is_set():
                 break
+
+            # --gui a change l'entree audio: redemarre la capture. Pas de recouvrement
+            # seamless comme --reactive dans audio2wave_live.py (pas necessaire: aucune
+            # fenetre ne se rouvre, viewer ne bouge pas) -- juste terminer l'ancien
+            # ffmpeg dshow, attendre, en relancer un nouveau sur le peripherique choisi.
+            # chunk_size ne change pas: --rate/--stereo/--split-channels restent figes,
+            # donc capture_command garde le meme format de sortie, seul -i change.
+            if args.device != last_device:
+                status["text"] = f"changement d'entree audio -> {args.device}..."
+                capture_proc.terminate()
+                capture_proc.wait()
+                capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
+                capture = LiveCapture(capture_proc.stdout, chunk_size(args))
+                capture_state["capture"] = capture
+                last_device = args.device
+                last_interval = args.interval  # deja repris par le chunk_size ci-dessus
+                status["text"] = f"entree audio: {args.device}"
+
+            # --gui a change --bpm/--beats: args.interval (deja relu tel quel plus haut
+            # pour la cadence de next_at, voir la boucle) a change avec, mais la fenetre
+            # glissante de LiveCapture reste a l'ancienne taille tant qu'on ne la
+            # retaille pas explicitement -- set_window() le fait en place, sans recreer
+            # de fil ni de sous-processus (rien a redemarrer cote ffmpeg: seule la
+            # fenetre Python cote qui change).
+            if args.interval != last_interval:
+                capture.set_window(chunk_size(args))
+                last_interval = args.interval
+
+            # Meme principe pour video/video2 (--style pencil): un VideoSource est lie a
+            # un fichier precis a sa construction, donc un changement redemarre le
+            # decodeur concerne plutot que de muter un attribut relu en direct.
+            current_video = getattr(args, "video", None)
+            if current_video != last_video:
+                if video is not None:
+                    video.stop()
+                video = (VideoSource(current_video, size, args.draw_fps, args.loglevel)
+                         if current_video else None)
+                last_video = current_video
+            current_video2 = getattr(args, "video2", None)
+            if current_video2 != last_video2:
+                if video_out is not None:
+                    video_out.stop()
+                video_out = (VideoSource(current_video2, size, args.draw_fps, args.loglevel)
+                            if current_video2 else None)
+                last_video2 = current_video2
+
             if capture.ended:
                 print("\nCapture interrompue.", file=sys.stderr)
                 break
@@ -1606,10 +2112,15 @@ def main() -> None:
     capture = LiveCapture(capture_proc.stdout, chunk_size(args))
 
     status: dict = {}
+    # Pont vers le bouton "Mesurer" de --gui: la LiveCapture courante, remplacee par
+    # run() a chaque changement d'entree audio (voir sa docstring et celle de
+    # build_gui). Sans lui la fenetre garderait une reference perimee des le premier
+    # changement de peripherique.
+    capture_state: dict = {"capture": capture}
     stop_event = threading.Event()
     finished_event = threading.Event()
     run_args = (args, size, background, ink, capture_proc, viewer, capture,
-                status, stop_event, finished_event)
+                status, capture_state, stop_event, finished_event)
 
     if args.gui:
         # run() tourne dans un fil separe pour laisser tkinter posseder le fil
@@ -1617,7 +2128,7 @@ def main() -> None:
         thread = threading.Thread(target=run, args=run_args, daemon=True)
         thread.start()
         try:
-            build_gui(args, size, status, stop_event, finished_event)
+            build_gui(args, size, status, capture_state, stop_event, finished_event)
         except KeyboardInterrupt:
             stop_event.set()
         thread.join()
