@@ -234,6 +234,25 @@ def tune(args: argparse.Namespace) -> None:
         print("\nSignal quasi nul: la carte son ne recoit probablement rien "
               "(mauvaise entree, cable, ou volume de la platine a zero).")
         return
+    # Signal deja au plafond numerique (ou tout pres) : le convertisseur de la
+    # carte son (ou un pre-ampli/trim en amont) ecrete AVANT meme la capture.
+    # Aucun --gain, si negatif soit-il, ne peut "de-clipper" une valeur deja
+    # tronquee au moment ou elle est numerisee -- il ne peut que remettre a
+    # l'echelle un signal deja deforme, ce qui explique un rendu qui reste
+    # sature (le spectre reste "plein", riche en harmoniques d'ecretage) meme
+    # au gain minimal. `mean_db` proche de `peak_db` (facteur de crete faible)
+    # est un second signe: un signal propre a des pics ponctuels bien au-dessus
+    # de sa moyenne, un signal ecrete est presque plat.
+    if peak_db > -1.0 or (mean_db is not None and peak_db - mean_db < 3.0):
+        print("\nATTENTION: signal deja au maximum numerique (ecretage probable AVANT "
+              "meme la capture). Baisser --gain ne peut pas reparer un signal deja "
+              "deforme a la source -- seulement le reduire en gardant la deformation. "
+              "A faire cote materiel: baisse la sortie de la platine/table de mixage, "
+              "ou le potentiometre d'entree de la carte son si elle en a un, puis relance "
+              "--tune. Verifie aussi le niveau d'enregistrement dans les parametres son de "
+              "Windows (Panneau de configuration > Son > Enregistrement > Proprietes > "
+              "Niveaux) : un curseur d'entree pousse a fond y ecrete independamment de "
+              "--gain.")
     # Le gain conseille depend du style: les deux sont a 40 dB d'ecart.
     print(f"\n  --style {args.style} --gain {-peak_db + STYLE_BOOST_DB[args.style]:.0f}")
     other = "radio" if args.style == "analyzer" else "analyzer"

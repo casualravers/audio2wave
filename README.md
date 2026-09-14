@@ -114,6 +114,18 @@ python audio2wave_live.py -d "<entree>" --gain 34     # lance l'affichage
 un flux live n'a pas de crete connue a l'avance, contrairement a un fichier, donc
 `--gain` ne peut pas etre automatique. Il donne la valeur pour chacun des modes.
 
+**Si la crete mesuree est deja proche de 0 dBFS** (ou que la moyenne colle a la
+crete, signe d'un signal quasi plat), `--tune` previent d'un ecretage probable
+*avant meme* la capture — typique d'une table de mixage/platine dont la sortie
+est trop chaude pour l'entree de la carte son. Aucun `--gain`, meme au minimum,
+ne peut reparer ca : baisser le gain d'un signal deja tronque a la numerisation
+ne fait que le reduire en gardant sa forme deformee (le spectre reste "plein",
+riche en harmoniques d'ecretage) quel que soit `--gain`. A regler cote materiel
+(baisser la sortie de la platine/table de mixage, ou le potentiometre d'entree
+de la carte son si elle en a un) ou dans les parametres d'enregistrement de
+Windows (un curseur de niveau d'entree pousse a fond ecrete independamment de
+`--gain`), puis relancer `--tune` pour verifier.
+
 ## Modes d'affichage
 
 Le mode se choisit au lancement (relancer pour en changer) :
@@ -401,6 +413,36 @@ d'argparse (`set_defaults` puis reparsing de la ligne de commande), pas une fusi
 dictionnaires : seules les options *absentes* de la ligne de commande prennent la
 valeur du preset.
 
+### Presets utilisateur (charger/sauvegarder depuis `--gui`)
+
+En plus des quatre presets integres ci-dessus, la fenetre `--gui` (voir plus bas)
+permet de **charger** un preset, d'en **sauvegarder un nouveau** ou de **mettre a
+jour** un preset utilisateur existant a partir des reglages courants — pratique
+pour retrouver en un clic une combinaison style/couleurs/gain/etc. deja reglee a
+l'oreille pendant une session precedente, ou pour affiner un preset deja
+sauvegarde sans repartir de zero.
+
+Les presets sauvegardes depuis la fenetre atterrissent dans
+`~/.audio2wave/snap_presets.json` (cree au besoin) et sont **immediatement
+utilisables en ligne de commande** comme n'importe quel preset integre :
+
+```bash
+python audio2wave_snap.py -d "<entree>" --preset mon_preset
+python audio2wave_snap.py --list-presets   # liste aussi les presets utilisateur
+```
+
+Sauvegarder (nouveau nom) et Mettre a jour (preset selectionne dans **Charger**)
+capturent tous les deux tout ce que la fenetre expose (style, couleurs,
+epaisseur, `--wave`, points/colonnes, echelle, filtre, crossover, gain, images/s,
+dossier PNG) — pas seulement les quelques options choisies a la main dans les
+presets integres. Aucun des deux ne peut toucher un preset integre (`wave`,
+`club`, `rekordbox`, `editor`) : Sauvegarder refuse ce nom, Mettre a jour refuse
+de le modifier. Charger un preset qui contient une option figee au lancement
+(ex. `--fullscreen` dans `club`) l'ignore silencieusement dans la fenetre — ces
+options ne peuvent de toute facon pas se relancer en direct sans redemarrer le
+programme (voir la section `--gui` plus bas) — et l'indique dans la ligne de
+statut.
+
 ## Styles (`--style`)
 
 | style | rendu |
@@ -582,24 +624,55 @@ repeinture par pas ; a garder en tete sur une resolution plein ecran.
 python audio2wave_snap.py -d "<entree>" --gui
 ```
 
-Ouvre une petite fenetre tkinter avec un controle par reglage : style (pencil /
-rekordbox / simple), couleurs du trait et de fond, epaisseur, `--wave` (case a
-cocher + oscillations), points/colonnes, echelle, filtre par colonne, crossover
-(deux champs Hz), gain (case "automatique" + curseur manuel en dB), dossier PNG
-(`--save-dir`, cree au besoin) et images/s du trace. Un changement prend effet
-**a la photo suivante**, sans redemarrer la capture ni la fenetre ffplay.
+Ouvre une petite fenetre tkinter avec un controle par reglage : entree audio,
+tempo (BPM et temps par photo, `--bpm`/`--beats`),
+style (pencil / rekordbox / simple), couleurs du trait et de fond, epaisseur,
+`--wave` (case a cocher + oscillations), points/colonnes, echelle, filtre par
+colonne, crossover (deux champs Hz), gain (case "automatique" + curseur manuel en
+dB) avec un bouton **Mesurer (tuning)**, video interieure/exterieure (`--video`/
+`--video2`, pencil seul), dossier PNG (`--save-dir`, cree au besoin), images/s du
+trace, et un bloc **Presets** (charger/sauvegarder, voir plus haut). La plupart
+des changements prennent effet **a la photo suivante**, sans redemarrer la
+capture ni la fenetre ffplay ; trois exceptions redemarrent un sous-processus en
+douceur (voir ci-dessous).
 
 Theme sombre coherent (fond ardoise, accent cyan), partage avec les deux autres
 fenetres `--gui` (`audio2wave_live.py`, `audio2wave_ridge.py`) via `style_gui()`
 dans `audio2wave.py`.
 
-**Ce qui n'y est volontairement pas** : `--stereo`, `--split-channels`, `--rate`,
-`--buffer`, `--size`, `--beats`/`--bpm`/`--interval`, `--fullscreen`, `--video` et
-`--video2`. Tous sont figes des le lancement — dans la commande de capture
-(nombre de canaux, frequence, taille du tampon), dans la fenetre ffplay deja
-ouverte (taille, plein ecran), ou dans un decodeur video deja demarre — donc les
-changer en direct n'aurait aucun effet ou desynchroniserait carrement le flux
-audio.
+**Entree audio, video et video2 redemarrent un sous-processus, pas juste `args`**
+Changer l'entree audio (menu deroulant + bouton **Actualiser** pour re-detecter
+les peripheriques branches apres l'ouverture de la fenetre — utile pour brancher
+des platines en cours de route) relance la capture ffmpeg sur le nouveau
+peripherique ; changer le chemin de `--video`/`--video2` (champ texte, cherche
+tel quel puis dans `--asset-dir` comme au demarrage) relance le decodeur video
+correspondant. Dans les deux cas la fenetre ffplay ne bouge pas : seul le flux
+source change, avec une courte coupure (quelques centaines de ms pour l'audio,
+le temps qu'un nouveau ffmpeg dshow s'ouvre) plutot qu'un redemarrage seamless
+comme `--reactive` d'`audio2wave_live.py`. Un chemin video introuvable est
+signale en statut sans toucher au flux en cours, pour ne pas couper une video
+qui marchait sur une faute de frappe pas encore corrigee.
+
+**Le bouton "Mesurer (tuning)"** mesure la crete (et le facteur de crete, pour
+detecter un ecretage AVANT la capture) de la fenetre audio courante et bascule
+le gain en manuel sur la valeur conseillee — l'equivalent de `--tune`
+(`audio2wave_live.py`) mais lu depuis la capture deja en cours, sans avoir a
+relancer le programme. Le meme avertissement d'ecretage que `--tune` s'affiche
+au besoin (voir plus bas, section Gain).
+
+**BPM et temps par photo** recalculent `--interval` a chaque changement de l'un
+ou l'autre (meme formule qu'au demarrage : temps × 60 / BPM), et retaillent la
+fenetre glissante de capture en consequence — sans redemarrer la capture, juste
+en resize cote Python (le flux ffmpeg dshow lui-meme ne change pas). Y toucher
+bascule la fenetre sur les deux curseurs pour la suite de la session, meme si le
+programme a demarre avec un `--interval` explicite.
+
+**Ce qui reste volontairement hors de cette fenetre** : `--stereo`,
+`--split-channels`, `--rate`, `--buffer`, `--size`, `--interval` (remplace par
+BPM/temps ci-dessus), `--fullscreen`. Tous sont figes des le lancement — dans la
+commande de capture (nombre de canaux, frequence, taille du tampon) ou dans la
+fenetre ffplay deja ouverte (taille, plein ecran) — donc les changer en direct
+desynchroniserait carrement le flux audio ou n'aurait aucun effet.
 
 **Changer de style reinitialise les champs couleur** (vides = defaut du nouveau
 style) : `rekordbox` exige trois couleurs separees par `|`, `pencil`/`simple` une
@@ -667,6 +740,16 @@ bords, quelle que soit `--scale`.
 `--scale lin` est le defaut et le plus proche d'une platine. `sqrt` et `cbrt`
 remontent les passages faibles, mais en `rekordbox` ils gonflent surtout les graves,
 qui finissent en bloc bleu plein ou l'on ne distingue plus les kicks.
+
+Ce script n'a pas de `--tune` en ligne de commande (contrairement a
+`audio2wave_live.py`) : `--gui` (voir plus haut) l'expose a la place, sous la
+forme d'un bouton **Mesurer (tuning)** — la capture tournant deja, pas besoin
+d'une etape de mesure separee avant de lancer le vrai rendu. Meme diagnostic
+d'ecretage qu'en mode live : une crete proche de 0 dBFS, ou un facteur de crete
+faible (signal quasi plat), signalent un ecretage survenu AVANT la capture
+(platine/table de mixage trop chaude, ou niveau d'enregistrement Windows pousse
+a fond) — baisser le gain ne peut alors que reduire un signal deja deforme, pas
+le reparer.
 
 ## Pourquoi ce n'est pas une video au ralenti
 

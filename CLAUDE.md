@@ -243,9 +243,59 @@ resolution de chemins.
   `--split-channels` (nombre de canaux fige dans `capture_command`, dont
   `channel_count(args)` deriverait sinon d'une commande de capture different de
   ce qu'elle affiche reellement), `--rate`/`--buffer` (capture), `--size`/
-  `--fullscreen` (fenetre ffplay), `--beats`/`--bpm`/`--interval` (cadence de
-  `run()`), `--video`/`--video2` (un seul `VideoSource` cree avant la boucle,
-  jamais recree).
+  `--fullscreen` (fenetre ffplay), `--interval` (concurrent de `--bpm`/`--beats`
+  sur la meme valeur, voir plus bas).
+  **`--bpm`/`--beats` sont exposes malgre determiner `chunk_size`** (taille de la
+  fenetre glissante de `LiveCapture`), a la difference de `--rate`/`--stereo`/
+  `--split-channels` qui, eux, figent le format de `capture_command`. `run()`
+  compare `args.interval` (recalcule par le curseur des que bpm OU beats bouge, et
+  seul point de verite relu partout ailleurs dans `run()`) a la valeur vue au tour
+  precedent ; sur un changement, `capture.set_window(chunk_size(args))` retaille la
+  fenetre EN PLACE (nouvelle methode sur `LiveCapture`, verrou + reaffectation de
+  `_window`, retaille aussi le tampon deja accumule si la nouvelle fenetre est plus
+  petite) -- aucun sous-processus ni fil ne redemarre, contrairement au
+  changement d'entree audio ci-dessous : seule la fenetre Python cote lecture
+  change de taille, `capture_command`/le flux ffmpeg dshow restent inchanges.
+  **L'entree audio et `--video`/`--video2` sont, eux, exposes dans `--gui` malgre
+  d'etre lies a un sous-processus deja lance** : contrairement a tout le reste de
+  cette fenetre (une simple mutation d'attribut relue a la photo suivante), ces
+  trois-la font exception et redemarrent explicitement le sous-processus concerne.
+  `run()` compare `args.device`/`args.video`/`args.video2` a la valeur vue au tour
+  precedent, exactement comme il le fait deja pour `resolve_bg`/`resolve_colors`
+  (voir plus haut) : sur un changement, il termine l'ancien `capture_proc`
+  (`terminate()`/`wait()`) et en relance un nouveau via `capture_command(args)` +
+  une nouvelle `LiveCapture`, ou `stop()` l'ancien `VideoSource` et en construit un
+  nouveau. Pas de redemarrage seamless a la `--reactive` (`audio2wave_live.py`) :
+  inutile ici, la fenetre ffplay ne bouge pas et ne se rouvre pas, seule la source
+  change derriere elle — une coupure de quelques centaines de ms (le temps qu'un
+  nouveau ffmpeg dshow s'ouvre) est acceptable et visible seulement dans le flux
+  audio/video, pas dans la fenetre elle-meme. `chunk_size(args)` ne change pas au
+  redemarrage de la capture : `--rate`/`--stereo`/`--split-channels` restent figes,
+  donc le format de sortie de `capture_command` est inchange, seul `-i` differe.
+  Un menu deroulant + bouton "Actualiser" (`list_audio_devices()`, relance a la
+  demande) sert l'entree audio, pour detecter un peripherique branche apres
+  l'ouverture de la fenetre (le cas d'usage vise : brancher des platines en cours
+  de route) ; la valeur courante reste dans la liste meme si elle en disparait
+  (peripherique debranche), pour ne pas la changer sous les pieds de
+  l'utilisateur. `--video`/`--video2` sont des champs texte resolus par
+  `find_asset()` (extrait de la logique de `parse_args()`, chemin tel quel puis
+  dans `--asset-dir`) : un chemin introuvable est signale en statut sans toucher
+  a `args.video`/`args.video2`, pour ne pas couper une video en cours sur une
+  faute de frappe pas encore corrigee.
+  `capture_state` (`{"capture": LiveCapture}`, cree dans `main()`) est le pont
+  entre `run()` et `build_gui()` pour ces redemarrages : `run()` y remet la
+  `LiveCapture` courante a chaque changement d'entree audio, et le bouton
+  "Mesurer" (tuning, voir plus bas) y lit toujours la derniere en date plutot que
+  de garder sa propre reference — qui deviendrait perimee des le premier
+  changement de peripherique.
+  **Le bouton "Mesurer (tuning)"** est l'equivalent de `--tune`
+  (`audio2wave_live.py`) mais lu depuis la capture deja en cours au lieu d'une
+  mesure separee : `capture_state["capture"].latest()` donne la derniere fenetre
+  pleine, `peak_dbfs`/`mean_dbfs` (nouveau, RMS en dBFS) en tirent une crete et un
+  facteur de crete, `TUNE_CLIP_PEAK_DB`/`TUNE_CLIP_CREST_DB` (memes valeurs que
+  les seuils de `tune()` en live) decident de l'avertissement d'ecretage. Le gain
+  conseille (`-crete + AUTO_GAIN_MARGIN_DB`) est applique en manuel via
+  `controls["gain"]`, pas juste affiche : bascule "auto" -> valeur mesuree.
   **`--video`** (pencil seul) remplit la bande entre les deux traits de l'enveloppe
   (amplitude min/max) avec une video jouee en boucle — pas jusqu'au bord bas de
   l'image. `VideoSource` reprend le modele de `LiveCapture` (un fil vide le tube,
@@ -476,6 +526,45 @@ reutiliser pour ajouter un preset, pas une fusion manuelle de `vars(args)` qui
 ecraserait aussi les options explicites. `--list-presets` s'evalue et quitte **avant**
 `require_tools()`, comme `-h` : c'est une aide statique, elle ne doit pas exiger ffmpeg.
 
+**Presets utilisateur** (`load_user_presets`/`save_user_preset`, JSON dans
+`~/.audio2wave/snap_presets.json`) sont distincts de `PRESETS` : ces derniers
+integres au code (relus, versionnes), ceux-la vivent dans le profil utilisateur
+pour survivre d'une session a l'autre sans toucher au depot — sauvegardes depuis
+`--gui` (voir plus bas), mais aussi utilisables via `--preset <nom>` en ligne de
+commande comme n'importe quel preset integre (`all_presets()` fusionne les deux,
+l'utilisateur prioritaire en cas de nom identique ; `preset_value()`/
+`describe_presets()`/`--list-presets` les incluent). Fichier absent ou mal forme =
+aucun preset utilisateur, jamais une erreur bloquante. Seul point d'attention au
+round-trip : `--save-dir` est de `type=Path`, mais `set_defaults()` ne repasse pas
+les valeurs par ce `type=` (reserve aux valeurs lues sur la ligne de commande) —
+et JSON n'a pas de type `Path` de toute facon, donc `save_dir` est stocke en texte
+et reconverti a la main juste avant `set_defaults(**overrides)`.
+
+`build_gui()` expose desormais **charger un preset** (integre ou utilisateur) et
+**en sauvegarder un nouveau** a partir des reglages courants. `controls: dict[str,
+Callable]` (construit par `add_slider`/`add_entry`/`add_dropdown`, plus des
+setters dedies pour `style`/`wave`/`gain`/`crossover`/`save_dir`) associe chaque
+attribut GUI-editable a un setter qui met a jour **le widget ET `args`** (pas
+juste l'un ou l'autre) — necessaire parce que charger un preset doit rejouer la
+meme logique qu'une interaction manuelle (reset des couleurs sur un changement de
+style, `mkdir` sur un `save_dir`, bascule auto/manuel sur `gain`...), pas
+seulement pousser une valeur. `apply_preset()` traite `style` en premier
+explicitement (peu importe l'ordre des cles du dict source), pour que les
+couleurs qu'un preset fournirait lui-meme soient posees APRES le reset que le
+changement de style declenche, jamais avant. Les cles d'un preset absentes de
+`controls` (options figees au lancement, ex. `fullscreen` du preset `club`) sont
+silencieusement ignorees et listees dans le texte de statut plutot que de lever —
+memes options exclues de cette fenetre que documente plus haut, un preset --gui
+peut legitimement contenir des options que --preset sait appliquer au demarrage
+mais que cette fenetre ne peut pas relancer en direct. `capture_overrides()`
+factorise la meme capture (`{attr: getattr(args, attr) for attr in controls}`,
+conversion `Path` -> `str` pour `save_dir`) entre **Sauvegarder sous** (nouveau
+nom, refuse un nom de preset integre) et **Mettre a jour** (`on_update_preset`,
+reecrit le preset actuellement selectionne dans le menu **Charger** avec l'etat
+courant — refuse aussi de toucher un preset integre, meme logique de protection).
+Aucun des deux ne rappelle `refresh_preset_menu()` pour "Mettre a jour" : le nom
+existe deja dans le menu, seul son contenu change.
+
 ### Frequence d'echantillonnage
 
 `audio2wave_snap.py` prend par defaut la frequence native du peripherique
@@ -498,6 +587,18 @@ independamment**. Sa correction est quasi nulle (`AUTO_GAIN_MARGIN_DB`) et non
 dependante du style, parce que `showwavespic` dessine l'amplitude telle quelle :
 a crete normalisee le trace touche les bords quelle que soit `--scale`
 (`sqrt(1) = cbrt(1) = 1`).
+
+**`--tune` detecte aussi l'ecretage AVANT capture**, distinct d'un simple niveau
+trop fort : une platine/table de mixage dont la sortie est trop chaude pour
+l'entree de la carte son (ou un niveau d'enregistrement Windows pousse a fond)
+tronque le signal a la numerisation, avant que `--gain` (un simple facteur
+multiplicatif applique apres coup) n'ait la moindre prise dessus — signale par
+l'utilisateur, `--gain` au minimum ne changeait rien au rendu sature. `tune()`
+avertit si la crete mesuree est proche de 0 dBFS (`> -1.0`) ou si le facteur de
+crete est faible (`peak - mean < 3.0`, signal quasi plat) : les deux sont des
+signes d'ecretage, pas juste de volume eleve. Le message oriente vers le
+materiel (baisser la source, verifier le trim de la carte son ou le niveau
+d'enregistrement Windows) plutot que vers `--gain`, qui ne peut pas aider ici.
 
 ## Sortie et fichiers
 
