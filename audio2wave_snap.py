@@ -41,7 +41,9 @@ from audio2wave import (
     GUI_ACCENT, GUI_ACCENT_FG, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL,
     GUI_MUTED_FG, GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
-from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
+from audio2wave_live import (
+    find_window_position, list_audio_devices, primary_screen_size, require_tools,
+)
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
 # transite par Python entre la capture et le rendu: fixer le format a la sortie de
@@ -826,7 +828,17 @@ def build_render_args(args: argparse.Namespace, graph: str, png: Path | None) ->
     ] + outputs
 
 
-def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]:
+def window_title(args: argparse.Namespace) -> str:
+    """Extrait de viewer_command pour etre reutilisable par find_window_position()
+    (meme principe qu'audio2wave_live.py) : sur un redemarrage --size/--fullscreen,
+    il faut retrouver la fenetre DEJA OUVERTE par son titre exact avant de la
+    fermer, donc calculer ce titre a partir des memes args, separement de la
+    construction de la commande."""
+    return f"audio2wave photo [{args.style}, {describe_window(args)}] - {args.device}"
+
+
+def viewer_command(args: argparse.Namespace, size: tuple[int, int],
+                   position: tuple[int, int] | None = None) -> list[str]:
     """Fenetre d'affichage, alimentee image par image.
 
     Une image par photo suffit: privee de donnees, ffplay laisse la derniere a l'ecran,
@@ -836,6 +848,13 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]
     consommer plus vite qu'on ne le nourrit, sinon elles s'empilent dans sa file et
     l'affichage prend un retard qui grandit. Trop vite, il attend simplement. Ce rythme
     est celui du trace progressif quand il est actif, et celui des photos sinon.
+
+    `position` (left, top de l'ancienne fenetre, voir find_window_position) ne sert
+    qu'en mode fenetre : passe a `-left`/`-top` pour qu'un redemarrage --size se voie
+    comme une mise a jour sur place plutot qu'une fenetre qui se ferme et se rouvre
+    ailleurs sur l'ecran (meme motif qu'audio2wave_live.py). Sans effet ici en
+    --fullscreen -- ffplay ignore -left/-top des qu'il recoit -fs ; voir
+    viewer_env() pour la tentative de ciblage du bon moniteur dans ce cas-la.
     """
     width, height = size
     if args.draw_fps > 0:
@@ -849,11 +868,34 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]
         "-video_size", f"{width}x{height}",
         "-framerate", rate,
         "-i", "-", "-autoexit",
-        "-window_title", f"audio2wave photo [{args.style}, {describe_window(args)}] - {args.device}",
+        "-window_title", window_title(args),
     ]
     if args.fullscreen:
         cmd.append("-fs")
+    elif position:
+        cmd += ["-left", str(position[0]), "-top", str(position[1])]
     return cmd
+
+
+def viewer_env(args: argparse.Namespace, position: tuple[int, int] | None) -> dict[str, str]:
+    """Environnement du sous-processus ffplay : tentative de cibler le bon moniteur
+    en plein ecran, via la variable SDL_VIDEO_WINDOW_POS (lue par SDL2 -- la
+    bibliotheque sous-jacente de ffplay -- a la creation de sa fenetre, AVANT que
+    -fs ne la fasse passer en plein ecran).
+
+    Distinct de `-left`/`-top` (voir viewer_command) : ces options d'ffplay lui-meme
+    sont documentees ignorees en `-fs` (voir find_window_position dans common.py),
+    mais SDL_VIDEO_WINDOW_POS agit un cran plus bas, avant meme que le choix
+    fenetre/plein ecran d'ffplay ne s'applique -- une piste plausible pour un
+    multi-ecran, mais NON VERIFIEE sur un vrai poste multi-moniteur (cette session
+    tourne dans un environnement distant sans acces aux moniteurs physiques de
+    l'utilisateur). A confirmer en usage reel avant de la considerer fiable ;
+    sans effet mesurable si SDL l'ignore, pas de degradation en tout cas.
+    """
+    env = dict(os.environ)
+    if args.fullscreen and position:
+        env["SDL_VIDEO_WINDOW_POS"] = f"{position[0]},{position[1]}"
+    return env
 
 
 class LiveCapture:
@@ -1851,6 +1893,18 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             scale.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
 
         def set_value(value: object) -> None:
+            # `value` peut valoir None (attribut jamais touche, ex. --columns
+            # en mode "auto" avant tout reglage manuel) des qu'un preset
+            # sauvegarde depuis capture_overrides() capture TOUS les controls,
+            # meme ceux restes a leur valeur par defaut -- un Scale n'a pas de
+            # position "auto" a afficher, contrairement a --wave/--crossover
+            # (setters dedies qui gerent deja None). Sans cette garde,
+            # recharger un tel preset plantait le callback Tk ("cannot assign
+            # a non-numeric value to a scale variable"), decouvert en testant
+            # le chargement automatique a la selection. Ne rien faire laisse
+            # la valeur courante intacte, cohere avec le sens de None ailleurs.
+            if value is None:
+                return
             var.set(value)
             on_change()
 
@@ -2278,6 +2332,74 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     add_slider("Images/s du trace", "draw_fps", 0, 60, 1, panel="right")
 
+    # --size : pre-rempli avec la taille REELE deja resolue (ecran/fullscreen si
+    # --size n'etait pas passe en ligne de commande), pas avec args.size brut
+    # (souvent None) -- pour que les champs montrent d'emblee la resolution
+    # courante plutot que rien. args.size lui-meme reste None tant que ces
+    # champs ne sont pas touches (meme principe que --wave/--bars ailleurs :
+    # y toucher fige une valeur explicite) -- ne pas y toucher laisse le
+    # comportement automatique (plein ecran/tiers de hauteur) intact.
+    width0, height0 = size
+
+    def apply_size(_evt: object = None) -> None:
+        try:
+            w = int(width_var.get().strip())
+            h = int(height_var.get().strip())
+        except ValueError:
+            return
+        if w <= 0 or h <= 0:
+            return
+        args.size = f"{w}x{h}"
+
+    def set_size(value: object) -> None:
+        if value:
+            try:
+                w, h = (int(part) for part in str(value).lower().split("x", 1))
+            except ValueError:
+                return
+            width_var.set(str(w))
+            height_var.set(str(h))
+        apply_size()
+
+    controls["size"] = set_size
+
+    r = next_row("right")
+    add_label("Taille fenetre", r, RIGHT_LABEL_COL,
+             tooltip="Largeur x hauteur de la fenetre video, en pixels. Redemarre la "
+                     "fenetre ffplay (et les videos actives) -- une coupure de quelques "
+                     "centaines de ms, comme changer d'entree audio ou de video.")
+    size_frame = tk.Frame(root)
+    size_frame.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    width_var = tk.StringVar(value=str(width0))
+    height_var = tk.StringVar(value=str(height0))
+    for var in (width_var, height_var):
+        entry = tk.Entry(size_frame, textvariable=var, width=6)
+        entry.pack(side="left", padx=(0, 6))
+        entry.bind("<Return>", apply_size)
+        entry.bind("<FocusOut>", apply_size)
+
+    # --fullscreen : bascule juste a cote de la taille, meme redemarrage de
+    # viewer -- utile en particulier pour SORTIR d'un plein ecran ouvert sur le
+    # mauvais moniteur (signale par l'utilisateur : "la fenetre s'ouvre en plein
+    # ecran sur le mauvais moniteur et je n'arrive plus a la deplacer") : decocher
+    # relance une fenetre normale, deplacable a la souris comme n'importe quelle
+    # fenetre, vers le bon moniteur.
+    fullscreen_var = tk.BooleanVar(value=args.fullscreen)
+
+    def on_fullscreen_change(value: object = None) -> None:
+        if value is not None:
+            fullscreen_var.set(bool(value))
+        args.fullscreen = fullscreen_var.get()
+
+    controls["fullscreen"] = on_fullscreen_change
+
+    fullscreen_check = tk.Checkbutton(size_frame, text="Plein ecran", variable=fullscreen_var,
+                                      command=on_fullscreen_change)
+    fullscreen_check.pack(side="left", padx=(4, 0))
+    Tooltip(fullscreen_check, "Redemarre la fenetre video en plein ecran ou non. Decoche pour "
+                             "sortir d'un plein ecran ouvert sur le mauvais moniteur : la "
+                             "nouvelle fenetre, normale, peut etre deplacee a la souris.")
+
     # --save-dir: le dossier initial est deja cree par main() avant l'ouverture de la
     # fenetre; un dossier saisi ici doit l'etre aussi, sinon write_png (qui ne cree pas
     # ses dossiers parents) echouerait des la premiere photo.
@@ -2364,14 +2486,27 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             ).grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                    padx=ROW_PADX, pady=(10, SECTION_GAP))
 
+    # "size" est dans `controls` pour que le champ "Taille fenetre" puisse etre
+    # pilote comme n'importe quel autre reglage GUI, mais NE DOIT PAS voyager
+    # dans un preset : la taille de fenetre est independante du rendu (comme
+    # --device/--video, deja hors de cette logique en n'etant simplement pas
+    # dans `controls`), demande explicite ("verifie que la taille de la fenetre
+    # ne puisse pas etre sauvegardee dans les presets, c'est independant").
+    # `--fullscreen`, lui, reste volontairement dans les presets (le preset
+    # "club" en depend deja, voir plus haut) : seule la taille en pixels est
+    # exclue ici, pas le mode plein ecran.
+    PRESET_EXCLUDED_CONTROLS = {"size"}
+
     def apply_preset(overrides: dict) -> list[str]:
         """Applique les cles d'un preset aux widgets+args ; renvoie celles ignorees
-        (figees au lancement, non exposees dans cette fenetre -- voir docstring)."""
-        skipped = [key for key in overrides if key not in controls]
+        (figees au lancement et non exposees dans cette fenetre, ou explicitement
+        exclues des presets comme "size" -- voir PRESET_EXCLUDED_CONTROLS)."""
+        skipped = [key for key in overrides
+                  if key not in controls or key in PRESET_EXCLUDED_CONTROLS]
         if "style" in overrides:
             controls["style"](overrides["style"])
         for key, value in overrides.items():
-            if key != "style" and key in controls:
+            if key != "style" and key in controls and key not in PRESET_EXCLUDED_CONTROLS:
                 controls[key](value)
         return skipped
 
@@ -2384,21 +2519,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     style_option_menu(preset_menu)
     preset_menu.pack(side="left")
 
-    def refresh_preset_menu(select: str | None = None) -> None:
-        names = sorted(all_presets())
-        menu = preset_menu["menu"]
-        menu.delete(0, "end")
-        for name in names:
-            menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
-        if select is not None:
-            preset_var.set(select)
-        elif names and preset_var.get() not in names:
-            preset_var.set(names[0])
-
-    refresh_preset_menu()
-
-    def on_load_preset() -> None:
-        name = preset_var.get()
+    def on_load_preset(name: str) -> None:
         presets = all_presets()
         if name not in presets:
             status["text"] = f"preset inconnu: {name}"
@@ -2406,13 +2527,35 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         skipped = apply_preset(presets[name])
         text = f"preset '{name}' charge"
         if skipped:
-            # Options figees au lancement (video, capture, fenetre ffplay...): un
-            # preset --gui peut les contenir (ex. "club" a --fullscreen) mais cette
-            # fenetre ne peut pas les relancer en direct, voir la docstring.
-            text += f" (ignore, deja fige au lancement: {', '.join(skipped)})"
+            # Options figees au lancement (video, capture, fenetre ffplay...) ou
+            # volontairement exclues des presets (ex. "size", voir
+            # PRESET_EXCLUDED_CONTROLS) : un preset peut les contenir (a la
+            # main dans le JSON, ou "club" pour --fullscreen) mais cette
+            # fenetre ne les applique pas depuis un preset, voir la docstring.
+            text += f" (ignore: {', '.join(skipped)})"
         status["text"] = text
 
-    tk.Button(preset_frame, text="Charger", command=on_load_preset).pack(side="left", padx=(8, 0))
+    def select_preset(name: str) -> None:
+        # Choisir dans le menu deroulant charge directement le preset -- plus
+        # de bouton "Charger" separe, a la demande explicite ("charge
+        # automatiquement lors de la selection de la liste deroulante").
+        preset_var.set(name)
+        on_load_preset(name)
+
+    def refresh_preset_menu(select: str | None = None) -> None:
+        names = sorted(all_presets())
+        menu = preset_menu["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: select_preset(n))
+        if select is not None:
+            # Rafraichissement apres Sauvegarder/Mettre a jour : le preset vient
+            # d'etre ecrit avec l'etat courant, pas la peine de le recharger.
+            preset_var.set(select)
+        elif names and preset_var.get() not in names:
+            preset_var.set(names[0])
+
+    refresh_preset_menu()
 
     def capture_overrides() -> dict:
         # Capture args (pas les widgets) : args est la source de verite deja tenue
@@ -2427,7 +2570,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         # par l'utilisateur. Conversion generalisee a TOUT attribut Path, pas
         # seulement save_dir : plus robuste qu'ajouter un cas special de plus
         # par attribut au fil du temps.
-        overrides = {attr: getattr(args, attr) for attr in controls}
+        overrides = {attr: getattr(args, attr) for attr in controls
+                    if attr not in PRESET_EXCLUDED_CONTROLS}
         for key, value in overrides.items():
             if isinstance(value, Path):
                 overrides[key] = str(value)
@@ -2874,10 +3018,24 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     actif (pour laisser tkinter posseder le fil principal), directement dans main()
     sinon.
     """
+    def stop_viewer(v: subprocess.Popen) -> None:
+        # Factorise entre le redemarrage sur changement de --size (voir plus bas)
+        # et le nettoyage final (bloc finally) : fermer stdin (EOF, -autoexit
+        # referme la fenetre de lui-meme) puis terminate()/wait() en secours si
+        # elle ne s'est pas fermee toute seule.
+        try:
+            v.stdin.close()
+        except OSError:
+            pass
+        if v.poll() is None:
+            v.terminate()
+        v.wait()
+
     last_bg = resolve_bg(args)
     last_colors = resolve_colors(args)[0]
     last_device = args.device
     last_interval = args.interval
+    last_fullscreen = args.fullscreen
     last_video = getattr(args, "video", None)
     last_video2 = getattr(args, "video2", None)
     # Un seul decodeur par video au depart, qui reboucle tout seul (-stream_loop -1);
@@ -2945,6 +3103,44 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             if args.interval != last_interval:
                 capture.set_window(chunk_size(args))
                 last_interval = args.interval
+
+            # --gui a change --size ou --fullscreen: contrairement a interval
+            # ci-dessus, la fenetre ffplay ET les VideoSource actives sont liees a
+            # une taille fixee a leur construction (comme device/video le sont a un
+            # peripherique/fichier precis) -- redemarrer le viewer et les decodeurs
+            # video est donc necessaire, pas juste une mutation d'attribut.
+            # resolve_size(args) (pas args.size brut) est comparee: args.size reste
+            # None tant que ce champ n'a pas ete touche (voir build_gui), et c'est
+            # resolve_size() qui determine alors la taille reelle a partir de
+            # l'ecran -- y compris plein ecran ou non, d'ou le suivi separe de
+            # last_fullscreen : un --size explicite fixe une resolution independante
+            # de --fullscreen (resolve_size la retourne telle quelle dans les deux
+            # cas), donc SEUL le drapeau -fs de viewer_command change quand on
+            # decoche "Plein ecran" avec une taille explicite deja fixee -- rien que
+            # la comparaison de taille seule ne detecterait.
+            current_size = resolve_size(args)
+            if current_size != size or args.fullscreen != last_fullscreen:
+                status["text"] = f"changement d'affichage -> {current_size[0]}x{current_size[1]}..."
+                # Position de la fenetre ENCORE OUVERTE, retrouvee par son titre
+                # avant de la fermer (meme technique qu'audio2wave_live.py) :
+                # reutilisee en -left/-top si la nouvelle fenetre est en mode
+                # fenetre, ou passee en tentative via SDL_VIDEO_WINDOW_POS si elle
+                # doit s'ouvrir en plein ecran (voir viewer_env, non verifie sur un
+                # vrai multi-ecran).
+                position = find_window_position(window_title(args))
+                size = current_size
+                last_fullscreen = args.fullscreen
+                stop_viewer(viewer)
+                viewer = subprocess.Popen(viewer_command(args, size, position),
+                                          stdin=subprocess.PIPE, env=viewer_env(args, position))
+                previous_frame = background * (size[0] * size[1])
+                if video is not None:
+                    video.stop()
+                    video = VideoSource(last_video, size, args.draw_fps, args.loglevel)
+                if video_out is not None:
+                    video_out.stop()
+                    video_out = VideoSource(last_video2, size, args.draw_fps, args.loglevel)
+                status["text"] = f"affichage: {size[0]}x{size[1]}{' plein ecran' if args.fullscreen else ''}"
 
             # Meme principe pour video/video2 (--style pencil): un VideoSource est lie a
             # un fichier precis a sa construction, donc un changement redemarre le
@@ -3077,13 +3273,7 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             video.stop()
         if video_out is not None:
             video_out.stop()
-        try:
-            viewer.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
-        except OSError:
-            pass
-        if viewer.poll() is None:
-            viewer.terminate()
-        viewer.wait()
+        stop_viewer(viewer)
         finished_event.set()
 
 

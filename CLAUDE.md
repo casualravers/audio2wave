@@ -310,13 +310,19 @@ resolution de chemins.
   filtre, crossover, **gain** — case "auto" + curseur manuel en dB, `resolve_gain`
   lu chaque photo — et **`--save-dir`** — champ texte, `mkdir(parents=True,
   exist_ok=True)` a la validation puisque `write_png` ne cree pas ses dossiers
-  parents — en plus des images/s). Exclut deliberement tout ce qui est fige dans
+  parents — en plus des images/s). Exclut deliberement tout ce qui reste fige dans
   un sous-processus deja lance au demarrage et jamais rouvert : `--stereo`/
   `--split-channels` (nombre de canaux fige dans `capture_command`, dont
   `channel_count(args)` deriverait sinon d'une commande de capture different de
-  ce qu'elle affiche reellement), `--rate`/`--buffer` (capture), `--size`/
-  `--fullscreen` (fenetre ffplay), `--interval` (concurrent de `--bpm`/`--beats`
-  sur la meme valeur, voir plus bas).
+  ce qu'elle affiche reellement), `--rate`/`--buffer` (capture), `--interval`
+  (concurrent de `--bpm`/`--beats` sur la meme valeur, voir plus bas). `--size`
+  et `--fullscreen`, eux, ne sont PLUS dans cette liste (voir juste apres) :
+  redemarrer la fenetre ffplay pour changer sa taille ou son mode plein ecran,
+  exactement comme redemarrer la capture pour changer d'entree audio, n'a rien
+  d'impossible -- ce n'etait qu'un choix initial pas encore remis en question,
+  jusqu'a la demande explicite de pouvoir "regler la taille de la fenetre
+  depuis la gui", puis "un bouton qui mette en plein ecran" pour sortir d'un
+  plein ecran ouvert sur le mauvais moniteur.
   **"Variation automatique"** fait piloter un curseur par une COURBE plutot que
   par la souris, a la demande explicite — d'abord "un moyen de piloter la
   variation des parametres depuis la GUI", puis, apres un premier jet a sinus/
@@ -472,6 +478,80 @@ resolution de chemins.
   "Mesurer" (tuning, voir plus bas) y lit toujours la derniere en date plutot que
   de garder sa propre reference — qui deviendrait perimee des le premier
   changement de peripherique.
+  **`--size` (champ "Taille fenetre", largeur/hauteur separees comme
+  "Crossover Hz") redemarre la fenetre ffplay ET les `VideoSource` actives**, a
+  la demande explicite de pouvoir "regler la taille de la fenetre depuis la
+  gui" — meme famille d'exception qu'entree audio/video/video2 juste au-dessus
+  (un sous-processus deja lance redemarre plutot qu'un attribut simplement relu
+  en direct), pas une categorie a part. `run()` compare `resolve_size(args)`
+  (PAS `args.size` brut) a la taille courante `size` a chaque tour : tant que
+  ce champ n'a pas ete touche, `args.size` reste `None` et `resolve_size()`
+  retombe sur son calcul habituel (ecran entier ou tiers de sa hauteur), donc
+  la comparaison ne change jamais et rien ne redemarre — comportement
+  automatique intact par defaut, comme `--wave`/`--bars` ailleurs (y toucher
+  fige une valeur explicite). Sur un changement : `stop_viewer(viewer)`
+  (nouvelle petite fonction, factorisee avec le nettoyage final du `finally`
+  qui faisait deja exactement ca — fermer `stdin`, `terminate()`/`wait()` en
+  secours) puis `viewer = subprocess.Popen(viewer_command(args, size), ...)`,
+  `previous_frame` reconstruit a la nouvelle taille, et toute `VideoSource`
+  active recreee (meme fichier, nouvelle taille) — sinon son image decodee ne
+  correspondrait plus aux dimensions du canevas. Les champs largeur/hauteur de
+  la fenetre sont pre-remplis avec le `size` REEL deja resolu au lancement
+  (parametre deja recu par `build_gui`), pas avec `args.size` (souvent `None`),
+  pour montrer d'emblee la resolution courante plutot qu'un champ vide.
+  Verifie sans vrai ffmpeg/ffplay (`subprocess.Popen`/`VideoSource` remplaces
+  par de faux objets qui n'observent que les arguments recus, meme mecanique
+  que le test de redemarrage device/video/video2) : changer `args.size` en
+  cours de route redemarre bien le viewer avec le nouveau `-video_size`, ET une
+  `VideoSource` deja active avec la nouvelle taille, sans toucher a
+  `capture_proc` (l'audio n'a rien a voir avec la taille video). Piege
+  rencontre en ecrivant ce test : si le `size` passe artificiellement a `run()`
+  ne correspond pas a ce que `resolve_size(args)` calculerait reellement (cas
+  courant dans les tests existants, qui passent un `size` arbitraire type
+  `(100, 50)` sans jamais fixer `args.size`), le tout PREMIER tour de boucle
+  declenche desormais un redemarrage parasite — plusieurs tests plus anciens
+  (`check_snap_tune_clip_and_run_restart.py`, `check_snap_gui_tempo.py`) ont
+  du fixer `args.size` explicitement pour rester coherents avec leur propre
+  `size` de test, sans quoi leur `subprocess.Popen` factice (qui ne savait
+  gerer que la capture audio) plantait des la premiere iteration.
+  **`--fullscreen` (case "Plein ecran", juste a cote de "Taille fenetre") suit
+  le meme redemarrage**, ajoute juste apres a la demande explicite d'un moyen de
+  sortir d'un plein ecran ouvert sur le mauvais moniteur ("je n'arrive plus a la
+  deplacer") : `run()` suit `last_fullscreen` separement de `size`, parce que
+  `--size` explicite rend `resolve_size(args)` INDEPENDANT de `--fullscreen`
+  (une resolution fixe reste la meme, plein ecran ou pas) — seul le drapeau
+  `-fs` de `viewer_command` changerait alors, que la seule comparaison de taille
+  ne verrait jamais. La condition de redemarrage est donc
+  `current_size != size or args.fullscreen != last_fullscreen`, testee dans le
+  MEME bloc que `--size` (ils redemarrent le meme `viewer`, pas la peine de
+  dupliquer `stop_viewer`/`subprocess.Popen`/la reconstruction de
+  `previous_frame`/des `VideoSource` dans un second bloc). Decocher relance donc
+  une fenetre normale (pas plein ecran), deplacable a la souris comme n'importe
+  quelle fenetre — resout le blocage signale. Verifie avec `--size` explicite
+  (donc `resolve_size(args)` constant) : cocher puis decocher "Plein ecran"
+  redemarre bien le viewer deux fois, avec `-fs` present puis absent, alors que
+  la taille annoncee reste identique aux deux tours.
+  **Ciblage du bon moniteur, tentative non verifiee sur un vrai multi-ecran** :
+  signale par l'utilisateur ("quand je coche plein ecran, cela redemarre sur le
+  mauvais moniteur") apres le premier jet ci-dessus. `window_title(args)`
+  (extrait de `viewer_command`, meme scission qu'`audio2wave_live.py`) et
+  `find_window_position()` (deja dans `common.py`, importee via
+  `audio2wave_live.py`) retrouvent la position de la fenetre ENCORE OUVERTE par
+  son titre exact, juste avant de la fermer. Deux usages distincts de cette
+  position, selon `args.fullscreen` : en mode fenetre, `-left`/`-top` (comme
+  `audio2wave_live.py`) ; en plein ecran, ces options sont documentees ignorees
+  par ffplay des qu'il recoit `-fs` (voir la docstring de
+  `find_window_position`) — `viewer_env()` tente donc `SDL_VIDEO_WINDOW_POS`
+  dans l'environnement du sous-processus a la place : cette variable est lue
+  par SDL2 (la bibliotheque graphique sous-jacente d'ffplay) au moment de la
+  creation de sa fenetre, UN CRAN AVANT qu'`-fs` ne la fasse passer en plein
+  ecran — piste plausible pour influencer quel ecran regoit le plein ecran,
+  mais **non confirmee empiriquement** : cette session tourne dans un
+  environnement distant sans acces aux moniteurs physiques de l'utilisateur,
+  impossible d'observer le resultat reel d'un `SDL_VIDEO_WINDOW_POS` a cote
+  d'un `-fs`. Sans effet mesurable si SDL2/ffplay l'ignorent malgre tout (pas
+  de degradation, juste retour au comportement precedent). A confirmer en
+  usage reel avant de considerer ce point clos.
   **Le bouton "Mesurer (tuning)"** est l'equivalent de `--tune`
   (`audio2wave_live.py`) mais lu depuis la capture deja en cours au lieu d'une
   mesure separee : `capture_state["capture"].latest()` donne la derniere fenetre
@@ -801,6 +881,52 @@ une collision accidentelle par faute de frappe, un nom cree "par erreur" n'a
 pas la meme intention qu'un preset explicitement selectionne puis mis a jour,
 voir plus bas) et **Mettre a jour** (`on_update_preset`, reecrit le preset
 actuellement selectionne dans le menu **Charger** avec l'etat courant).
+**Selectionner un preset dans le menu Charger le charge immediatement**, sans
+bouton "Charger" separe a cliquer en plus — demande explicite ("enleve le
+bouton charger des presets et charge les automatiquement lors de la selection
+de la liste deroulante"). `select_preset(name)` fait les deux choses qu'un
+ancien clic sur "Charger" faisait en deux temps (`preset_var.set(name)` puis
+`on_load_preset`) ; c'est cette fonction, pas `preset_var.set` seul, qui est
+maintenant le `command=` de chaque entree du menu deroulant
+(`menu.add_command`). `refresh_preset_menu(select=...)`, elle, continue de
+seulement positionner `preset_var` sans charger (appelee apres Sauvegarder/
+Mettre a jour : le preset vient d'etre ecrit avec l'etat courant, pas la peine
+de le relire). Meme mecanique gardee telle quelle pour l'enchainement VJ (menu
+**Charger**/**Mettre a jour** avec bouton, voir plus bas) : ce menu-la ajoute
+une ENTREE a la liste en cours d'edition plutot que de remplacer l'etat
+courant, une selection accidentelle y aurait un cout different (perte de
+saisie en cours), un clic explicite reste plus sur.
+**`--size` (taille de fenetre) est explicitement EXCLUE des presets**, a la
+demande explicite ("verifie que la taille de la fenetre ne puisse pas etre
+sauvegardee dans les presets, c'est independant") : bien que "size" soit dans
+`controls` (le champ doit rester pilotable comme les autres reglages GUI, y
+compris par un futur mecanisme qui le voudrait), `PRESET_EXCLUDED_CONTROLS =
+{"size"}` (local a `build_gui`, a cote de `apply_preset`) en retire la prise
+en compte des deux cotes : `capture_overrides()` ne l'inclut plus dans le
+JSON ecrit par Sauvegarder/Mettre a jour, et `apply_preset()` l'ignore
+(ajoute a `skipped`) si un JSON en contient un malgre tout (ecrit a la main).
+`--fullscreen` reste volontairement CAPTURE, lui : seule la taille en pixels
+est jugee independante du rendu, pas le mode plein ecran (le preset "club" en
+depend deja, voir plus bas). Verifie : changer la taille puis sauvegarder un
+preset n'ecrit pas "size" dans le JSON ; changer la taille une seconde fois
+puis recharger ce preset ne la fait PAS revenir en arriere (elle n'a jamais
+ete capturee, donc rien a rejouer).
+**Bug corrige, decouvert en ecrivant ce test-la : recharger un preset
+fraichement sauvegarde pouvait planter le callback Tk** ("cannot assign a
+non-numeric value to a scale variable"). Cause : `capture_overrides()` capture
+TOUS les attributs de `controls`, y compris ceux restes a leur valeur par
+defaut `None` (ex. `--columns` jamais touche, mode "auto"). La plupart des
+setters geres a la main (`wave`, `crossover`, `gain`...) savent deja
+interpreter `None` ; le setter GENERIQUE cree par `add_slider()` (utilise tel
+quel par `columns`, seul curseur a pouvoir valoir `None`) ne faisait, lui, que
+`var.set(value)` sans garde — un `tk.Scale`/`DoubleVar` refuse une valeur non
+numerique. `set_value()` ignore desormais silencieusement un `value is None`
+(la valeur courante reste inchangee, coherent avec ce que `None` veut dire
+partout ailleurs dans ce fichier). Symptomatique seulement depuis que charger
+un preset ne demande plus de clic explicite (voir plus haut) : un menu
+deroulant qu'on parcourt a la souris peut desormais declencher ce chargement
+par un simple survol-puis-clic sur la mauvaise entree, la ou un bouton
+"Charger" separe laissait le temps de changer d'avis.
 **Peut desormais mettre a jour un preset INTEGRE** (ex. "club"), a la demande
 explicite ("rend la possibilite de mettre a jour les presets par defaut") —
 refuse au premier jet, par prudence excessive plutot que par necessite
@@ -834,12 +960,13 @@ popup, voir plus bas) ; `vj_tick()`, reprogrammee via
 `root.after(VJ_TICK_MS, ...)`, calcule `elapsed = (now - start) % total` (le
 modulo fait la boucle) puis cherche dans quelle entree cet `elapsed` tombe par
 somme cumulee ; des que l'index change, elle appelle **`apply_preset()`
-directement** — la MEME fonction que le bouton "Charger", donc un preset du
-mode VJ beneficie gratuitement de toute sa logique deja en place (reset des
-couleurs sur changement de style, options figees au lancement ignorees et
-signalees via `skipped`, etc.) sans rien dupliquer. `run()` ne voit que des
-attributs d'`args` qui changent, exactement comme un clic sur "Charger" ou un
-curseur pilote par une courbe (voir "Variation automatique" plus haut) : le
+directement** — la MEME fonction que la selection dans le menu "Charger",
+donc un preset du mode VJ beneficie gratuitement de toute sa logique deja en
+place (reset des couleurs sur changement de style, options figees au
+lancement ignorees et signalees via `skipped`, etc.) sans rien dupliquer.
+`run()` ne voit que des attributs d'`args` qui changent, exactement comme une
+selection dans le menu "Charger" ou un curseur pilote par une courbe (voir
+"Variation automatique" plus haut) : le
 mode VJ n'est qu'un troisieme "input" de plus vers les memes setters.
 **Popup independant (`open_vj_editor()`), PAS inline dans la fenetre
 principale** : un premier jet inline (separateur + titre + ligne "Ajouter" +
