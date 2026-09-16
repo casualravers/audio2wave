@@ -822,6 +822,91 @@ valeur du JSON apres coup (`all_presets()['club']`, pas `PRESETS['club']`).
 Aucun des deux ne rappelle `refresh_preset_menu()` pour "Mettre a jour" : le nom
 existe deja dans le menu, seul son contenu change.
 
+**"Mode VJ"** enchaine une liste ORDONNEE de presets sur des durees relatives,
+EN BOUCLE — demande explicite pour "planifier un enchainement sur un set
+entier". Durees relatives plutot qu'horaires absolus (choix de l'utilisateur) :
+chaque entree porte sa propre duree, l'horaire de declenchement se deduit en
+cumulant — reordonner une entree decale donc automatiquement tout ce qui suit,
+sans recalcul manuel. `vj_state` (dict : `entries` — liste de `{"preset": nom,
+"duration_s": float}` —, `running`, `start`, `current`, plus les references aux
+widgets du popup courant) et `vj_tick()` vivent dans `build_gui` (pas dans le
+popup, voir plus bas) ; `vj_tick()`, reprogrammee via
+`root.after(VJ_TICK_MS, ...)`, calcule `elapsed = (now - start) % total` (le
+modulo fait la boucle) puis cherche dans quelle entree cet `elapsed` tombe par
+somme cumulee ; des que l'index change, elle appelle **`apply_preset()`
+directement** — la MEME fonction que le bouton "Charger", donc un preset du
+mode VJ beneficie gratuitement de toute sa logique deja en place (reset des
+couleurs sur changement de style, options figees au lancement ignorees et
+signalees via `skipped`, etc.) sans rien dupliquer. `run()` ne voit que des
+attributs d'`args` qui changent, exactement comme un clic sur "Charger" ou un
+curseur pilote par une courbe (voir "Variation automatique" plus haut) : le
+mode VJ n'est qu'un troisieme "input" de plus vers les memes setters.
+**Popup independant (`open_vj_editor()`), PAS inline dans la fenetre
+principale** : un premier jet inline (separateur + titre + ligne "Ajouter" +
+`Listbox` + ligne de boutons) a pousse la fenetre a 1128 px de haut, mesure a
+l'ecran — au-dela des 1032 px de zone de travail disponibles sur l'ecran de
+test (1920x1080, barre des taches deduite), les boutons "Monter"/"Demarrer
+VJ"/le statut tombaient hors champ (meme piege que l'alignement des curseurs
+documente plus haut, mais cette fois sur CET ecran precis, pas seulement un
+ecran plus petit hypothetique). Deplace en popup (meme mecanique que
+`open_curve_editor` pour la variation automatique) : la fenetre principale ne
+grandit plus que d'UNE ligne ("Mode VJ" + bouton "Ouvrir..."), le popup peut
+etre aussi haut qu'il faut sans contrainte sur la fenetre principale. Point
+important qui decoule de ce choix : **`vj_state`/`vj_tick()` doivent continuer
+a tourner popup ferme** (un set ne s'arrete pas parce qu'on a referme la
+fenetre d'edition) — seuls les widgets (`listbox`, `next_label`, `toggle_btn`,
+`preset_var`, `duration_var`, `menu`) sont crees a l'ouverture et remis a
+`None` a la fermeture (`on_close()`), et chaque fonction qui les touche
+(`refresh_vj_listbox`, `refresh_vj_preset_menu`, `vj_add_entry`,
+`vj_selected_index`) verifie d'abord qu'ils existent plutot que de presumer le
+popup ouvert. Rouvrir relve le popup existant (`winfo_exists()` + `lift()`,
+meme garde que l'editeur de courbe) et **reaffiche l'etat courant** (la
+`Listbox` est repeuplee depuis `vj_state["entries"]` a l'ouverture) : fermer le
+popup ne perd donc rien. "Demarrer VJ" repart TOUJOURS du debut de la liste
+(`current = -1`, `start = now`) plutot que de reprendre l'ancienne position :
+un set qu'on relance doit repartir de son premier preset, pas d'un point
+arbitraire laisse par la derniere lecture. La `Listbox` surligne l'entree
+active en accent (seul indice visuel de ce qui joue, pas de second widget
+d'etat dedie) ; `Listbox`/`Scrollbar` ne sont pas couverts par le theme
+`option_add` de `style_gui` de la meme façon que les widgets classiques (meme
+limitation documentee en tete de ce fichier pour les indicateurs natifs
+`Radiobutton`/`Checkbutton` — la barre de la `Scrollbar` reste dessinee par le
+theme Windows), sans consequence : le texte/fond de la `Listbox` elle-meme
+suit bien la palette (`*Background`/`*Foreground` sont des jokers globaux, pas
+scopes a une classe de widget). Verifie avec deux presets utilisateur a
+`line_width` bien distincts (2 et 9) et des durees de quelques secondes : le
+premier preset s'applique immediatement au demarrage, le second prend le
+relais a l'echeance, la boucle revient bien sur le premier, arreter fige la
+valeur courante, et l'etat (liste, apres suppression d'une entree) survit a un
+cycle fermeture/reouverture du popup.
+**Les enchainements eux-memes se sauvegardent**, a la demande explicite
+("comme les presets") : `VJ_SETLISTS_PATH` (JSON separe,
+`~/.audio2wave/snap_vj_setlists.json`, meme mecanique lecture/ecriture que
+`USER_PRESETS_PATH`/`load_user_presets`/`save_user_preset` — fichier absent ou
+mal forme = liste vide, jamais une erreur bloquante) plutot qu'un troisieme
+usage de `snap_presets.json` : un enchainement (liste ordonnee de `{preset,
+duration_s}`) et un preset (dict d'overrides argparse) sont deux formes de
+donnees differentes, les melanger dans un seul fichier aurait complique la
+lecture des deux sans rien apporter. Pas d'equivalent de `PRESETS`/
+`all_presets()` ici : un enchainement n'a pas de version "integree au code",
+`load_vj_setlists()` suffit, pas de fusion a faire. Dans le popup, une
+sous-section "Enchainement" (menu deroulant + **Charger**/**Mettre a jour**) et
+"Sauvegarder sous" (champ nom + bouton, meme bind `<Return>` que l'equivalent
+des presets, voir juste apres) precedent la ligne "Ajouter" : **Charger**
+REMPLACE `vj_state["entries"]` par une COPIE des dicts lus dans le JSON
+(`[dict(e) for e in ...]`, jamais une reference partagee) — muter la liste
+ensuite (Monter/Descendre/Supprimer) ne doit jamais modifier silencieusement ce
+qui vient d'etre lu en memoire. **Sauvegarder sous** refuse une liste vide
+(rien a capturer) mais, a la difference des presets, n'a pas de garde
+"preset integre" a proteger (pas d'enchainement integre au code) — un nom deja
+pris est simplement ecrase, sans confirmation, meme logique que
+`save_user_preset` pour un preset utilisateur deja existant. Verifie : capture
+bien la liste courante (pas une reference qu'une modification ulterieure
+alterait), Charger restaure les entrees exactement telles que sauvegardees
+meme apres une modification locale entre-temps, Mettre a jour reflete un ajout
+ulterieur, Sauvegarder sous une liste vide refuse explicitement sans rien
+ecrire.
+
 **Bug corrige : le champ "Sauvegarder sous" n'avait PAS de bind `<Return>`**,
 contrairement a tous les autres champs texte de cette fenetre (couleurs, video,
 crossover, dossier PNG — tous via `add_entry`/`make_video_field`, qui bindent

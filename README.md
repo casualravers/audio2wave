@@ -448,6 +448,49 @@ options ne peuvent de toute facon pas se relancer en direct sans redemarrer le
 programme (voir la section `--gui` plus bas) — et l'indique dans la ligne de
 statut.
 
+### Mode VJ (enchainement de presets pour un set entier)
+
+Un bouton **Mode VJ -- Ouvrir...** dans la fenetre `--gui` ouvre un petit popup
+pour planifier un enchainement de presets sur toute la duree d'un set :
+
+1. **Ajouter** une entree : choisis un preset (integre ou utilisateur, meme
+   liste que **Charger**) et une duree en minutes, puis **Ajouter** — elle
+   rejoint la fin de la liste.
+2. Reordonne avec **Monter**/**Descendre**, retire une entree avec
+   **Supprimer**. Les durees sont relatives : deplacer une entree decale
+   automatiquement l'horaire de toutes celles qui suivent, pas besoin de
+   recalculer quoi que ce soit a la main.
+3. **Demarrer VJ** lance l'enchainement : le premier preset s'applique
+   immediatement, puis chaque suivant a l'echeance cumulee de son tour — et le
+   tout **boucle** indefiniment une fois la liste epuisee, pour couvrir un set
+   qui dure plus longtemps que prevu. **Arreter VJ** fige le preset en cours.
+
+```bash
+python audio2wave_snap.py -d "<entree>" --gui
+# Mode VJ -> Ouvrir... -> ajoute quelques presets avec leurs durees -> Demarrer VJ
+```
+
+Chaque changement planifie appelle exactement la meme logique que le bouton
+**Charger** (`apply_preset()`) : une entree qui reference une option figee au
+lancement est ignoree de la meme facon, et signalee dans le statut. Fermer le
+popup ne perd rien — l'enchainement continue de tourner en arriere-plan, et la
+liste reapparait telle quelle a la reouverture ; c'est volontaire, pour ne pas
+avoir a garder cette fenetre ouverte pendant tout le set.
+
+**L'enchainement lui-meme se sauvegarde**, en haut du popup :
+
+- **Enchainement** (menu deroulant) + **Charger** : remplace la liste en cours
+  par un enchainement deja sauvegarde.
+- **Mettre a jour** : reecrit l'enchainement selectionne dans le menu avec la
+  liste courante.
+- **Sauvegarder sous** (champ nom + bouton, Entree fonctionne aussi) : cree un
+  nouvel enchainement a partir de la liste courante.
+
+Stocke dans `~/.audio2wave/snap_vj_setlists.json`, separement des presets
+(`snap_presets.json`) — utile pour retrouver en un clic le plan d'un set
+complet joue un soir precedent, sans avoir a re-saisir chaque preset et sa
+duree.
+
 ## Styles (`--style`)
 
 | style | rendu |

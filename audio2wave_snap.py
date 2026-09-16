@@ -38,8 +38,8 @@ except ImportError:  # tkinter absent de certaines installations minimales de Py
     filedialog = None
 
 from audio2wave import (
-    GUI_ACCENT, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL, GUI_MUTED_FG,
-    GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
+    GUI_ACCENT, GUI_ACCENT_FG, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL,
+    GUI_MUTED_FG, GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
 from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
 
@@ -201,6 +201,26 @@ def automate_curve_dents_de_scie(n: int) -> list[float]:
 def automate_curve_aleatoire(n: int) -> list[float]:
     return [random.random() for _ in range(n)]
 
+
+# --gui: "Mode VJ" enchaine une LISTE ORDONNEE de presets sur des durees
+# relatives (pas d'horaires absolus : deplacer une entree decale
+# automatiquement tout ce qui suit, plus simple a reordonner en direct) --
+# demande explicite pour planifier un enchainement sur un set entier. Boucle
+# a la fin (pas d'arret ni de blocage sur le dernier preset). Reutilise
+# integralement `apply_preset()` (le meme mecanisme que le bouton "Charger"),
+# donc un preset de l'enchainement peut contenir des options figees au
+# lancement (--fullscreen, etc.) sans planter -- juste ignorees, comme
+# "Charger" le fait deja.
+VJ_TICK_MS = 500                 # frequence de verification (secondes/minutes en jeu, pas besoin
+                                  # de la cadence fine d'AUTOMATE_TICK_MS)
+VJ_DEFAULT_DURATION_MIN = 5.0     # duree par defaut d'une nouvelle entree, en minutes
+
+
+def format_mmss(total_seconds: float) -> str:
+    total_seconds = max(0, round(total_seconds))
+    return f"{total_seconds // 60}:{total_seconds % 60:02d}"
+
+
 # Duree d'audio visee par colonne dessinee, quand une photo resume plusieurs secondes.
 # En dessous d'un cycle de basse (10 ms a 100 Hz), une colonne attrape un bout de cycle
 # au hasard et le trace part en peigne de traits fins; au-dela, chaque colonne resume
@@ -291,6 +311,37 @@ def all_presets() -> dict[str, dict]:
     merged = dict(PRESETS)
     merged.update(load_user_presets())
     return merged
+
+
+# Enchainements du "Mode VJ" (voir build_gui) sauvegardes depuis --gui : meme
+# mecanique que USER_PRESETS_PATH/load_user_presets/save_user_preset ci-dessus
+# (fichier JSON dans le profil utilisateur, absent/illisible = liste vide,
+# jamais une erreur bloquante), fichier separe plutot que reutiliser
+# snap_presets.json -- un enchainement (liste ordonnee de {preset, duration_s})
+# et un preset (dict d'overrides argparse) sont deux formes de donnees
+# distinctes, les melanger dans un seul fichier aurait complique la lecture des
+# deux sans rien apporter. Pas d'equivalent de PRESETS/all_presets() ici : un
+# enchainement n'a pas de version "integree au code", donc pas de fusion a
+# faire, juste ce fichier.
+VJ_SETLISTS_PATH = Path.home() / ".audio2wave" / "snap_vj_setlists.json"
+
+
+def load_vj_setlists() -> dict[str, list[dict]]:
+    if not VJ_SETLISTS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(VJ_SETLISTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_vj_setlist(name: str, entries: list[dict]) -> None:
+    setlists = load_vj_setlists()
+    setlists[name] = entries
+    VJ_SETLISTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    VJ_SETLISTS_PATH.write_text(
+        json.dumps(setlists, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
 def describe_presets() -> str:
@@ -2422,6 +2473,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             return
         save_user_preset(name, capture_overrides())
         refresh_preset_menu(select=name)
+        refresh_vj_preset_menu()  # le nouveau preset doit aussi apparaitre dans la liste VJ
         save_name_var.set("")
         status["text"] = f"preset '{name}' sauvegarde ({USER_PRESETS_PATH})"
 
@@ -2438,6 +2490,357 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     tk.Button(save_preset_frame, text="Sauvegarder", command=on_save_preset,
              ).pack(side="left", padx=(8, 0))
+
+    # --- Mode VJ : enchaine une liste ordonnee de presets sur des durees
+    # relatives, en boucle -- pour planifier un set entier a l'avance. Popup
+    # independant (comme l'editeur de courbe plus haut), PAS inline dans cette
+    # fenetre : un premier jet inline (separateur+titre+ligne Ajouter+Listbox+
+    # ligne de controles) a pousse la fenetre a 1128 px de haut, au-dela de la
+    # zone de travail de l'ecran de test (1032 px, 1920x1080 barre des taches
+    # deduite) -- mesure a l'ecran, pas suppose : les boutons "Monter"/
+    # "Demarrer VJ"/le statut tombaient hors champ, meme piege que
+    # l'alignement des curseurs plus haut dans ce fichier. En popup, la
+    # fenetre principale ne grandit que d'UNE ligne (bouton "Ouvrir..."),
+    # et le popup lui-meme peut etre aussi haut qu'il faut sans contrainte.
+    # `vj_state` (entries/running/start/current) et `vj_tick()` -- le fil qui
+    # applique les presets planifies -- vivent ICI, dans build_gui, PAS dans
+    # open_vj_editor() : ils doivent continuer a tourner meme popup ferme
+    # (un set ne s'arrete pas parce qu'on a referme la fenetre d'edition).
+    # Seuls les widgets (listbox, boutons, champs) sont crees/oublies a
+    # l'ouverture/fermeture du popup, meme principe que open_curve_editor :
+    # les fonctions qui les touchent (refresh_vj_listbox, refresh_vj_preset_
+    # menu) verifient d'abord que le popup est ouvert plutot que de planter
+    # sur un widget detruit.
+    vj_state: dict = {
+        "entries": [], "running": False, "start": 0.0, "current": -1,
+        "editor": None, "listbox": None, "next_label": None, "toggle_btn": None,
+        "preset_var": None, "duration_var": None, "menu": None,
+        "setlist_var": None, "setlist_menu": None, "save_setlist_name_var": None,
+    }
+
+    def refresh_vj_setlist_menu(select: str | None = None) -> None:
+        menu_widget = vj_state["setlist_menu"]
+        setlist_var = vj_state["setlist_var"]
+        if menu_widget is None or setlist_var is None:
+            return
+        names = sorted(load_vj_setlists())
+        menu = menu_widget["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: setlist_var.set(n))
+        if select is not None:
+            setlist_var.set(select)
+        elif names and setlist_var.get() not in names:
+            setlist_var.set(names[0])
+        elif not names:
+            setlist_var.set("")
+
+    def vj_load_setlist() -> None:
+        setlist_var = vj_state["setlist_var"]
+        if setlist_var is None:
+            return
+        name = setlist_var.get()
+        setlists = load_vj_setlists()
+        if not name or name not in setlists:
+            status["text"] = "VJ: aucun enchainement a charger (sauvegarde-en un d'abord)"
+            return
+        # Copie les dicts (pas juste la liste) : muter vj_state["entries"] plus
+        # tard (Monter/Descendre/Supprimer) ne doit jamais modifier silencieusement
+        # ce qui vient d'etre lu depuis le JSON en memoire.
+        vj_state["entries"] = [dict(entry) for entry in setlists[name]]
+        vj_state["current"] = -1
+        refresh_vj_listbox()
+        status["text"] = f"VJ: enchainement '{name}' charge ({len(vj_state['entries'])} entree(s))"
+
+    def vj_save_setlist(_evt: object = None) -> None:
+        name_var = vj_state["save_setlist_name_var"]
+        if name_var is None:
+            return
+        name = name_var.get().strip().lower()
+        if not name:
+            status["text"] = "VJ: nom d'enchainement vide"
+            return
+        if not vj_state["entries"]:
+            status["text"] = "VJ: la liste est vide, ajoute au moins une entree avant de sauvegarder"
+            return
+        save_vj_setlist(name, vj_state["entries"])
+        refresh_vj_setlist_menu(select=name)
+        name_var.set("")
+        status["text"] = f"VJ: enchainement '{name}' sauvegarde ({VJ_SETLISTS_PATH})"
+
+    def vj_update_setlist() -> None:
+        setlist_var = vj_state["setlist_var"]
+        if setlist_var is None:
+            return
+        name = setlist_var.get()
+        if not name:
+            status["text"] = "VJ: aucun enchainement selectionne"
+            return
+        if not vj_state["entries"]:
+            status["text"] = "VJ: la liste est vide, ajoute au moins une entree avant de mettre a jour"
+            return
+        save_vj_setlist(name, vj_state["entries"])
+        status["text"] = f"VJ: enchainement '{name}' mis a jour ({VJ_SETLISTS_PATH})"
+
+    def refresh_vj_preset_menu() -> None:
+        menu_widget = vj_state["menu"]
+        preset_var = vj_state["preset_var"]
+        if menu_widget is None or preset_var is None:
+            return
+        names = sorted(all_presets())
+        menu = menu_widget["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
+        if names and preset_var.get() not in names:
+            preset_var.set(names[0])
+
+    def refresh_vj_listbox() -> None:
+        listbox = vj_state["listbox"]
+        if listbox is None:
+            return
+        # Rappelle la selection courante (l'index change de sens sinon a
+        # chaque insert/delete) et surligne l'entree active (vj_state
+        # ["current"]) en accent -- seul indice visuel de ce qui joue
+        # actuellement sans dupliquer un second widget d'etat.
+        selection = listbox.curselection()
+        selected_index = selection[0] if selection else None
+        listbox.delete(0, "end")
+        for i, entry in enumerate(vj_state["entries"]):
+            marker = "-> " if i == vj_state["current"] else "   "
+            listbox.insert(
+                "end", f"{marker}{i + 1:>2}. {format_mmss(entry['duration_s'])}  {entry['preset']}")
+        if 0 <= vj_state["current"] < len(vj_state["entries"]):
+            listbox.itemconfig(vj_state["current"], fg=GUI_ACCENT)
+        if selected_index is not None and selected_index < listbox.size():
+            listbox.selection_set(selected_index)
+
+    def vj_add_entry() -> None:
+        preset_var = vj_state["preset_var"]
+        duration_var = vj_state["duration_var"]
+        if preset_var is None or duration_var is None:
+            return
+        name = preset_var.get()
+        if not name:
+            status["text"] = "VJ: aucun preset a ajouter (sauvegarde/charge au moins un preset)"
+            return
+        try:
+            minutes = float(duration_var.get().strip().replace(",", "."))
+        except ValueError:
+            status["text"] = "VJ: duree invalide (nombre de minutes attendu)"
+            return
+        if minutes <= 0:
+            status["text"] = "VJ: la duree doit etre positive"
+            return
+        vj_state["entries"].append({"preset": name, "duration_s": minutes * 60.0})
+        vj_state["current"] = -1  # force vj_tick() a revalider la position au prochain tour
+        refresh_vj_listbox()
+        status["text"] = f"VJ: '{name}' ajoute ({format_mmss(minutes * 60.0)})"
+
+    def vj_selected_index() -> int | None:
+        listbox = vj_state["listbox"]
+        if listbox is None:
+            return None
+        selection = listbox.curselection()
+        return selection[0] if selection else None
+
+    def vj_remove_selected() -> None:
+        idx = vj_selected_index()
+        if idx is None:
+            status["text"] = "VJ: selectionne d'abord une ligne a supprimer"
+            return
+        del vj_state["entries"][idx]
+        vj_state["current"] = -1
+        refresh_vj_listbox()
+
+    def vj_move(delta: int) -> None:
+        idx = vj_selected_index()
+        if idx is None:
+            return
+        target = idx + delta
+        if not (0 <= target < len(vj_state["entries"])):
+            return
+        entries = vj_state["entries"]
+        entries[idx], entries[target] = entries[target], entries[idx]
+        vj_state["current"] = -1
+        refresh_vj_listbox()
+        vj_state["listbox"].selection_set(target)
+
+    def vj_toggle() -> None:
+        # Demarrer repart TOUJOURS du debut de la liste (current=-1, start=now)
+        # plutot que de reprendre l'ancienne position : un set qu'on relance
+        # doit repartir de son premier preset, pas d'un point arbitraire laisse
+        # par la derniere lecture.
+        vj_state["running"] = not vj_state["running"]
+        if vj_state["running"]:
+            vj_state["start"] = time.monotonic()
+            vj_state["current"] = -1
+            status["text"] = "VJ demarre"
+        else:
+            status["text"] = "VJ arrete"
+        toggle_btn = vj_state["toggle_btn"]
+        if toggle_btn is not None:
+            toggle_btn.config(text="Arreter VJ" if vj_state["running"] else "Demarrer VJ")
+        refresh_vj_listbox()
+
+    def open_vj_editor() -> None:
+        existing = vj_state["editor"]
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+
+        win = tk.Toplevel(root)
+        win.title("Mode VJ -- enchainement de presets")
+        win.configure(bg=GUI_PANEL_BG)
+
+        # --- Enchainements sauvegardes (JSON separe des presets, voir
+        # VJ_SETLISTS_PATH) : charger REMPLACE la liste en cours, sauvegarder/
+        # mettre a jour capturent la liste en cours telle quelle -- avant
+        # "Ajouter" pour que charger un enchainement existant soit le premier
+        # reflexe en ouvrant ce popup, pas une action retrouvee en bas apres
+        # avoir deja commence a construire une liste a la main.
+        setlist_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        setlist_frame.pack(fill="x", padx=14, pady=(14, 4))
+        tk.Label(setlist_frame, text="Enchainement :", bg=GUI_PANEL_BG).pack(side="left")
+        setlist_var = tk.StringVar(value="")
+        setlist_menu = tk.OptionMenu(setlist_frame, setlist_var, "")
+        style_option_menu(setlist_menu)
+        setlist_menu.pack(side="left", padx=(8, 0))
+        vj_state["setlist_var"] = setlist_var
+        vj_state["setlist_menu"] = setlist_menu
+        tk.Button(setlist_frame, text="Charger", command=vj_load_setlist,
+                 ).pack(side="left", padx=(8, 0))
+        tk.Button(setlist_frame, text="Mettre a jour", command=vj_update_setlist,
+                 ).pack(side="left", padx=(8, 0))
+        refresh_vj_setlist_menu()
+
+        save_setlist_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        save_setlist_frame.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(save_setlist_frame, text="Sauvegarder sous :", bg=GUI_PANEL_BG).pack(side="left")
+        save_setlist_name_var = tk.StringVar(value="")
+        save_setlist_entry = tk.Entry(save_setlist_frame, textvariable=save_setlist_name_var, width=14)
+        save_setlist_entry.pack(side="left", padx=(8, 0))
+        vj_state["save_setlist_name_var"] = save_setlist_name_var
+        # Meme raison qu'au meme endroit pour les presets (voir plus haut) :
+        # Entree valide, comme le reflexe naturel apres avoir tape un nom.
+        save_setlist_entry.bind("<Return>", vj_save_setlist)
+        tk.Button(save_setlist_frame, text="Sauvegarder", command=vj_save_setlist,
+                 ).pack(side="left", padx=(8, 0))
+
+        tk.Frame(win, bg=GUI_MUTED_FG, height=1).pack(fill="x", padx=14, pady=(0, 10))
+
+        add_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        add_frame.pack(fill="x", padx=14, pady=(14, 8))
+        tk.Label(add_frame, text="Ajouter :", bg=GUI_PANEL_BG).pack(side="left")
+        preset_var = tk.StringVar(value="")
+        menu = tk.OptionMenu(add_frame, preset_var, "")
+        style_option_menu(menu)
+        menu.pack(side="left", padx=(8, 0))
+        duration_var = tk.StringVar(value=str(VJ_DEFAULT_DURATION_MIN))
+        tk.Entry(add_frame, textvariable=duration_var, width=5).pack(side="left", padx=(8, 0))
+        tk.Label(add_frame, text="min", bg=GUI_PANEL_BG).pack(side="left", padx=(4, 0))
+        vj_state["preset_var"] = preset_var
+        vj_state["duration_var"] = duration_var
+        vj_state["menu"] = menu
+        tk.Button(add_frame, text="Ajouter", command=vj_add_entry).pack(side="left", padx=(8, 0))
+        refresh_vj_preset_menu()
+
+        list_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        listbox = tk.Listbox(list_frame, height=10, width=44, selectbackground=GUI_ACCENT,
+                             selectforeground=GUI_ACCENT_FG, activestyle="none",
+                             exportselection=False, font=GUI_FONT_MONO)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.pack(side="left", fill="y")
+        listbox.config(yscrollcommand=scrollbar.set)
+        vj_state["listbox"] = listbox
+        refresh_vj_listbox()
+
+        controls_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        controls_frame.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Button(controls_frame, text="Monter", command=lambda: vj_move(-1)).pack(side="left")
+        tk.Button(controls_frame, text="Descendre", command=lambda: vj_move(1),
+                 ).pack(side="left", padx=(8, 0))
+        tk.Button(controls_frame, text="Supprimer", command=vj_remove_selected,
+                 ).pack(side="left", padx=(8, 0))
+
+        run_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        run_frame.pack(fill="x", padx=14, pady=(0, 8))
+        toggle_btn = tk.Button(run_frame, text="Arreter VJ" if vj_state["running"] else "Demarrer VJ",
+                               command=vj_toggle)
+        toggle_btn.pack(side="left")
+        vj_state["toggle_btn"] = toggle_btn
+        next_label = tk.Label(run_frame, text="", fg=GUI_MUTED_FG, bg=GUI_PANEL_BG)
+        next_label.pack(side="left", padx=(16, 0))
+        vj_state["next_label"] = next_label
+
+        def on_close() -> None:
+            vj_state["editor"] = None
+            vj_state["listbox"] = None
+            vj_state["next_label"] = None
+            vj_state["toggle_btn"] = None
+            vj_state["preset_var"] = None
+            vj_state["duration_var"] = None
+            vj_state["menu"] = None
+            vj_state["setlist_var"] = None
+            vj_state["setlist_menu"] = None
+            vj_state["save_setlist_name_var"] = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        tk.Button(win, text="Fermer", command=on_close).pack(pady=(0, 12))
+        vj_state["editor"] = win
+
+    r = next_shared_row()
+    add_label("Mode VJ", r, 0,
+             tooltip="Enchaine une liste ordonnee de presets sur des durees relatives, en "
+                     "boucle -- pour planifier un set entier a l'avance.")
+    tk.Button(root, text="Ouvrir...", command=open_vj_editor).grid(
+        row=r, column=1, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+
+    def vj_tick() -> None:
+        # Tourne dans le fil tkinter (root.after), jamais dans run() : un
+        # changement de preset planifie n'est qu'un appel a apply_preset(),
+        # exactement comme un clic sur "Charger" -- run() ne voit que des
+        # attributs d'args qui changent, comme pour tout le reste de cette
+        # fenetre. S'arrete de se reprogrammer des que finished_event est
+        # positionne, meme garde que refresh()/automate_tick() plus haut.
+        if finished_event.is_set():
+            return
+        if vj_state["running"] and vj_state["entries"]:
+            total = sum(entry["duration_s"] for entry in vj_state["entries"])
+            if total > 0:
+                elapsed = (time.monotonic() - vj_state["start"]) % total
+                acc = 0.0
+                idx = len(vj_state["entries"]) - 1
+                for i, entry in enumerate(vj_state["entries"]):
+                    acc += entry["duration_s"]
+                    if elapsed < acc:
+                        idx = i
+                        break
+                if idx != vj_state["current"]:
+                    vj_state["current"] = idx
+                    entry = vj_state["entries"][idx]
+                    presets = all_presets()
+                    if entry["preset"] in presets:
+                        skipped = apply_preset(presets[entry["preset"]])
+                        text = (f"VJ: '{entry['preset']}' "
+                                f"({idx + 1}/{len(vj_state['entries'])})")
+                        if skipped:
+                            text += f" (ignore, deja fige au lancement: {', '.join(skipped)})"
+                        status["text"] = text
+                    else:
+                        # Preset supprime apres avoir ete ajoute a la liste VJ :
+                        # signale et saute, plutot que de planter le fil tkinter.
+                        status["text"] = f"VJ: preset '{entry['preset']}' introuvable, saute"
+                    refresh_vj_listbox()
+                next_label = vj_state["next_label"]
+                if next_label is not None:
+                    next_label.config(text=f"Prochain changement dans {format_mmss(acc - elapsed)}")
+        root.after(VJ_TICK_MS, vj_tick)
+
+    root.after(VJ_TICK_MS, vj_tick)
 
     tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
         row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="ew",
