@@ -378,7 +378,7 @@ chaque photo repart d'un fond uni comme avant — demarrer d'une photo deja char
 (trait + video) s'est avere ralentir assez l'affichage pour faire saccader la video
 qui joue derriere.
 
-`--draw-fps` regle la fluidite (30 img/s par defaut) ; `--draw-fps 0` revient a
+`--draw-fps` regle la fluidite (60 img/s par defaut) ; `--draw-fps 0` revient a
 l'affichage direct de la photo entiere.
 
 Chaque photo est annoncee dans le terminal avec sa crete et le gain applique :
@@ -435,9 +435,14 @@ Sauvegarder (nouveau nom) et Mettre a jour (preset selectionne dans **Charger**)
 capturent tous les deux tout ce que la fenetre expose (style, couleurs,
 epaisseur, `--wave`, points/colonnes, echelle, filtre, crossover, gain, images/s,
 dossier PNG) — pas seulement les quelques options choisies a la main dans les
-presets integres. Aucun des deux ne peut toucher un preset integre (`wave`,
-`club`, `rekordbox`, `editor`) : Sauvegarder refuse ce nom, Mettre a jour refuse
-de le modifier. Charger un preset qui contient une option figee au lancement
+presets integres. **Mettre a jour** peut aussi cibler un preset integre (`wave`,
+`club`, `rekordbox`, `editor`...) : ca cree une version personnalisee dans le
+JSON utilisateur qui le remplace desormais sur cette machine (`--preset club`
+lira alors cette version), sans toucher au preset d'origine dans le code —
+supprimer l'entree du JSON restaure le comportement integre. **Sauvegarder**
+(nouveau nom), lui, refuse toujours un nom de preset integre, pour eviter
+qu'une faute de frappe n'ecrase un preset existant sans intention explicite.
+Charger un preset qui contient une option figee au lancement
 (ex. `--fullscreen` dans `club`) l'ignore silencieusement dans la fenetre — ces
 options ne peuvent de toute facon pas se relancer en direct sans redemarrer le
 programme (voir la section `--gui` plus bas) — et l'indique dans la ligne de
@@ -475,6 +480,25 @@ python audio2wave_snap.py -d "<entree>" --wave 12 --line-width 3
 La phase ne depend que de la position horizontale : d'une photo a l'autre les cretes
 restent en place et seule leur hauteur change, ce qui evite un scintillement d'un
 temps sur l'autre.
+
+**`--kick-glow`** ajoute un halo blanc sur le trait a chaque attaque franche (kick)
+detectee dans le signal — purement decoratif, pas une isolation des basses par
+filtre (pas de scipy/numpy dans ce projet) : une montee brutale d'energie locale,
+assez pour l'oeil, y compris sur un mix deja bien compresse/limite (typique en
+club/DJ). Le trait s'epaissit legerement, et surtout un halo blanc degrade
+apparait dans le fond juste autour du trait sur `--kick-glow-size` pixels —
+visible quelle que soit la couleur du trait, y compris blanc (couleur par
+defaut de `pencil`) : le halo vit dans le fond, pas sur la couleur du trait lui-
+meme, qui ne pourrait pas "s'eclaircir" davantage s'il est deja blanc.
+
+```bash
+python audio2wave_snap.py -d "<entree>" --kick-glow
+python audio2wave_snap.py -d "<entree>" --kick-glow --kick-glow-size 80 --colors 0xff2266
+```
+
+Le nombre de kicks detectes par photo s'affiche dans la ligne de statut
+(console et `--gui`) des que l'option est active, meme quand il vaut 0 : utile
+pour verifier que la detection accroche bien avant de chercher le halo a l'oeil.
 
 Ce style est **rasterise en Python, pas par ffmpeg** : aucun filtre ne dessine une
 polyligne d'enveloppe, `showwavespic` remplit une silhouette et `showwaves` trace la
@@ -518,11 +542,13 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--columns <n>` | points de la polyligne en `pencil`, colonnes dessinees sinon | `96` en `pencil` |
 | `--line-width <n>` | epaisseur du trait, `pencil` seul | `2` |
 | `--wave [n]` | sinusoide bornee par l'amplitude au lieu du contour, `pencil` seul | contour ; `24` avec l'option |
+| `--kick-glow` | halo blanc sur le trait a chaque kick detecte, `pencil` seul | desactive |
+| `--kick-glow-size <px>` | rayon du halo | `40` |
 | `--crossover <g,a>` | coupures entre bandes, en Hz | `200,2000` |
 | `--gain auto\|<dB>` | `auto` normalise chaque photo sur sa propre crete | `auto` |
 | `--scale` | `lin` \| `sqrt` \| `cbrt` \| `log` | `lin` |
 | `--filter-mode peak\|average` | crete gardee ou enveloppe lissee par colonne | `peak` |
-| `--draw-fps <n>` | fluidite du trace progressif ; `0` = affichage direct | `30` |
+| `--draw-fps <n>` | fluidite du trace progressif ; `0` = affichage direct | `60` |
 | `--video <fichier>` | video jouee en boucle sous le trace, `pencil` seul (voir plus bas) | - |
 | `--video2 <fichier>` | deuxieme video, jouee en boucle hors de la bande d'enveloppe, `pencil` seul (voir plus bas) | - |
 | `--asset-dir <dir>` | dossier ou chercher `--video`/`--video2` si le chemin donne n'existe pas tel quel | `asset` |
@@ -627,7 +653,8 @@ python audio2wave_snap.py -d "<entree>" --gui
 Ouvre une petite fenetre tkinter avec un controle par reglage : entree audio,
 tempo (BPM et temps par photo, `--bpm`/`--beats`),
 style (pencil / rekordbox / simple), couleurs du trait et de fond, epaisseur,
-`--wave` (case a cocher + oscillations), points/colonnes, echelle, filtre par
+`--wave` (case a cocher + oscillations), points/colonnes, `--kick-glow` (case a
+cocher + rayon du halo), echelle, filtre par
 colonne, crossover (deux champs Hz), gain (case "automatique" + curseur manuel en
 dB) avec un bouton **Mesurer (tuning)**, video interieure/exterieure (`--video`/
 `--video2`, pencil seul), dossier PNG (`--save-dir`, cree au besoin), images/s du
@@ -638,7 +665,13 @@ douceur (voir ci-dessous).
 
 Theme sombre coherent (fond ardoise, accent cyan), partage avec les deux autres
 fenetres `--gui` (`audio2wave_live.py`, `audio2wave_ridge.py`) via `style_gui()`
-dans `audio2wave.py`.
+dans `audio2wave.py` — marges genereuses, boutons aeres et curseurs amincis
+plutot que le rendu Tk par defaut, pour un aspect plus moderne. Fenetre en deux
+panneaux cote a cote plutot qu'une seule colonne, pour rester large plutot que
+haute avec autant de reglages, chaque groupe (Source, Apparence, Video,
+Rekordbox / Simple, Sortie) annonce par un petit intitule en capitales ; les
+precisions ("vide = defaut", "pencil seul"...) ne sont plus dans le texte des
+labels mais en info-bulle au survol de la souris.
 
 **Entree audio, video et video2 redemarrent un sous-processus, pas juste `args`**
 Changer l'entree audio (menu deroulant + bouton **Actualiser** pour re-detecter
@@ -651,7 +684,10 @@ source change, avec une courte coupure (quelques centaines de ms pour l'audio,
 le temps qu'un nouveau ffmpeg dshow s'ouvre) plutot qu'un redemarrage seamless
 comme `--reactive` d'`audio2wave_live.py`. Un chemin video introuvable est
 signale en statut sans toucher au flux en cours, pour ne pas couper une video
-qui marchait sur une faute de frappe pas encore corrigee.
+qui marchait sur une faute de frappe pas encore corrigee. Un bouton
+**Parcourir...** a cote de chaque champ video ouvre le selecteur de fichiers
+habituel plutot que de taper le chemin a la main, filtre sur les extensions
+video courantes.
 
 **Le bouton "Mesurer (tuning)"** mesure la crete (et le facteur de crete, pour
 detecter un ecretage AVANT la capture) de la fenetre audio courante et bascule
@@ -666,6 +702,29 @@ fenetre glissante de capture en consequence — sans redemarrer la capture, just
 en resize cote Python (le flux ffmpeg dshow lui-meme ne change pas). Y toucher
 bascule la fenetre sur les deux curseurs pour la suite de la session, meme si le
 programme a demarre avec un `--interval` explicite.
+
+**Variation automatique** fait piloter un curseur tout seul par une courbe au
+lieu de la souris : une case **`~`** (active/desactive) et un bouton **courbe**
+(editer) apparaissent sous le curseur de l'epaisseur du trait, des points/
+colonnes et du rayon du halo (`--kick-glow-size`) — les seuls reglages ou une
+derive visuelle a un sens direct ; places sous le curseur plutot qu'a cote pour
+que tous les curseurs de la fenetre gardent la meme largeur et restent alignes.
+Le bouton **courbe** ouvre une petite fenetre d'edition **propre a ce
+reglage** : un canevas ou glisser les points de la courbe a la souris pour
+dessiner une forme libre, cinq presets pour partir d'une base (**Sinus**,
+**Triangle**, **Carre**, **Dents de scie**, **Aleatoire**), et une **Vitesse**
+(curseur allant du plus lent a gauche au plus rapide a droite, de 3 a 40
+secondes par cycle complet) — chaque reglage garde sa propre courbe et sa
+propre vitesse, independantes des autres : rien n'empeche de faire
+respirer lentement l'epaisseur en triangle pendant que le rayon du halo saute en
+carre rapide. Purement decoratif, aucun lien avec la detection de kicks
+ci-dessus ; decocher `~` fige le curseur a sa position courante et repart du
+debut de la courbe a la prochaine activation ; ni la case ni la courbe ne font
+partie des presets (une preference de session, pas un reglage de rendu).
+
+```bash
+python audio2wave_snap.py -d "<entree>" --gui   # coche ~ sur "Epaisseur du trait", bouton courbe pour l'editer
+```
 
 **Ce qui reste volontairement hors de cette fenetre** : `--stereo`,
 `--split-channels`, `--rate`, `--buffer`, `--size`, `--interval` (remplace par
