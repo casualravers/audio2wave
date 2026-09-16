@@ -29,8 +29,13 @@ GUI_ACCENT = "#5fd4c8"
 GUI_ACCENT_FG = "#0b1a19"
 GUI_FONT = ("Segoe UI", 10)
 GUI_FONT_BOLD = ("Segoe UI", 10, "bold")
-GUI_FONT_HEADING = ("Segoe UI", 12, "bold")
+GUI_FONT_HEADING = ("Segoe UI", 13, "bold")
 GUI_FONT_MONO = ("Consolas", 9)
+# "Kicker" en petites capitales pour les sous-titres de groupe (ex. "SOURCE",
+# "SORTIE" dans audio2wave_snap.py --gui) : plus discret qu'un GUI_FONT_HEADING,
+# fait la transition entre une simple ligne separatrice et un vrai titre de
+# section, un cran de hierarchie visuelle en plus pour un rendu plus structure.
+GUI_FONT_SMALL = ("Segoe UI", 8, "bold")
 
 
 def style_gui(root) -> None:
@@ -65,8 +70,11 @@ def style_gui(root) -> None:
     root.option_add("*Button.relief", "flat")
     root.option_add("*Button.font", GUI_FONT_BOLD)
     root.option_add("*Button.cursor", "hand2")
-    root.option_add("*Button.padX", 10)
-    root.option_add("*Button.padY", 4)
+    # Marge genereuse plutot que le minimum Tk (10/4 dans un premier jet): un bouton
+    # plat sans relief a besoin de respirer pour ne pas se lire comme un simple
+    # bloc de couleur colle au texte -- demande explicite d'un rendu plus aere.
+    root.option_add("*Button.padX", 12)
+    root.option_add("*Button.padY", 5)
     root.option_add("*Radiobutton.selectColor", GUI_PANEL_BG)
     root.option_add("*Radiobutton.activeBackground", GUI_BG)
     root.option_add("*Radiobutton.activeForeground", GUI_ACCENT)
@@ -77,6 +85,11 @@ def style_gui(root) -> None:
     root.option_add("*Scale.activeBackground", GUI_ACCENT)
     root.option_add("*Scale.highlightThickness", 0)
     root.option_add("*Scale.sliderRelief", "flat")
+    # Piste et poignee plus fines que le defaut Tk (~15/30 px) : le gros bouton 3D
+    # par defaut fait daté a cote du reste, deja plat -- demande explicite d'un
+    # rendu "plus moderne".
+    root.option_add("*Scale.width", 10)
+    root.option_add("*Scale.sliderLength", 16)
     root.option_add("*Menu.Background", GUI_PANEL_BG)
     root.option_add("*Menu.Foreground", GUI_FG)
     root.option_add("*Menu.activeBackground", GUI_ACCENT)

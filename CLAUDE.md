@@ -224,7 +224,78 @@ resolution de chemins.
   au premier rafraichissement d'une colonne deja revelee (bug corrige : la
   delimitation de la bande devenait invisible au bout de quelques pas).
   **`--gui`** : meme mecanisme que `audio2wave_ridge.py` (fil separe pour `run()`,
-  fenetre tkinter qui ne fait que muter `args`). Particularite ici : les couleurs
+  fenetre tkinter qui ne fait que muter `args`).
+  **La fenetre est disposee en deux panneaux cote a cote (gauche/droite), pas une
+  seule colonne** : au nombre de reglages exposes desormais, une colonne unique
+  rendait la fenetre plus haute que la plupart des ecrans. `next_row(panel)` tient
+  un compteur de ligne *par panneau* (`row_left`/`row_right`), `cols(panel)`
+  donne la paire de colonnes grid correspondante (0/1 a gauche, 3/4 a droite,
+  colonne 2 en entre-deux) ; `add_slider`/`add_entry`/`add_dropdown` prennent un
+  parametre `panel` (defaut `"left"`) pour ca. Repartition : gauche = source
+  (entree audio, tempo) puis tout ce qui est propre a `--style pencil` (couleurs,
+  epaisseur, `--wave`, points/colonnes, `--kick-glow`) ; droite = `--video`/
+  `--video2` (pencil aussi, mais place a droite pour equilibrer les hauteurs des
+  deux panneaux) puis tout ce qui s'applique quel que soit le style (rekordbox/
+  simple, gain, tuning, sortie). Tout ce qui doit courir sur toute la largeur
+  (separateurs de section, bloc Presets, statut) utilise un troisieme compteur
+  partage (`row_shared`), demarre a `max(row_left, row_right)` une fois les deux
+  panneaux finis -- c'est aussi a ce moment-la, la hauteur finale connue, qu'une
+  ligne verticale fine (colonne 2, `rowspan=row_shared-1`) separe visuellement les
+  deux panneaux.
+  **`ROW_PADX`/`ROW_PADY`/`SECTION_GAP`** (locales a `build_gui`, en tete de
+  fonction) centralisent les marges de chaque ligne/separateur — a la demande
+  explicite d'une fenetre "plus lisible, aeree... plus classe" que le 8/4 px
+  d'origine. Un point de reglage unique plutot que des litteraux repetes sur la
+  trentaine d'appels `grid()`/`pack()` de cette fonction : `add_label` (donc
+  `add_slider`/`add_entry`/`add_dropdown` qui s'appuient dessus) et
+  `add_separator` les lisent tous les trois, le reste (rangees construites a la
+  main : entree audio, tempo, style, video, crossover, gain, presets, statut)
+  les reprend explicitement. Premier essai a des valeurs bien plus genereuses
+  (12/7/18) mesure trop haut a l'ecran (1028 px, deborderait un ecran 900-1080
+  px de haut une fois la barre des taches deduite) — redescendu a 11/5/10, puis
+  encore a 11/4/7 (avec `*Button.padY` 6 -> 5 dans `common.py`) une fois les
+  intitules de groupe (`SOURCE`/`APPARENCE`/...) ajoutes, qui reajoutaient de la
+  hauteur -- mesure reelle de `root.winfo_height()` (capture d'ecran) a chaque
+  fois, pas juste a l'oeil.
+  **`add_section_title(panel, title)`/`add_separator(panel, title=None)`**
+  nomment chaque groupe de reglages (`SOURCE`, `APPARENCE` a gauche ; `VIDEO`,
+  `REKORDBOX / SIMPLE`, `SORTIE` a droite) en petites capitales muettes
+  (`GUI_FONT_SMALL`, nouvelle police dans `common.py`) — a la demande explicite
+  d'un design "plus moderne" : une suite de traits fins anonymes entre groupes
+  ne dit pas ce qui commence apres, un intitule le dit d'un coup d'oeil (meme
+  principe que les sous-titres de section d'une appli de reglages classique).
+  `add_section_title` seule (sans trait) sert au tout premier groupe de chaque
+  panneau, qui n'a rien a separer d'un groupe precedent ; `add_separator(...,
+  title=...)` l'appelle en plus du trait pour tous les suivants. Piste et
+  poignee de `tk.Scale` amincies (`*Scale.width`/`*Scale.sliderLength` dans
+  `style_gui`, 10/16 px contre ~15/30 px par defaut) pour le meme motif : le
+  gros bouton 3D de Tk par defaut jurait a cote du reste, deja plat partout
+  ailleurs. Ces deux changements de `common.py` (police + Scale) profitent aux
+  trois fenetres `--gui` d'un coup, sans toucher `audio2wave_live.py`/
+  `audio2wave_ridge.py` — c'est tout le sens du point de theme unique
+  (`style_gui`, voir l'intro de ce document).
+  **Les labels restent courts, les precisions vont en info-bulle (survol de la
+  souris)** plutot que d'etre ecrites entre parentheses dans le texte du label
+  (`"Couleur(s) (vide = defaut)"` -> label `"Couleurs"` + info-bulle) : a deux
+  panneaux plus etroits qu'une seule colonne, ces precisions poussaient les
+  colonnes de controle bien au-dela des 170 px des curseurs. `Tooltip` (classe,
+  definie juste avant `build_gui`) est une Toplevel `overrideredirect` creee a
+  l'entree de la souris (`<Enter>`) et detruite a la sortie (`<Leave>`), pas
+  cachee/reaffichee -- une Toplevel de plus est negligeable face a la frequence
+  des survols, et ca evite de gerer un etat "creee mais cachee" en plus. Les
+  callbacks sont lies via `widget.bind`, ce qui garde l'instance en vie sans
+  avoir besoin de la stocker ailleurs (Tk retient le callback tant que le widget
+  existe). `add_label(text, row, column, tooltip=None)` factorise la creation
+  d'un label seul (utilisee directement pour les labels manuels, et par
+  `add_slider`/`add_entry`/`add_dropdown`, qui prennent maintenant un parametre
+  `tooltip` optionnel en plus de `panel`) ; les `Checkbutton` (pas de label
+  separe) attachent leur `Tooltip` directement sur eux-memes. Verifie a l'oeil :
+  simuler un survol (`widget.event_generate("<Enter>")`) cree bien une Toplevel
+  mappee (`winfo_ismapped()`), mais une capture d'ecran immediate peut la rater
+  tant que le compositeur ne l'a pas encore peinte -- laisser un court delai
+  avant de capturer pour verifier visuellement, ce n'est pas un signe que
+  l'info-bulle ne marche pas.
+  Particularite ici : les couleurs
   resolues dependent du **style**, pas seulement de `args.colors`/`args.bg_color`
   (`resolve_colors`/`resolve_bg`), donc `run()` compare les valeurs *resolues* d'un
   tour a l'autre, pas les attributs bruts, pour savoir quand resonder. Changer de
@@ -234,7 +305,8 @@ resolution de chemins.
   Exception)` pour qu'un reglage temporairement invalide (crossover mal forme,
   etc. — ces fonctions font `sys.exit(2)` en ligne de commande) saute une photo au
   lieu de tuer le fil de rendu. Expose tout ce que `run()` relit deja frais a
-  chaque photo (style, couleurs, epaisseur, `--wave`, points/colonnes, echelle,
+  chaque photo (style, couleurs, epaisseur, `--wave`, points/colonnes,
+  `--kick-glow`/rayon du halo, echelle,
   filtre, crossover, **gain** — case "auto" + curseur manuel en dB, `resolve_gain`
   lu chaque photo — et **`--save-dir`** — champ texte, `mkdir(parents=True,
   exist_ok=True)` a la validation puisque `write_png` ne cree pas ses dossiers
@@ -245,6 +317,111 @@ resolution de chemins.
   ce qu'elle affiche reellement), `--rate`/`--buffer` (capture), `--size`/
   `--fullscreen` (fenetre ffplay), `--interval` (concurrent de `--bpm`/`--beats`
   sur la meme valeur, voir plus bas).
+  **"Variation automatique"** fait piloter un curseur par une COURBE plutot que
+  par la souris, a la demande explicite — d'abord "un moyen de piloter la
+  variation des parametres depuis la GUI", puis, apres un premier jet a sinus/
+  aleatoire partages, "plus complexe qu'une sinusoide", "choisir moi-meme la
+  courbe" et "differentes variations a differents parametres" : chaque curseur
+  automatable a donc sa PROPRE courbe et sa PROPRE vitesse, pas un seul couple
+  forme/vitesse partage par tous. Purement decoratif, sans lien avec
+  `--kick-glow`. Seuls trois curseurs le proposent (epaisseur du trait, points/
+  colonnes, rayon du halo) : ce sont les seuls reglages numeriques de cette
+  fenetre ou une derive automatique a un sens visuel direct ; le gain (dB) et
+  `--wave` (cycles) auraient pu s'y preter aussi mais n'ont pas ete demandes, pas
+  ajoutes pour ne pas surcharger la fenetre au-dela du necessaire (voir la
+  remarque generale plus haut sur `--reactive`/`--glow`/`--hue-cycle`).
+  Une courbe est representee par `AUTOMATE_CURVE_POINTS` valeurs dans `[0, 1]`
+  (`automation[attr]["points"]`), interpolees lineairement et **bouclees** (le
+  dernier point reboucle sur le premier) — meme principe que `deform_envelope`/
+  `render_ridge_line` dans `audio2wave_ridge.py` (peu de points de controle
+  interpoles plutot qu'un bruit par pixel), applique ici a un CYCLE qui se repete
+  dans le temps plutot qu'a une largeur d'image. Cinq presets generateurs
+  (`automate_curve_sinus`/`_triangle`/`_carre`/`_dents_de_scie`/`_aleatoire`,
+  fonctions module-level pures) remplissent ces points d'un coup ; l'utilisateur
+  peut ensuite les affiner point par point en glissant a la souris sur le petit
+  `tk.Canvas` de l'editeur (voir plus bas), donc "choisir sa propre courbe" va du
+  preset tel quel jusqu'au dessin libre.
+  `add_slider(automatable=True)` ajoute, SOUS le curseur concerne (pas a cote,
+  voir la puce dediee a l'alignement plus bas), une case `~` (active/desactive)
+  et un bouton `courbe`, qui ouvre `open_curve_editor(attr)` : une petite
+  `Toplevel` independante (pas de widget
+  supplementaire dans la fenetre principale, deja chargee) avec le `Canvas` de la
+  courbe, une rangee de boutons-preset, et un curseur "Vitesse" (periode en
+  secondes) — **propre a CET attribut**, stocke dans `automation[attr]["period"]`
+  (un `tk.DoubleVar` par attribut, pas une variable partagee).
+  **Bug corrige : la jauge de vitesse etait inversee.** Premier jet :
+  `tk.Scale(from_=1, to=30, ...)`, valeur AFFICHEE = secondes. Pousser le
+  curseur vers la droite (le geste naturel pour "plus de vitesse") ALLONGEAIT
+  donc le cycle au lieu de le raccourcir -- jauge inversee par rapport a ce que
+  le libelle "Vitesse" laisse attendre, signale par l'utilisateur ("la vitesse
+  ... est bien trop rapide (et la jauge est inversee)") : en cherchant a
+  ralentir en poussant vers la gauche (le sens qu'on associe a "moins" par
+  reflexe), on tombait au contraire sur l'extreme le plus RAPIDE (1 s/cycle).
+  Corrige en creant le `Scale` avec `from_=AUTOMATE_PERIOD_MAX_S,
+  to=AUTOMATE_PERIOD_MIN_S` (le sens INVERSE du sens naturel from_ < to,
+  confirme fonctionner correctement avec Tk avant de cabler) : la gauche du
+  curseur est desormais le plus lent, la droite le plus rapide. `MIN` releve de
+  1 s a 3 s au passage (`AUTOMATE_PERIOD_MIN_S`) et `MAX` de 30 s a 40 s
+  (`AUTOMATE_PERIOD_MAX_S`) : une fois la direction corrigee, l'extreme rapide
+  n'a plus besoin d'etre aussi brutal (1 s/cycle etait justement l'exces
+  atteint par erreur a cause de l'inversion). `AUTOMATE_DEFAULT_PERIOD_S` passe
+  de 8 a 10 s au meme moment, une marge de confort plutot qu'une necessite
+  stricte. Un `Tooltip` sur le label "Vitesse" precise desormais le sens
+  ("droite = plus rapide, gauche = plus lent") : cette fenetre popup n'avait
+  jusque-la aucune info-bulle, a la difference de la fenetre principale.
+  Rouvrir l'editeur
+  d'un attribut deja ouvert relve juste sa fenetre (`winfo_exists()` +
+  `lift()`) plutot que d'en dupliquer une deuxieme. `on_curve_drag` retrouve
+  l'index du point le plus proche depuis `event.x` (les points sont espaces
+  regulierement sur la largeur du canevas) plutot que d'exiger un clic precis
+  dessus : plus tolerant a la souris, permet de "peindre" la courbe en glissant.
+  `redraw_curve` est appelee apres chaque modification (preset ou glisser) pour
+  que le `Canvas` reste le reflet exact de `automation[attr]["points"]`.
+  Une seule fonction `automate_tick()`, reprogrammee via
+  `root.after(AUTOMATE_TICK_MS, ...)` dans le fil tkinter (jamais dans `run()`,
+  fil separe), calcule pour chaque attribut coche sa position dans son propre
+  cycle (`elapsed = now - state["start"]`, `pos = (elapsed / periode % 1) * n`,
+  interpolation lineaire entre les deux points de controle encadrants,
+  bouclage `% n` sur l'index suivant) et pousse la valeur resultante (mise a
+  l'echelle dans `[lo, hi]` du curseur) via le setter deja expose par
+  `controls[attr]` — donc le curseur visible bouge en meme temps que `args`
+  change, exactement comme un changement a la souris ou un preset charge ;
+  `run()` ne voit ni ne sait qu'un curseur est pilote, il relit juste l'attribut
+  a chaque photo comme toujours. `state["start"]` est reinitialise a
+  `time.monotonic()` a chaque fois que la case `~` passe a coche (pas seulement
+  a la creation du curseur) : sans ca, activer une variation apres une pause
+  ferait sauter la valeur a une phase arbitraire de l'horloge globale au lieu de
+  repartir proprement du premier point de la courbe — plus previsible pour
+  l'utilisateur qui vient de cocher la case. `automate_tick()` s'arrete de se
+  reprogrammer des que `finished_event` est positionne (fenetre video fermee),
+  meme garde que `refresh()` (statut) juste apres dans le code — sans ca, `root`
+  detruit ferait echouer le prochain `root.after`. Ni `automation` ni l'etat des
+  editeurs ne sont dans `controls` : deliberement absents des presets
+  (`capture_overrides()` ne capture que `controls`), une preference de session
+  plutot qu'un attribut de rendu a figer dans un preset. Verifie en pilotant les
+  widgets de l'editeur par de vrais evenements Tk (`invoke()`/`event_generate`,
+  pas de mock) et de vrais ecoulements de `time.monotonic()` sur quelques
+  secondes : le preset "carre" colle bien la valeur pres des bornes (pas au
+  milieu comme un sinus), decocher `~` fige la valeur, et deux curseurs avec des
+  courbes differentes (triangle vs dents de scie) divergent nettement plus qu'un
+  simple dephasage n'expliquerait.
+  **La case `~` et le bouton `courbe` vivent SOUS le curseur, pas a cote** : un
+  premier jet les mettait cote a cote (`pack(side="left")` dans le meme `Frame`
+  que le `Scale`), ce qui forcait a retrecir ce `Scale` (140 px au lieu des 170 px
+  partout ailleurs) pour laisser la place — constate a l'oeil (capture d'ecran),
+  ca decalait la piste des curseurs automatables par rapport a tous les autres
+  curseurs de la fenetre, avec un bord droit en dents de scie d'une ligne a
+  l'autre. Empiler resout ca : le `Scale` garde 170 px et `sticky="w"` comme tous
+  les autres (y compris les non-automatables, avant sans `sticky` explicite donc
+  potentiellement centres si la colonne s'elargissait), et la case+bouton
+  forment une deuxieme rangee (`automate_row`, un `Frame` de plus) alignee sur le
+  meme bord gauche juste en dessous. Seule la hauteur de CETTE ligne de la grille
+  grandit ; les grilles Tk dimensionnent chaque ligne independamment, ca ne
+  deplace donc aucune autre ligne. Le bouton `courbe` recoit `padx=4, pady=0` a
+  la creation (pas de nouvelle couleur, le theme reste celui de `style_gui`) pour
+  rester a l'echelle d'un bouton d'edition secondaire accole a une case a cocher,
+  plutot que d'avoir le meme poids visuel que les boutons d'action principaux de
+  la fenetre (Actualiser/Parcourir/Mesurer...).
   **`--bpm`/`--beats` sont exposes malgre determiner `chunk_size`** (taille de la
   fenetre glissante de `LiveCapture`), a la difference de `--rate`/`--stereo`/
   `--split-channels` qui, eux, figent le format de `capture_command`. `run()`
@@ -281,7 +458,14 @@ resolution de chemins.
   `find_asset()` (extrait de la logique de `parse_args()`, chemin tel quel puis
   dans `--asset-dir`) : un chemin introuvable est signale en statut sans toucher
   a `args.video`/`args.video2`, pour ne pas couper une video en cours sur une
-  faute de frappe pas encore corrigee.
+  faute de frappe pas encore corrigee. Un bouton "Parcourir..." a cote de chaque
+  champ ouvre `filedialog.askopenfilename` (importe conditionnellement avec
+  `tkinter`, memes precautions que `tk` lui-meme pour rester optionnel) filtre sur
+  les extensions video courantes ; le dossier initial est celui du fichier deja
+  saisi s'il existe, sinon `--asset-dir`. Le chemin choisi est simplement pousse
+  dans le champ texte puis validé par le meme `apply()` que la saisie au clavier
+  -- pas un chemin separe, pour ne garder qu'une seule logique de resolution/
+  validation entre les deux façons de renseigner le champ.
   `capture_state` (`{"capture": LiveCapture}`, cree dans `main()`) est le pont
   entre `run()` et `build_gui()` pour ces redemarrages : `run()` y remet la
   `LiveCapture` courante a chaque changement d'entree audio, et le bouton
@@ -472,6 +656,58 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   crete mesuree par le gain auto est bien celle qui touche les bords.
 - **Passe-bas a deux poles en cascade** (24 dB/oct) : en 12 dB/oct, les bandes se
   recouvrent trop et tout le trace vire a la couleur des graves.
+- **`--kick-glow` est un detecteur d'attaques deliberement approximatif, pas une
+  isolation des basses** : le projet vise l'esthetique ("jolis visuels"), pas la
+  fidelite audio, et ce depot est stdlib-seulement (pas de filtre passe-bas maison
+  a bas cout). `detect_kicks()` a ete corrige deux fois de suite apres avoir
+  constate en pratique qu'il ratait tout sur un mix synthetique deja fort (crest
+  factor ~7 dB, comme un master limite typique de club/DJ) alors qu'un premier
+  jet marchait sur un signal a fond calme — ne pas revenir a ces deux premieres
+  formes sans retester sur un signal deja fort :
+  - **`energy_envelope()` (RMS par tranche), pas `amplitude_envelope()` (crete
+    par tranche)** : sur un mix deja pres du plafond numerique en permanence, la
+    CRETE d'un kick ne bouge quasiment plus (le plafond est deja atteint), alors
+    que l'energie RMS continue de monter nettement.
+  - **FLUX (montee d'une tranche a l'autre), pas niveau absolu au-dessus d'une
+    moyenne locale** : sur un mix compresse le niveau lui-meme reste trop
+    constant pour depasser sa propre moyenne locale d'un facteur utile ; la
+    montee, elle, reste nette meme quand le niveau absolu bouge peu.
+  - **`KICK_ANALYSIS_MS` (duree ciblee par tranche), pas un nombre de tranches
+    fixe** : a un compte fixe (300 tranches, essaye en premier), la duree de
+    tranche varie avec `--beats`/`--bpm`/la frequence de capture et peut tomber
+    sous un cycle de basse — constate en pratique, un simple fond sans aucun kick
+    declenchait alors des dizaines de faux positifs (l'enveloppe suivait le
+    zigzag de l'onde elle-meme, pas sa silhouette). `KICK_ANALYSIS_MS=20` (50 Hz)
+    couvre au moins un cycle complet meme pour un kick tres grave, meme principe
+    que `TARGET_COLUMN_MS` plus haut.
+  Le nombre de tranches resultant flague un pic local qui depasse
+  `KICK_FLUX_RATIO` fois le flux local moyen (`KICK_LOCAL_AVG_SPAN` tranches de
+  part et d'autre), avec un plancher (`KICK_MIN_FLUX`, ignore le bruit de fond)
+  et un ecart minimal entre deux declenchements (`KICK_MIN_GAP_SLICES`, evite
+  plusieurs triggers sur la meme attaque). Diagnostic direct dans la ligne de
+  statut de `--gui`/la console (`", N kick(s)"` des que `--kick-glow` est actif,
+  y compris a 0) : sans lui, "le halo ne se voit pas" ne dit pas si le detecteur
+  ne trouve rien ou si le halo est juste trop discret a l'oeil.
+  Le halo lui-meme (`paint_pencil_columns`) epaissit legerement le trait
+  (`KICK_GLOW_EXTRA_RATIO`, un effet mineur) ET peint un degrade vers
+  `KICK_GLOW_COLOR` (blanc pur) dans le FOND juste au-dela du trait, sur
+  `KICK_GLOW_HALO_RATIO * kick_glow_radius` px avec un falloff lineaire — pas un
+  flou gaussien, juste des tranches de pixels blendues, bien moins cher a
+  calculer par colonne qu'un vrai flou. **Corrige apres un premier jet qui ne
+  faisait que virer la COULEUR DU TRAIT vers `KICK_GLOW_COLOR`** : signale par
+  l'utilisateur comme invisible avec la couleur pencil par defaut (deja blanche,
+  donc "blanc vers blanc" ne change rien a l'oeil). Le halo doit rester visible
+  quelle que soit la couleur du trait, donc il vit dans le fond autour du trait
+  (normalement noir, contraste garanti), jamais sur le trait lui-meme — verifie
+  par un test qui utilise volontairement `ink == KICK_GLOW_COLOR` (blanc sur
+  blanc) et confirme que le trait ne change pas pixel pour pixel, alors que le
+  fond juste a cote vire nettement vers le blanc. `kicks`/`kick_glow_radius`
+  traversent `paint_pencil_columns` /
+  `compose_pencil` / `draw_pencil_video_progressively` en parametres optionnels
+  (`None` par defaut, aucun cout ni changement de comportement si `--kick-glow`
+  est desactive) ; calcules une fois par photo dans `run()` comme `columns`, pas
+  recalcules pendant le balayage — un kick ne bouge pas plus que le contour
+  pendant que sa photo est affichee.
 - **`--style pencil` ne passe pas par ffmpeg** : aucun filtre ne dessine une polyligne
   d'enveloppe (`showwavespic` remplit une silhouette, `showwaves` trace la forme d'onde).
   `render_pencil` peint pour chaque colonne le segment vertical reliant la hauteur
@@ -558,12 +794,67 @@ memes options exclues de cette fenetre que documente plus haut, un preset --gui
 peut legitimement contenir des options que --preset sait appliquer au demarrage
 mais que cette fenetre ne peut pas relancer en direct. `capture_overrides()`
 factorise la meme capture (`{attr: getattr(args, attr) for attr in controls}`,
-conversion `Path` -> `str` pour `save_dir`) entre **Sauvegarder sous** (nouveau
-nom, refuse un nom de preset integre) et **Mettre a jour** (`on_update_preset`,
-reecrit le preset actuellement selectionne dans le menu **Charger** avec l'etat
-courant — refuse aussi de toucher un preset integre, meme logique de protection).
+conversion `Path` -> `str` generalisee a tout attribut, pas seulement
+`save_dir` — voir le bug corrige juste apres) entre **Sauvegarder sous**
+(nouveau nom, refuse encore un nom de preset integre : une protection contre
+une collision accidentelle par faute de frappe, un nom cree "par erreur" n'a
+pas la meme intention qu'un preset explicitement selectionne puis mis a jour,
+voir plus bas) et **Mettre a jour** (`on_update_preset`, reecrit le preset
+actuellement selectionne dans le menu **Charger** avec l'etat courant).
+**Peut desormais mettre a jour un preset INTEGRE** (ex. "club"), a la demande
+explicite ("rend la possibilite de mettre a jour les presets par defaut") —
+refuse au premier jet, par prudence excessive plutot que par necessite
+technique : `save_user_preset()` ecrit toujours dans le JSON utilisateur,
+jamais dans `PRESETS` (le dict en code) ; `all_presets()` fait deja gagner
+l'utilisateur sur un nom identique (voir sa docstring), le mecanisme de
+"shadow" existait donc deja pour `--preset <nom>` en ligne de commande AVANT
+ce changement — seul le bouton `--gui` refusait artificiellement de s'en
+servir. "Mettre a jour" un preset integre cree donc juste une version
+personnalisee qui le remplace **pour cette machine** (JSON dans le profil
+utilisateur) ; le preset d'origine, dans `PRESETS`, reste intact dans le code
+et reapparaitrait si l'entree JSON etait supprimee (`--list-presets` distingue
+d'ailleurs deja "integres" et "utilisateur", voir plus haut). Le statut le
+precise explicitement (`"... -- remplace desormais le preset integre du meme
+nom sur cette machine"`) pour que ce ne soit jamais une surprise silencieuse.
+Verifie avec `PRESETS['club']['line_width']` (le dict en code) reste inchange
+apres la mise a jour, et que `--preset club` en ligne de commande lit bien la
+valeur du JSON apres coup (`all_presets()['club']`, pas `PRESETS['club']`).
 Aucun des deux ne rappelle `refresh_preset_menu()` pour "Mettre a jour" : le nom
 existe deja dans le menu, seul son contenu change.
+
+**Bug corrige : le champ "Sauvegarder sous" n'avait PAS de bind `<Return>`**,
+contrairement a tous les autres champs texte de cette fenetre (couleurs, video,
+crossover, dossier PNG — tous via `add_entry`/`make_video_field`, qui bindent
+`<Return>` ET `<FocusOut>`). Signale par l'utilisateur ("la sauvegarde d'un
+nouveau preset n'a aucun effet") : taper un nom puis Entree, le reflexe naturel
+apres tous ces autres champs, ne faisait RIEN — seul un clic explicite sur le
+bouton "Sauvegarder" fonctionnait. Reproduit avant correction avec un vrai
+`entry.event_generate("<Return>")` (pas juste `button.invoke()`, qui contourne
+justement le chemin clavier en cause). `on_save_preset` accepte maintenant un
+evenement optionnel et est bindee sur `<Return>` du champ, EXACTEMENT comme le
+bouton (meme fonction, deux declencheurs) — mais sans `<FocusOut>` a la
+difference des autres champs : ceux-la valident une valeur qui reste affichee en
+continu, sauvegarder un preset est une action ponctuelle qui vide le nom juste
+apres, cliquer ailleurs sans avoir voulu sauvegarder ne doit pas declencher une
+sauvegarde surprise.
+
+**Deuxieme bug corrige, plus sournois : "Sauvegarder"/"Mettre a jour" semblaient
+ne plus rien faire des qu'une video etait active**, signale par l'utilisateur
+juste apres le correctif ci-dessus. Cause : `capture_overrides()` ne convertissait
+que `save_dir` de `Path` en `str` avant le `json.dumps()` de `save_user_preset()` ;
+`video`/`video2` restent des `Path` des que `find_asset()` les a resolus (voir
+plus haut), et `json.dumps` sur un `Path` leve `TypeError: Object of type
+WindowsPath is not JSON serializable`. Cette exception, levee DANS un callback
+`command=` de bouton Tk, est interceptee et affichee sur stderr par le
+gestionnaire d'exceptions par defaut de Tkinter — **rien ne remonte a l'interface**,
+le bouton parait juste inerte. Repro isolee (`json.dumps({"video": Path(...)})`)
+avant de toucher au code, pour confirmer la cause exacte plutot que deviner.
+Corrige en generalisant la conversion a TOUT attribut `Path` dans `overrides`
+(boucle sur `overrides.items()`), pas seulement `save_dir` : plus robuste qu'un
+cas special de plus a chaque nouvel attribut `Path` ajoute un jour. Verifie avec
+un vrai `--video` choisi via le bouton "Parcourir..." (mock d'`askopenfilename`,
+meme mecanisme que le test de ce bouton) puis une sauvegarde de preset : le JSON
+ecrit contient bien une chaine, pas un objet illisible.
 
 ### Frequence d'echantillonnage
 

@@ -21,6 +21,7 @@ import array
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -31,12 +32,14 @@ from typing import Callable
 
 try:
     import tkinter as tk
+    from tkinter import filedialog
 except ImportError:  # tkinter absent de certaines installations minimales de Python
     tk = None
+    filedialog = None
 
 from audio2wave import (
-    GUI_ACCENT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_MUTED_FG, GUI_PANEL_BG, gain_value,
-    parse_size, style_gui, style_option_menu,
+    GUI_ACCENT, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL, GUI_MUTED_FG,
+    GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
 from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
 
@@ -103,6 +106,101 @@ DEFAULT_LINE_WIDTH = 2
 # que l'enveloppe reste visible a travers.
 WAVE_CYCLES = 24
 
+# --kick-glow: detecteur d'attaques purement decoratif (pas une isolation des
+# basses par filtre, le projet vise l'esthetique pas la fidelite) sur une
+# enveloppe fine (beaucoup plus de tranches que PENCIL_POINTS: le contour n'a
+# besoin que de la silhouette, la detection d'attaque a besoin de voir les pics
+# que le contour, lui, lisse deja).
+# Detection par FLUX (montee d'energie d'une tranche a l'autre), pas par niveau
+# absolu au-dessus d'une moyenne locale: une premiere version comparait le niveau
+# a sa moyenne locale, qui marchait sur un signal synthetique a fond calme mais
+# ratait TOUT sur un mix compresse/limite (loudness war, la norme en club/DJ) --
+# le niveau y reste quasi constant, y compris sur les kicks, donc rien ne depasse
+# jamais assez sa propre moyenne locale. Le flux, lui, reste net meme quand le
+# niveau absolu bouge peu: un kick reste une MONTEE brutale, compresse ou pas.
+#
+# Duree ciblee par tranche, PAS un nombre de tranches fixe (meme principe que
+# TARGET_COLUMN_MS plus haut, pour la meme raison: une tranche plus courte qu'un
+# cycle de basse suit le zigzag de l'onde elle-meme au lieu de son enveloppe, et
+# CHAQUE cycle ressemble alors a une fausse attaque). 20 ms = 50 Hz: au moins un
+# cycle complet meme pour un kick tres grave. Verifie en pratique: a 300 tranches
+# fixes sur un signal de 2 s (6,7 ms/tranche, sous ce seuil), un simple fond
+# basse-frequence sans aucun kick declenchait des dizaines de faux positifs.
+KICK_ANALYSIS_MS = 20.0
+KICK_FLUX_RATIO = 1.8        # montee au moins 80% au-dessus du flux local moyen
+KICK_MIN_FLUX = 0.03         # ignore les micro-variations dans le bruit de fond
+KICK_MIN_GAP_SLICES = 4      # evite plusieurs declenchements sur une seule attaque
+KICK_LOCAL_AVG_SPAN = 6      # tranches de part et d'autre pour la moyenne locale
+KICK_GLOW_COLOR = b"\xff\xff\xff"  # flash au blanc pur, pas de sonde ffmpeg pour ca
+KICK_GLOW_RADIUS_PX = 40     # rayon horizontal par defaut du halo, voir --kick-glow-size
+KICK_GLOW_EXTRA_RATIO = 0.3  # epaississement du trait au pic du halo, en fraction du rayon
+# Degrade peint dans le FOND de part et d'autre du trait (pas une couleur appliquee
+# au trait lui-meme) : avec la couleur pencil par defaut (blanc), virer le trait
+# vers KICK_GLOW_COLOR (blanc aussi) ne change RIEN a l'oeil -- seul un halo qui
+# eclaire les pixels autour du trait, dans une couleur normalement occupee par le
+# fond, reste visible quelle que soit la couleur du trait. Constate en usage reel
+# (signale par l'utilisateur) apres le premier jet, qui ne faisait qu'epaissir/
+# eclaircir le trait -- invisible des que le trait etait deja blanc.
+KICK_GLOW_HALO_RATIO = 0.6   # portee verticale du halo, en fraction du rayon
+
+# --gui: "variation automatique" fait piloter un curseur coche via '~' (epaisseur,
+# points/colonnes, rayon du halo -- voir add_slider(automatable=True) dans build_gui)
+# par une COURBE qui lui est propre, pas une forme partagee : chaque curseur a son
+# editeur (bouton "C"), ses points de controle glissables a la souris, et sa propre
+# vitesse -- a la demande explicite d'une variation "plus complexe qu'une
+# sinusoide", choisie par l'utilisateur, differente d'un parametre a l'autre.
+# Purement decoratif, aucun lien avec detect_kicks plus haut.
+AUTOMATE_TICK_MS = 50            # frequence de rafraichissement des curseurs pilotes
+AUTOMATE_CURVE_POINTS = 12       # points de controle par cycle, interpoles lineairement et
+                                  # boucles (meme principe que deform_envelope/render_ridge_line
+                                  # dans audio2wave_ridge.py, adapte a un cycle qui reboucle)
+AUTOMATE_DEFAULT_PERIOD_S = 10.0  # duree par defaut d'un cycle complet, avant reglage individuel
+# Bornes du curseur "Vitesse" de l'editeur, en secondes par cycle complet. Le
+# curseur Tk est cree avec from_=MAX, to=MIN (voir open_curve_editor) : la
+# gauche correspond au plus lent, la droite au plus rapide, pour qu'une
+# variation vers la droite se lise comme "plus de vitesse" -- corrige apres un
+# premier jet a from_=1, to=30 (la valeur AFFICHEE etait le nombre de secondes,
+# donc pousser le curseur vers la droite ALLONGEAIT le cycle au lieu de le
+# raccourcir : jauge inversee par rapport a ce que le libelle "Vitesse"
+# laissait attendre, signale par l'utilisateur). MIN releve de 1 s a 3 s au
+# passage : un cycle complet par seconde etait un exces facile a atteindre par
+# erreur (justement a cause de l'inversion), une fois la direction corrigee la
+# valeur la plus rapide n'a plus besoin d'etre aussi extreme.
+AUTOMATE_PERIOD_MIN_S = 3.0
+AUTOMATE_PERIOD_MAX_S = 40.0
+AUTOMATE_CANVAS_W = 220          # taille du petit editeur de courbe (Canvas), en pixels
+AUTOMATE_CANVAS_H = 90
+
+
+def automate_curve_sinus(n: int) -> list[float]:
+    return [0.5 + 0.5 * math.sin(2 * math.pi * i / n) for i in range(n)]
+
+
+def automate_curve_triangle(n: int) -> list[float]:
+    # Monte de 0 a 1 sur la premiere moitie du cycle, redescend de 1 a 0 sur la
+    # seconde -- le point n (hors liste, ou la courbe reboucle sur le point 0)
+    # referme le triangle a 0 sans discontinuite.
+    out = []
+    for i in range(n):
+        t = i / n
+        out.append(2 * t if t <= 0.5 else 2 * (1 - t))
+    return out
+
+
+def automate_curve_carre(n: int) -> list[float]:
+    return [1.0 if (i / n) < 0.5 else 0.0 for i in range(n)]
+
+
+def automate_curve_dents_de_scie(n: int) -> list[float]:
+    # Monte lineairement sur tout le cycle puis retombe a 0 d'un coup en
+    # rebouclant sur le point 0 -- la chute nette (pas de point a 1.0 explicite)
+    # est la signature d'une dent de scie.
+    return [i / n for i in range(n)]
+
+
+def automate_curve_aleatoire(n: int) -> list[float]:
+    return [random.random() for _ in range(n)]
+
 # Duree d'audio visee par colonne dessinee, quand une photo resume plusieurs secondes.
 # En dessous d'un cycle de basse (10 ms a 100 Hz), une colonne attrape un bout de cycle
 # au hasard et le trace part en peigne de traits fins; au-dela, chaque colonne resume
@@ -122,9 +220,11 @@ RESOLVED_COLUMN_MS = 1.0
 DEFAULT_BUFFER_MS = 50
 
 # Cadence du trace progressif. Le trait avance colonne par colonne pour finir pile au
-# rafraichissement suivant, ce qui donne un balayage cale sur le tempo. 30 img/s suffit
-# a le rendre fluide; au-dela on n'ajoute que du debit dans le tube.
-DEFAULT_DRAW_FPS = 30
+# rafraichissement suivant, ce qui donne un balayage cale sur le tempo. 30 img/s
+# suffisait deja a le rendre fluide, mais 60 par defaut lisse mieux le balayage sur
+# les ecrans/sources a 60 Hz -- demande explicite, au prix d'un debit double dans le
+# tube ffplay (voir describe_window/le doublement de cadence annoncee a ffplay).
+DEFAULT_DRAW_FPS = 60
 
 # Couleur du style club: nettement plus vive que le blanc par defaut de pencil, pour se
 # detacher d'un ecran de projection ambiant plutot que se fondre dans une esquisse.
@@ -282,6 +382,14 @@ def parse_args() -> argparse.Namespace:
                          f"plus = detail fin facon editeur audio. 0 = une colonne par pixel "
                          f"(defaut: {PENCIL_POINTS} points en pencil, sinon une colonne par "
                          f"{TARGET_COLUMN_MS:g} ms d'audio)")
+    p.add_argument("--kick-glow", action="store_true",
+                    help="Ajoute un halo blanc sur le trait a chaque attaque franche "
+                         "(kick) detectee dans le signal. Purement decoratif : un pic "
+                         "d'energie local, pas une isolation des basses par filtre. "
+                         "--style pencil seul")
+    p.add_argument("--kick-glow-size", type=int, default=KICK_GLOW_RADIUS_PX,
+                    help=f"Rayon du halo en pixels, pour --kick-glow "
+                         f"(defaut: {KICK_GLOW_RADIUS_PX})")
     p.add_argument("--crossover", default=None,
                     help=f"Coupures entre bandes en Hz, GRAVES,AIGUS, pour --style rekordbox "
                          f"(defaut: {DEFAULT_CROSSOVER[0]},{DEFAULT_CROSSOVER[1]})")
@@ -394,6 +502,8 @@ def parse_args() -> argparse.Namespace:
         args.interval = args.beats * 60.0 / args.bpm
     if args.wave is not None and args.wave < 1:
         p.error("--wave demande au moins une oscillation")
+    if args.kick_glow_size < 1:
+        p.error("--kick-glow-size doit valoir au moins 1")
     for opt in ("video", "video2"):
         path = getattr(args, opt)
         if path is not None:
@@ -873,6 +983,85 @@ def amplitude_envelope(pcm: bytes, points: int, channels: int) -> list[float]:
     return smoothed
 
 
+def blend_color(a: bytes, b: bytes, t: float) -> bytes:
+    """Interpole lineairement deux couleurs RGB, t=0 -> a, t=1 -> b. Sert au halo de
+    --kick-glow (melange vers KICK_GLOW_COLOR), pas de dependance a une lib d'image."""
+    return bytes(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def energy_envelope(pcm: bytes, slices: int, channels: int) -> list[float]:
+    """RMS par tranche, normalise 0..1 -- pas la crete (voir amplitude_envelope,
+    destinee au contour visuel). Sert a detect_kicks: sur un mix deja limite pres
+    du plafond numerique (loudness war, courant en club/DJ), la CRETE d'un kick ne
+    bouge presque plus (le plafond est deja atteint en permanence) alors que
+    l'energie RMS, elle, continue de monter nettement -- verifie en pratique, voir
+    detect_kicks.
+    """
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    frames = len(samples) // channels
+    if frames < 1:
+        return [0.0] * slices
+    out = []
+    for i in range(slices):
+        start = frames * i // slices
+        end = max(start + 1, frames * (i + 1) // slices)
+        slice_ = samples[start * channels:end * channels]
+        ms = sum(s * s for s in slice_) / len(slice_)
+        out.append(math.sqrt(ms) / 32768)
+    return out
+
+
+def detect_kicks(pcm: bytes, channels: int, rate: int, width: int) -> list[int]:
+    """Colonnes (position en pixels, 0..width-1) ou une attaque franche a ete
+    detectee, pour le halo de --kick-glow.
+
+    Detecteur simple et volontairement approximatif -- pas une isolation des
+    basses par un filtre passe-bas, que ce projet stdlib-seulement n'a de toute
+    facon aucun moyen d'ecrire sans couter cher.
+
+    Trois choix, tous corriges apres avoir rate des kicks sur un mix synthetique
+    deja fort (crest factor ~7 dB, comme un master limite typique de club/DJ)
+    alors qu'ils passaient sur un signal a fond calme :
+    - **energy_envelope (RMS), pas amplitude_envelope (crete)** : sur un mix deja
+      pres du plafond numerique en permanence, la CRETE d'un kick ne bouge
+      quasiment plus (le plafond est deja atteint), alors que l'energie RMS
+      continue de monter nettement.
+    - **FLUX (montee d'une tranche a l'autre), pas niveau absolu compare a une
+      moyenne locale** : le niveau lui-meme reste trop constant sur un mix
+      compresse pour depasser sa propre moyenne locale d'un facteur utile ; la
+      montee, elle, reste nette meme quand le niveau absolu bouge peu.
+    - **Duree de tranche ciblee (KICK_ANALYSIS_MS) plutot qu'un nombre de
+      tranches fixe** : a un compte fixe, la duree de tranche varie avec
+      `--beats`/`--bpm`/`rate` et peut tomber sous un cycle de basse -- verifie en
+      pratique, un simple fond sans aucun kick declenchait alors des dizaines de
+      faux positifs (l'enveloppe suivait le zigzag de l'onde, pas sa silhouette).
+    """
+    frames = len(pcm) // (SAMPLE_BYTES * channels)
+    duration_s = frames / rate if rate else 0.0
+    slices = max(8, round(duration_s * 1000 / KICK_ANALYSIS_MS)) if duration_s > 0 else 8
+    energy = energy_envelope(pcm, slices, channels)
+    n = len(energy)
+    if n < 3:
+        return []
+    flux = [max(0.0, energy[i] - energy[i - 1]) for i in range(1, n)]
+    m = len(flux)
+    kicks: list[int] = []
+    last = -KICK_MIN_GAP_SLICES
+    for i in range(m):
+        lo = max(0, i - KICK_LOCAL_AVG_SPAN)
+        hi = min(m, i + KICK_LOCAL_AVG_SPAN + 1)
+        local_avg = sum(flux[lo:hi]) / (hi - lo)
+        is_peak = (i == 0 or flux[i] >= flux[i - 1]) and \
+                  (i == m - 1 or flux[i] >= flux[i + 1])
+        if (is_peak and flux[i] >= KICK_MIN_FLUX
+                and (local_avg <= 0 or flux[i] >= local_avg * KICK_FLUX_RATIO)
+                and i - last >= KICK_MIN_GAP_SLICES):
+            kicks.append(i + 1)  # flux[i] = energy[i+1] - energy[i]
+            last = i
+    return [round(k * (width - 1) / max(1, n - 1)) for k in kicks]
+
+
 def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int]
                    ) -> list[tuple[int, int, tuple[int, ...]]]:
     """Pour chaque colonne: (haut de l'enveloppe, bas de l'enveloppe, hauteurs a encrer).
@@ -919,7 +1108,9 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
                          columns: list[tuple[int, int, tuple[int, ...]]], background: bytes,
                          ink: bytes, thickness: int, video: bytes | None,
                          video_out: bytes | None, start: int, end: int,
-                         full: bool = True, draw_ink: bool = True) -> None:
+                         full: bool = True, draw_ink: bool = True,
+                         kicks: list[int] | None = None,
+                         kick_glow_radius: int = KICK_GLOW_RADIUS_PX) -> None:
     """Peint les colonnes [start, end) du canevas: le fond d'abord (le canevas peut
     porter une photo precedente), la video interieure entre les bornes de l'enveloppe,
     la video exterieure au-dela, puis le trait.
@@ -957,6 +1148,14 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
     `draw_ink=False` saute le trait entierement (fond/video seuls) : sert a batir le
     canevas de depart du balayage suivant dans run(), pour que le contour d'une
     photo ne survive jamais au-dela d'elle (voir draw_pencil_video_progressively).
+
+    `kicks` (positions en colonnes, voir detect_kicks) epaissit legerement le trait
+    (`KICK_GLOW_EXTRA_RATIO`) ET peint un degrade vers KICK_GLOW_COLOR dans le fond
+    juste au-dela du trait, sur `KICK_GLOW_HALO_RATIO * kick_glow_radius` px avec
+    un falloff lineaire -- PAS une couleur appliquee au trait lui-meme, qui
+    "s'eclaircirait" vers du blanc sans aucun effet visible avec la couleur pencil
+    par defaut (deja blanche). Ignore si `draw_ink` est faux, le halo suit le
+    trait comme le reste.
     """
     width, height = size
     stride = width * 3
@@ -994,9 +1193,34 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
                         video_out[col0 + c:col0 + c + rows * stride:stride]
 
         if draw_ink:
+            glow = 0.0
+            if kicks:
+                for kx in kicks:
+                    d = abs(x - kx)
+                    if d <= kick_glow_radius:
+                        g = 1 - d / kick_glow_radius
+                        if g > glow:
+                            glow = g
+            extra = round(glow * kick_glow_radius * KICK_GLOW_EXTRA_RATIO)
+            halo_px = round(glow * kick_glow_radius * KICK_GLOW_HALO_RATIO)
             for index, y_now in enumerate(heights):
                 y_prev = previous[index]
-                for y in range(min(y_now, y_prev), max(y_now, y_prev) + thickness):
+                lo = min(y_now, y_prev) - extra
+                hi = max(y_now, y_prev) + thickness + extra
+                # Halo: degrade vers KICK_GLOW_COLOR peint dans le fond juste au-dela
+                # du trait (pas sur le trait lui-meme, voir KICK_GLOW_HALO_RATIO) --
+                # sinon un trait deja blanc (pencil par defaut) ne "s'eclaircit" pas
+                # en virant vers du blanc, le halo devient invisible.
+                for dy in range(1, halo_px + 1):
+                    t = glow * (1 - dy / halo_px)
+                    if t <= 0:
+                        continue
+                    for y in (lo - dy, hi - 1 + dy):
+                        if 0 <= y < height:
+                            base = y * stride + x * 3
+                            canvas[base:base + 3] = blend_color(
+                                canvas[base:base + 3], KICK_GLOW_COLOR, t)
+                for y in range(lo, hi):
                     if 0 <= y < height:
                         base = y * stride + x * 3
                         canvas[base:base + 3] = ink
@@ -1004,17 +1228,21 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
 
 def compose_pencil(size: tuple[int, int], columns: list[tuple[int, ...]], background: bytes,
                    ink: bytes, thickness: int, video: bytes | None = None,
-                   video_out: bytes | None = None, draw_ink: bool = True) -> bytes:
+                   video_out: bytes | None = None, draw_ink: bool = True,
+                   kicks: list[int] | None = None,
+                   kick_glow_radius: int = KICK_GLOW_RADIUS_PX) -> bytes:
     """Image complete du style pencil, fond compris.
 
     `draw_ink=False` omet le trait (fond + video seuls) : sert a construire le
     canevas de depart du balayage suivant dans run(), pour que l'ancien contour ne
     survive jamais au-dela de sa propre photo (voir draw_pencil_video_progressively).
+    `kicks`/`kick_glow_radius`: voir paint_pencil_columns, --kick-glow.
     """
     width, height = size
     canvas = bytearray(background * (width * height))
     paint_pencil_columns(canvas, size, columns, background, ink, thickness, video, video_out,
-                         0, width, draw_ink=draw_ink)
+                         0, width, draw_ink=draw_ink, kicks=kicks,
+                         kick_glow_radius=kick_glow_radius)
     return bytes(canvas)
 
 
@@ -1028,8 +1256,10 @@ def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple
     ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
     """
     columns = pencil_heights(args, pcm, gain, size)
+    kicks = (detect_kicks(pcm, channel_count(args), capture_rate(args), size[0])
+             if args.kick_glow else None)
     return compose_pencil(size, columns, background, ink, max(1, args.line_width), video,
-                          video_out)
+                          video_out, kicks=kicks, kick_glow_radius=args.kick_glow_size)
 
 
 def write_png(size: tuple[int, int], frame: bytes, png: Path) -> None:
@@ -1134,7 +1364,9 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
                                     columns: list[tuple[int, ...]], size: tuple[int, int],
                                     background: bytes, ink: bytes, thickness: int,
                                     video: VideoSource | None, video_out: VideoSource | None,
-                                    deadline: float, fps: int) -> bool:
+                                    deadline: float, fps: int,
+                                    kicks: list[int] | None = None,
+                                    kick_glow_radius: int = KICK_GLOW_RADIUS_PX) -> bool:
     """Variante de draw_progressively pour --video/--video2: la video continue de
     jouer pendant le balayage, et se superpose lentement a la photo precedente sur
     tout le creneau, comme le reste du trace (voir draw_progressively).
@@ -1194,7 +1426,8 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
         canvas = bytearray(previous)
         paint_pencil_columns(canvas, size, columns, background, ink, thickness,
                              video.latest() if video else None,
-                             video_out.latest() if video_out else None, 0, width)
+                             video_out.latest() if video_out else None, 0, width,
+                             kicks=kicks, kick_glow_radius=kick_glow_radius)
         return send_frame(viewer, canvas)
 
     canvas = bytearray(previous)
@@ -1213,10 +1446,12 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
             # trait restent tels quels (poses lors de leur premiere apparition).
             if drawn > 0:
                 paint_pencil_columns(canvas, size, columns, background, ink, thickness,
-                                     frame_video, None, 0, drawn, full=False)
+                                     frame_video, None, 0, drawn, full=False,
+                                     kicks=kicks, kick_glow_radius=kick_glow_radius)
             # Colonnes tout juste decouvertes: fond, video interieure et trait.
             paint_pencil_columns(canvas, size, columns, background, ink, thickness,
-                                 frame_video, None, drawn, target, full=True)
+                                 frame_video, None, drawn, target, full=True,
+                                 kicks=kicks, kick_glow_radius=kick_glow_radius)
             drawn = target
         elif frame_video_out is None:
             continue
@@ -1229,10 +1464,47 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
             # continue. Peinte en dernier, par-dessus le reste: elle ne touche que
             # la zone hors bande, jamais le trait ni la video interieure.
             paint_pencil_columns(canvas, size, columns, background, ink, thickness,
-                                 None, frame_video_out, 0, width, full=False)
+                                 None, frame_video_out, 0, width, full=False,
+                                 kicks=kicks, kick_glow_radius=kick_glow_radius)
         if not send_frame(viewer, canvas):
             return False
     return True
+
+
+class Tooltip:
+    """Info-bulle affichee au survol d'un widget: tkinter n'en fournit pas
+    nativement. Une Toplevel sans decoration (`overrideredirect`), creee a
+    l'entree de la souris et detruite a la sortie plutot que cachee/reaffichee --
+    le cout d'une Toplevel de plus est negligeable face a la frequence des
+    survols, et ca evite de gerer un etat "deja creee mais cachee" en plus.
+    Les callbacks lient l'instance a `widget` via `bind`, ce qui la garde en vie
+    (Tk retient le callback tant que le widget existe) sans avoir a la stocker
+    explicitement ailleurs.
+    """
+
+    def __init__(self, widget: object, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tip: object | None = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _evt: object = None) -> None:
+        if self.tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 4
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left", bg=GUI_PANEL_BG, fg=GUI_FG,
+                font=GUI_FONT, relief="solid", borderwidth=1, padx=6, pady=4, wraplength=260,
+                ).pack()
+
+    def _hide(self, _evt: object = None) -> None:
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
 
 
 def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
@@ -1281,15 +1553,77 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     root.title("audio2wave snap - reglages")
     root.resizable(False, False)
     style_gui(root)
-    row = 0
 
-    def next_row() -> int:
-        nonlocal row
-        row += 1
-        return row - 1
+    # Marges generales de la fenetre : plus genereuses que le strict minimum
+    # Tk (8/4 dans un premier jet) pour un rendu plus aere, moins "tableur" --
+    # a la demande explicite d'une fenetre "plus lisible, aeree... plus classe".
+    # Un point de reglage unique, reutilise par add_label/add_slider/add_entry/
+    # add_dropdown/add_separator ci-dessous, plutot que des litteraux repetes a
+    # chaque grid()/pack() : une seule valeur a retoucher si besoin.
+    ROW_PADX = 11
+    ROW_PADY = 4
+    SECTION_GAP = 7  # au-dessus/en-dessous d'un separateur de section
+
+    # Disposition en deux colonnes de reglages (gauche/droite) plutot qu'une seule
+    # liste verticale: une fenetre a la hauteur d'un ecran entier avec autant de
+    # reglages devient vite plus haute que large. Chaque "panneau" a son propre
+    # compteur de ligne (next_row) et sa propre paire de colonnes grid; tout ce qui
+    # doit courir sur toute la largeur (separateurs de section, presets, statut)
+    # utilise `row_shared`, demarre APRES la ligne la plus basse des deux panneaux.
+    LEFT_LABEL_COL, LEFT_CTRL_COL = 0, 1
+    SPACER_COL = 2
+    RIGHT_LABEL_COL, RIGHT_CTRL_COL = 3, 4
+    TOTAL_COLUMNS = 5
+    row_left = 1  # ligne 0 = titre "Reglages photo", commun aux deux panneaux
+    row_right = 1
+
+    def next_row(panel: str) -> int:
+        nonlocal row_left, row_right
+        if panel == "right":
+            row_right += 1
+            return row_right - 1
+        row_left += 1
+        return row_left - 1
+
+    def cols(panel: str) -> tuple[int, int]:
+        return (RIGHT_LABEL_COL, RIGHT_CTRL_COL) if panel == "right" \
+            else (LEFT_LABEL_COL, LEFT_CTRL_COL)
+
+    def add_label(text: str, row: int, column: int, tooltip: str | None = None,
+                 columnspan: int = 1) -> tk.Label:
+        # Les precisions ("vide = defaut", "pencil seul"...) vivaient avant dans le
+        # texte du label lui-meme entre parentheses, ce qui alourdissait la colonne
+        # de gauche de chaque panneau -- deplacees en info-bulle (survol), le label
+        # reste court et la precision reste disponible sans occuper de place fixe.
+        label = tk.Label(root, text=text)
+        label.grid(row=row, column=column, columnspan=columnspan, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        if tooltip:
+            Tooltip(label, tooltip)
+        return label
+
+    def add_section_title(panel: str, title: str) -> None:
+        # Petite capitale muette (GUI_FONT_SMALL) au-dessus d'un groupe de
+        # reglages, sans ligne de separation -- pour le tout premier groupe de
+        # chaque panneau (rien a separer d'un groupe precedent) et, via
+        # add_separator ci-dessous, pour les suivants. Demande explicite d'un
+        # rendu "plus moderne" : une fenetre organisee en groupes nommes plutot
+        # qu'une seule longue liste coupee de traits fins anonymes.
+        label_col, ctrl_col = cols(panel)
+        tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG,
+                ).grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
+                       padx=ROW_PADX, pady=(0, 2))
+
+    def add_separator(panel: str, title: str | None = None) -> None:
+        label_col, ctrl_col = cols(panel)
+        tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
+            row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
+            padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        if title:
+            add_section_title(panel, title)
 
     tk.Label(root, text="Reglages photo", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
-            ).grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
+            ).grid(row=0, column=0, columnspan=TOTAL_COLUMNS, sticky="w",
+                   padx=ROW_PADX, pady=(10, SECTION_GAP))
 
     # Un setter par attribut expose ici, plutot qu'un simple `var.set(...)` : charger
     # un preset doit a la fois mettre a jour le widget ET args (et, pour style/wave/
@@ -1298,6 +1632,25 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # Sert aussi a lister les attributs sauvegardables quand on cree un preset
     # (`list(controls)`), le meme ensemble que ce que cette fenetre expose deja.
     controls: dict[str, Callable[[object], None]] = {}
+
+    # "Variation automatique": un curseur coche via son '~' (voir add_slider ci-
+    # dessous) est pilote par une COURBE propre a CE curseur, pas par une seule
+    # forme partagee -- a la demande explicite ("plus complexe qu'une sinusoide",
+    # "choisir moi-meme la courbe", "differentes variations a differents
+    # parametres"). `automation` n'accumule que les attributs marques
+    # automatable=True ; chaque entree garde ses propres points de controle
+    # (`points`, AUTOMATE_CURVE_POINTS valeurs dans [0, 1], interpolees lineairement
+    # et bouclees -- meme principe que `deform_envelope`/`render_ridge_line` dans
+    # audio2wave_ridge.py, adapte a un cycle qui boucle au lieu d'une largeur
+    # d'image) et sa propre periode (`period`, tk.DoubleVar). Chaque entree
+    # reutilise le setter deja expose par `controls[attr]` (met a jour le widget ET
+    # args d'un seul coup), donc le curseur visible bouge en meme temps que la
+    # valeur relue par run().
+    automation: dict[str, dict] = {}
+
+    # ============================= PANNEAU GAUCHE =============================
+    # Source (entree audio, tempo) puis reglages propres au style pencil (defaut).
+    add_section_title("left", "Source")
 
     # --- Entree audio: seule cette section (avec video/video2 plus bas) redemarre un
     # sous-processus au lieu de se contenter de muter args, voir la docstring. ---
@@ -1310,10 +1663,10 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["device"] = on_device_change
 
-    r = next_row()
-    tk.Label(root, text="Entree audio").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_row("left")
+    tk.Label(root, text="Entree audio").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     device_frame = tk.Frame(root)
-    device_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    device_frame.grid(row=r, column=1, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     device_menu = tk.OptionMenu(device_frame, device_var, device_var.get())
     style_option_menu(device_menu)
     device_menu.pack(side="left")
@@ -1332,7 +1685,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         status["text"] = f"{len(names)} entree(s) audio detectee(s)"
 
     tk.Button(device_frame, text="Actualiser", command=refresh_devices,
-             ).pack(side="left", padx=(6, 0))
+             ).pack(side="left", padx=(8, 0))
     refresh_devices()
 
     # --bpm/--beats: comme l'entree audio, une exception qui ne se contente pas de
@@ -1365,24 +1718,24 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     controls["bpm"] = set_bpm
     controls["beats"] = set_beats
 
-    r = next_row()
-    tk.Label(root, text="BPM").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_row("left")
+    tk.Label(root, text="BPM").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     tk.Scale(root, from_=40, to=220, resolution=1, orient="horizontal", variable=bpm_var,
-            length=220, showvalue=True, command=on_tempo_change,
-            ).grid(row=r, column=1, padx=8, pady=4)
+            length=170, showvalue=True, command=on_tempo_change,
+            ).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
 
-    r = next_row()
-    tk.Label(root, text="Temps par photo (--beats)").grid(row=r, column=0, sticky="w",
-                                                          padx=8, pady=4)
+    r = next_row("left")
+    add_label("Temps par photo", r, 0,
+             tooltip="Nombre de temps par photo (--beats). C'est aussi le rythme de "
+                     "rafraichissement.")
     tk.Scale(root, from_=0.25, to=32, resolution=0.25, orient="horizontal", variable=beats_var,
-            length=220, showvalue=True, command=on_tempo_change,
-            ).grid(row=r, column=1, padx=8, pady=4)
+            length=170, showvalue=True, command=on_tempo_change,
+            ).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
 
     # Separateur: l'entree audio est la source, tout ce qui suit jusqu'au prochain
-    # separateur decrit comment cette source est dessinee (memes separateurs fins que
-    # devant "Presets" plus bas, pour une seule et meme convention de regroupement).
-    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+    # separateur decrit comment cette source est dessinee (meme convention de
+    # regroupement que devant "Presets" plus bas).
+    add_separator("left", "Apparence")
 
     style_var = tk.StringVar(value=args.style)
 
@@ -1403,26 +1756,48 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["style"] = on_style_change
 
-    tk.Label(root, text="Style").grid(row=next_row(), column=0, sticky="w", padx=8, pady=4)
+    r = next_row("left")
+    tk.Label(root, text="Style").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     style_frame = tk.Frame(root)
-    style_frame.grid(row=row - 1, column=1, sticky="w", padx=8, pady=4)
+    style_frame.grid(row=r, column=1, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     for value in ("pencil", "rekordbox", "simple"):
         tk.Radiobutton(style_frame, text=value, variable=style_var, value=value,
                        command=on_style_change).pack(side="left")
 
     def add_slider(label: str, attr: str, lo: float, hi: float, step: float,
-                  initial: float | None = None) -> None:
-        r = next_row()
-        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+                  initial: float | None = None, panel: str = "left",
+                  tooltip: str | None = None, automatable: bool = False) -> None:
+        label_col, ctrl_col = cols(panel)
+        r = next_row(panel)
+        add_label(label, r, label_col, tooltip)
         var = tk.DoubleVar(value=initial if initial is not None else getattr(args, attr))
         is_int = step >= 1
 
         def on_change(_value: object = None) -> None:
             setattr(args, attr, int(var.get()) if is_int else round(var.get(), 3))
 
-        tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal",
-                variable=var, length=220, showvalue=True, command=on_change,
-                ).grid(row=r, column=1, padx=8, pady=4)
+        # Un curseur automatable empile sa case '~'/son bouton d'edition SOUS le
+        # curseur, dans un Frame de plus (meme mecanique que device_frame/
+        # video_frame ailleurs dans cette fenetre), plutot qu'a cote de lui : cote
+        # a cote, le curseur devait retrecir pour laisser la place, ce qui
+        # decalait sa piste par rapport a tous les autres curseurs de la fenetre
+        # (largeur incoherente d'une ligne a l'autre, bord droit en dents de scie
+        # -- constate a l'oeil, voir la demande "gere l'alignement"). Empile, le
+        # curseur garde la MEME largeur (170 px) et le MEME point de depart que
+        # partout ailleurs ; seule la ligne grandit un peu en hauteur, ce qui ne
+        # deplace aucune autre ligne (chaque ligne de la grille a sa propre
+        # hauteur, independante des autres).
+        holder = root
+        if automatable:
+            holder = tk.Frame(root)
+            holder.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+
+        scale = tk.Scale(holder, from_=lo, to=hi, resolution=step, orient="horizontal",
+                         variable=var, length=170, showvalue=True, command=on_change)
+        if automatable:
+            scale.pack(side="top", anchor="w")
+        else:
+            scale.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
 
         def set_value(value: object) -> None:
             var.set(value)
@@ -1430,16 +1805,146 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
         controls[attr] = set_value
 
-    def add_entry(label: str, attr: str, width_chars: int = 20) -> tk.StringVar:
-        r = next_row()
-        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        if automatable:
+            enabled_var = tk.BooleanVar(value=False)
+            automation[attr] = {
+                "label": label, "lo": lo, "hi": hi, "enabled": enabled_var,
+                "points": automate_curve_sinus(AUTOMATE_CURVE_POINTS),
+                "period": tk.DoubleVar(value=AUTOMATE_DEFAULT_PERIOD_S),
+                "start": time.monotonic(), "editor": None, "canvas": None,
+            }
+
+            def on_toggle(a=attr) -> None:
+                # Redemarre le cycle a son tout debut (point 0) au moment de cocher,
+                # plutot que de sauter directement a la phase correspondant a
+                # l'horloge globale: sinon la valeur ferait un saut arbitraire des
+                # l'activation au lieu de partir proprement du premier point de la
+                # courbe.
+                if automation[a]["enabled"].get():
+                    automation[a]["start"] = time.monotonic()
+
+            automate_row = tk.Frame(holder)
+            automate_row.pack(side="top", anchor="w", pady=(2, 0))
+
+            check = tk.Checkbutton(automate_row, text="~", variable=enabled_var,
+                                   command=on_toggle)
+            check.pack(side="left")
+            Tooltip(check, "Fait varier ce reglage tout seul en suivant sa propre courbe "
+                          "(bouton 'courbe' a cote) au lieu de le laisser fixe a la "
+                          "position du curseur.")
+
+            # Bouton volontairement plus discret que les boutons d'action de cette
+            # fenetre (Actualiser/Parcourir/Mesurer...) -- meme palette (un seul
+            # point de theme via style_gui, pas de couleur recreee ici), mais
+            # marges reduites pour rester a l'echelle d'un simple bouton d'edition
+            # accole a une case a cocher, pas une action principale.
+            edit_btn = tk.Button(automate_row, text="courbe", padx=4, pady=0,
+                                 command=lambda a=attr: open_curve_editor(a))
+            edit_btn.pack(side="left", padx=(4, 0))
+            Tooltip(edit_btn, "Ouvre l'editeur de courbe pour CE reglage : glisse les points "
+                              "a la souris pour dessiner une forme libre, ou part d'un preset "
+                              "(sinus/triangle/carre/dents de scie/aleatoire), et regle sa "
+                              "propre vitesse -- independant des autres reglages pilotes.")
+
+    def redraw_curve(attr: str) -> None:
+        state = automation[attr]
+        canvas = state["canvas"]
+        if canvas is None:
+            return
+        canvas.delete("all")
+        w, h = AUTOMATE_CANVAS_W, AUTOMATE_CANVAS_H
+        canvas.create_line(0, h / 2, w, h / 2, fill=GUI_MUTED_FG)
+        n = len(state["points"])
+        coords = []
+        for i, v in enumerate(state["points"]):
+            x = i * w / (n - 1)
+            y = h - v * h
+            coords.extend([x, y])
+        canvas.create_line(*coords, fill=GUI_ACCENT, width=2)
+        for i in range(0, len(coords), 2):
+            x, y = coords[i], coords[i + 1]
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=GUI_ACCENT, outline="")
+
+    def on_curve_drag(event: object, attr: str) -> None:
+        # L'index du point le plus proche est retrouve depuis event.x (les points
+        # sont espaces regulierement sur la largeur du canevas) plutot que de
+        # cliquer precisement sur un point existant: plus tolerant a la souris,
+        # et permet de "peindre" la courbe en glissant sans viser chaque point.
+        state = automation[attr]
+        n = len(state["points"])
+        idx = round(event.x * (n - 1) / AUTOMATE_CANVAS_W)
+        idx = max(0, min(n - 1, idx))
+        value = max(0.0, min(1.0, 1 - event.y / AUTOMATE_CANVAS_H))
+        state["points"][idx] = value
+        redraw_curve(attr)
+
+    def open_curve_editor(attr: str) -> None:
+        state = automation[attr]
+        existing = state["editor"]
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+
+        win = tk.Toplevel(root)
+        win.title(f"Variation automatique : {state['label']}")
+        win.resizable(False, False)
+        win.configure(bg=GUI_PANEL_BG)
+
+        canvas = tk.Canvas(win, width=AUTOMATE_CANVAS_W, height=AUTOMATE_CANVAS_H,
+                          bg=GUI_PANEL_BG, highlightthickness=1, highlightbackground=GUI_MUTED_FG)
+        canvas.pack(padx=14, pady=(14, 12))
+        state["canvas"] = canvas
+        canvas.bind("<Button-1>", lambda e: on_curve_drag(e, attr))
+        canvas.bind("<B1-Motion>", lambda e: on_curve_drag(e, attr))
+        redraw_curve(attr)
+
+        preset_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        preset_frame.pack(padx=14, pady=(0, 10))
+        presets = (
+            ("Sinus", automate_curve_sinus), ("Triangle", automate_curve_triangle),
+            ("Carre", automate_curve_carre), ("Dents de scie", automate_curve_dents_de_scie),
+            ("Aleatoire", automate_curve_aleatoire),
+        )
+        for name, curve_fn in presets:
+            def apply_preset(curve_fn=curve_fn) -> None:
+                automation[attr]["points"] = curve_fn(len(automation[attr]["points"]))
+                redraw_curve(attr)
+            tk.Button(preset_frame, text=name, command=apply_preset).pack(side="left", padx=3)
+
+        speed_row = tk.Frame(win, bg=GUI_PANEL_BG)
+        speed_row.pack(fill="x", padx=14, pady=(0, 12))
+        speed_label = tk.Label(speed_row, text="Vitesse")
+        speed_label.pack(side="left")
+        Tooltip(speed_label, "Vers la droite = plus rapide (cycle court), vers la gauche = "
+                            "plus lent (cycle long). Le chiffre est la duree d'un cycle "
+                            "complet en secondes.")
+        # from_=MAX, to=MIN (pas l'inverse) : la gauche du curseur est le plus lent,
+        # la droite le plus rapide, voir AUTOMATE_PERIOD_MIN_S/MAX_S plus haut.
+        tk.Scale(speed_row, from_=AUTOMATE_PERIOD_MAX_S, to=AUTOMATE_PERIOD_MIN_S, resolution=1,
+                orient="horizontal", variable=state["period"], length=140, showvalue=True,
+                ).pack(side="left", padx=(8, 0))
+
+        def on_close() -> None:
+            state["editor"] = None
+            state["canvas"] = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        tk.Button(win, text="Fermer", command=on_close).pack(pady=(0, 12))
+        state["editor"] = win
+
+    def add_entry(label: str, attr: str, width_chars: int = 18, panel: str = "left",
+                 tooltip: str | None = None) -> tk.StringVar:
+        label_col, ctrl_col = cols(panel)
+        r = next_row(panel)
+        add_label(label, r, label_col, tooltip)
         var = tk.StringVar(value=getattr(args, attr) or "")
 
         def apply(_evt=None) -> None:
             setattr(args, attr, var.get().strip() or None)
 
         entry = tk.Entry(root, textvariable=var, width=width_chars)
-        entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        entry.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
         entry.bind("<Return>", apply)
         entry.bind("<FocusOut>", apply)
 
@@ -1450,9 +1955,11 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         controls[attr] = set_value
         return var
 
-    def add_dropdown(label: str, attr: str, choices: tuple[str, ...]) -> None:
-        r = next_row()
-        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    def add_dropdown(label: str, attr: str, choices: tuple[str, ...], panel: str = "left",
+                     tooltip: str | None = None) -> None:
+        label_col, ctrl_col = cols(panel)
+        r = next_row(panel)
+        add_label(label, r, label_col, tooltip)
         var = tk.StringVar(value=getattr(args, attr))
 
         def on_change(*_args) -> None:
@@ -1461,12 +1968,19 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         var.trace_add("write", on_change)
         menu = tk.OptionMenu(root, var, *choices)
         style_option_menu(menu)
-        menu.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        menu.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
         controls[attr] = var.set
 
-    colors_var = add_entry("Couleur(s) (vide = defaut)", "colors")
-    bg_var = add_entry("Couleur de fond (vide = defaut)", "bg_color")
-    add_slider("Epaisseur du trait (px, pencil)", "line_width", 1, 10, 1)
+    colors_var = add_entry(
+        "Couleurs", "colors",
+        tooltip="Couleur(s) du trace. Une seule en pencil/simple, trois separees par | en "
+                "rekordbox (graves,medium,aigus). Vide = couleur par defaut du style.")
+    bg_var = add_entry(
+        "Couleur de fond", "bg_color",
+        tooltip="Couleur de fond, independante des couleurs du trace. Vide = fond par "
+                "defaut du style.")
+    add_slider("Epaisseur du trait", "line_width", 1, 10, 1,
+              tooltip="En pixels. --style pencil seul.", automatable=True)
 
     wave_on = tk.BooleanVar(value=args.wave is not None)
     wave_cycles = tk.IntVar(value=args.wave if args.wave else WAVE_CYCLES)
@@ -1482,25 +1996,57 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["wave"] = set_wave
 
-    r = next_row()
-    tk.Checkbutton(root, text="--wave (sinusoide, pencil)", variable=wave_on,
-                  command=on_wave_change).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_row("left")
+    wave_check = tk.Checkbutton(root, text="Sinusoide", variable=wave_on,
+                                command=on_wave_change)
+    wave_check.grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    Tooltip(wave_check, "--wave : trace une sinusoide bornee par l'amplitude a la place du "
+                       "contour. --style pencil seul. Le curseur regle le nombre "
+                       "d'oscillations sur la largeur.")
     tk.Scale(root, from_=1, to=64, resolution=1, orient="horizontal", variable=wave_cycles,
-            length=220, showvalue=True,
-            command=lambda _v: on_wave_change()).grid(row=r, column=1, padx=8, pady=4)
+            length=170, showvalue=True,
+            command=lambda _v: on_wave_change()).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
 
-    add_slider("Points / colonnes (0=plein)", "columns", 0, 400, 4,
-              initial=args.columns if args.columns is not None else PENCIL_POINTS)
+    add_slider("Points / colonnes", "columns", 0, 400, 4,
+              initial=args.columns if args.columns is not None else PENCIL_POINTS,
+              tooltip="Nombre de points de la polyligne en pencil (grossierete du trait), "
+                      "ou de colonnes dessinees sinon. 0 = une colonne par pixel.",
+              automatable=True)
 
-    # Video/video2 (pencil seul): regroupees avec le reste des controles pencil
-    # ci-dessus plutot que plus bas avec le dossier PNG, purement pour la lecture de
-    # la fenetre -- elles n'ont de sens qu'en pencil, comme wave/points juste avant.
-    # A la difference des autres controles de ce bloc, un changement ici redemarre le
-    # VideoSource concerne (voir run()), pas juste une mutation d'args. Cherche tel
-    # quel puis dans --asset-dir, comme au demarrage (parse_args/find_asset); un
-    # chemin introuvable est signale en statut sans toucher a args.video, pour ne pas
-    # couper la video en cours sur une faute de frappe pas encore corrigee.
-    def make_video_field(label: str, attr: str) -> None:
+    # --kick-glow (pencil seul): purement decoratif, voir detect_kicks. Case a
+    # cocher + curseur de rayon, meme mecanique que --wave juste au-dessus.
+    kick_glow_var = tk.BooleanVar(value=args.kick_glow)
+
+    def on_kick_glow_change(value: object = None) -> None:
+        if value is not None:
+            kick_glow_var.set(bool(value))
+        args.kick_glow = kick_glow_var.get()
+
+    controls["kick_glow"] = on_kick_glow_change
+
+    r = next_row("left")
+    kick_glow_check = tk.Checkbutton(root, text="Halo sur les kicks", variable=kick_glow_var,
+                                     command=on_kick_glow_change)
+    kick_glow_check.grid(row=r, column=0, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    Tooltip(kick_glow_check, "Ajoute un halo blanc sur le trait a chaque attaque (kick) "
+                            "detectee dans le signal. --style pencil seul, purement "
+                            "decoratif.")
+
+    add_slider("Rayon du halo", "kick_glow_size", 5, 150, 5,
+              tooltip="En pixels, pour le halo sur les kicks ci-dessus.", automatable=True)
+
+    # ============================= PANNEAU DROIT =============================
+    # Video (pencil), reglages propres a rekordbox/simple, puis gain/sortie —
+    # s'appliquent quel que soit le style, contrairement au panneau gauche.
+    add_section_title("right", "Video")
+
+    # Video/video2 (pencil seul). A la difference des autres controles de ce bloc,
+    # un changement ici redemarre le VideoSource concerne (voir run()), pas juste
+    # une mutation d'args. Cherche tel quel puis dans --asset-dir, comme au
+    # demarrage (parse_args/find_asset); un chemin introuvable est signale en
+    # statut sans toucher a args.video, pour ne pas couper la video en cours sur
+    # une faute de frappe pas encore corrigee.
+    def make_video_field(label: str, attr: str, tooltip: str) -> None:
         current = getattr(args, attr)
         var = tk.StringVar(value=str(current) if current else "")
 
@@ -1521,24 +2067,57 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
         controls[attr] = set_value
 
-        r = next_row()
-        tk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        entry = tk.Entry(root, textvariable=var, width=20)
-        entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        r = next_row("right")
+        add_label(label, r, RIGHT_LABEL_COL, tooltip)
+        video_frame = tk.Frame(root)
+        video_frame.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        entry = tk.Entry(video_frame, textvariable=var, width=14)
+        entry.pack(side="left")
         entry.bind("<Return>", apply)
         entry.bind("<FocusOut>", apply)
 
-    make_video_field("Video interieure (vide = aucune, pencil)", "video")
-    make_video_field("Video exterieure (vide = aucune, pencil)", "video2")
+        def on_browse() -> None:
+            # initialdir: le dossier du fichier deja saisi s'il existe, sinon
+            # --asset-dir (ou il atterrirait de toute facon apres resolution par
+            # find_asset), pour ouvrir la boite de dialogue la ou les clips vivent
+            # plutot qu'au dossier courant a chaque fois.
+            current_path = getattr(args, attr)
+            start_dir = (current_path.parent if current_path and current_path.parent.is_dir()
+                        else args.asset_dir if args.asset_dir.is_dir() else None)
+            chosen = filedialog.askopenfilename(
+                title=f"Choisir : {label}",
+                initialdir=str(start_dir) if start_dir else None,
+                filetypes=[("Videos", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
+                          ("Tous les fichiers", "*.*")],
+            )
+            if chosen:
+                var.set(chosen)
+                apply()
 
-    # Separateur: bascule des controles pencil ci-dessus aux controles rekordbox/
-    # simple ci-dessous (echelle/filtre/crossover) -- deux groupes qui ne
-    # s'appliquent jamais en meme temps, autant les distinguer visuellement.
-    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+        tk.Button(video_frame, text="Parcourir...", command=on_browse,
+                 ).pack(side="left", padx=(8, 0))
 
-    add_dropdown("Echelle (rekordbox/simple)", "scale", ("lin", "log", "sqrt", "cbrt"))
-    add_dropdown("Filtre colonne (rekordbox/simple)", "filter_mode", ("peak", "average"))
+    make_video_field(
+        "Video interieure", "video",
+        tooltip="Fichier video joue en boucle entre les deux traits de l'enveloppe "
+                "(amplitude min/max). --style pencil seul. Vide = aucune.")
+    make_video_field(
+        "Video exterieure", "video2",
+        tooltip="Deuxieme fichier video, joue en boucle hors de la bande d'enveloppe "
+                "(au-dessus et en dessous), independante de la video interieure. "
+                "--style pencil seul. Vide = aucune.")
+
+    # Separateur: bascule des controles video ci-dessus aux controles rekordbox/
+    # simple ci-dessous (echelle/filtre/crossover).
+    add_separator("right", "Rekordbox / Simple")
+
+    add_dropdown("Echelle", "scale", ("lin", "log", "sqrt", "cbrt"), panel="right",
+                tooltip="Echelle d'amplitude. lin = fidele, sqrt/cbrt/log remontent les "
+                        "passages faibles. --style rekordbox/simple seuls.")
+    add_dropdown("Filtre colonne", "filter_mode", ("peak", "average"), panel="right",
+                tooltip="Valeur retenue par colonne de pixels: peak garde les transitoires, "
+                        "average donne une enveloppe plus lisse. --style rekordbox/simple "
+                        "seuls.")
 
     low0, high0 = DEFAULT_CROSSOVER
     if args.crossover:
@@ -1564,20 +2143,20 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["crossover"] = set_crossover
 
-    r = next_row()
-    tk.Label(root, text="Crossover Hz (rekordbox)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_row("right")
+    add_label("Crossover Hz", r, RIGHT_LABEL_COL,
+             tooltip="Coupures entre bandes en Hz, graves et aigus. --style rekordbox seul.")
     cross_frame = tk.Frame(root)
-    cross_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    cross_frame.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     for var in (low_var, high_var):
-        entry = tk.Entry(cross_frame, textvariable=var, width=8)
+        entry = tk.Entry(cross_frame, textvariable=var, width=6)
         entry.pack(side="left", padx=(0, 6))
         entry.bind("<Return>", apply_crossover)
         entry.bind("<FocusOut>", apply_crossover)
 
     # Separateur: bascule des controles de trace (rekordbox/simple ci-dessus) au
     # gain, qui s'applique lui a tous les styles.
-    tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+    add_separator("right", "Sortie")
 
     # Gain: "auto" (str) ou un nombre en dB (float), voir gain_value(). Case a cocher
     # + curseur plutot que deux widgets independants, pour eviter qu'un utilisateur
@@ -1598,15 +2177,18 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["gain"] = set_gain
 
-    r = next_row()
-    tk.Checkbutton(root, text="Gain automatique (crete de chaque photo)",
-                  variable=gain_auto_var, command=on_gain_change,
-                  ).grid(row=r, column=0, columnspan=2, sticky="w", padx=8, pady=4)
-    r = next_row()
-    tk.Label(root, text="Gain manuel (dB)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_row("right")
+    gain_auto_check = tk.Checkbutton(root, text="Gain automatique", variable=gain_auto_var,
+                                     command=on_gain_change)
+    gain_auto_check.grid(row=r, column=RIGHT_LABEL_COL, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    Tooltip(gain_auto_check, "Normalise chaque photo independamment sur sa propre crete, "
+                            "plutot qu'un gain fixe.")
+    r = next_row("right")
+    add_label("Gain manuel", r, RIGHT_LABEL_COL,
+             tooltip="En dB, actif quand gain automatique est decoche.")
     tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
-            length=220, showvalue=True, command=lambda _v: on_gain_change(),
-            ).grid(row=r, column=1, padx=8, pady=4)
+            length=170, showvalue=True, command=lambda _v: on_gain_change(),
+            ).grid(row=r, column=RIGHT_CTRL_COL, padx=ROW_PADX, pady=ROW_PADY)
 
     # Tuning: mesure la crete (et le facteur de crete, pour detecter un ecretage
     # AVANT capture, voir TUNE_CLIP_*) de la derniere fenetre pleine capturee, et
@@ -1638,12 +2220,12 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                 "parametres son de Windows) plutot que le gain.")
         status["text"] = text
 
-    r = next_row()
-    tk.Label(root, text="Tuning").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_row("right")
+    tk.Label(root, text="Tuning").grid(row=r, column=RIGHT_LABEL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     tk.Button(root, text="Mesurer", command=on_tune).grid(
-        row=r, column=1, sticky="w", padx=8, pady=4)
+        row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
 
-    add_slider("Images/s du trace", "draw_fps", 0, 60, 1)
+    add_slider("Images/s du trace", "draw_fps", 0, 60, 1, panel="right")
 
     # --save-dir: le dossier initial est deja cree par main() avant l'ouverture de la
     # fenetre; un dossier saisi ici doit l'etre aussi, sinon write_png (qui ne cree pas
@@ -1665,22 +2247,71 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["save_dir"] = set_save_dir
 
-    r = next_row()
-    tk.Label(root, text="Dossier PNG (vide = desactive)").grid(row=r, column=0, sticky="w",
-                                                               padx=8, pady=4)
-    save_entry = tk.Entry(root, textvariable=save_var, width=20)
-    save_entry.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    r = next_row("right")
+    add_label("Dossier PNG", r, RIGHT_LABEL_COL,
+             tooltip="Enregistre aussi chaque photo en PNG dans ce dossier, cree au "
+                     "besoin. Vide = desactive.")
+    save_entry = tk.Entry(root, textvariable=save_var, width=18)
+    save_entry.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     save_entry.bind("<Return>", apply_save_dir)
     save_entry.bind("<FocusOut>", apply_save_dir)
+
+    # =========================== SECTION PARTAGEE ===========================
+    # A partir d'ici, tout court sur la largeur totale des deux panneaux, sous le
+    # plus bas des deux (row_shared) : separateur fin de section, ligne verticale
+    # entre panneaux (maintenant que leur hauteur finale est connue), presets,
+    # statut.
+    row_shared = max(row_left, row_right)
+
+    def next_shared_row() -> int:
+        nonlocal row_shared
+        row_shared += 1
+        return row_shared - 1
+
+    tk.Frame(root, bg=GUI_PANEL_BG, width=1).grid(
+        row=1, column=SPACER_COL, rowspan=row_shared - 1, sticky="ns", padx=ROW_PADX + 4)
+
+    # --- Variation automatique : pas de reglages partages ici, chaque curseur
+    # automatable (epaisseur, points/colonnes, rayon du halo) a deja sa propre
+    # courbe et sa propre vitesse, editables via son bouton "C" (voir add_slider/
+    # open_curve_editor plus haut). Reste seulement le tick qui les fait avancer.
+    def automate_tick() -> None:
+        # Tourne dans le fil tkinter (root.after), jamais dans run(): les curseurs
+        # pilotes restent une simple mutation d'attribut relue a la photo suivante,
+        # exactement comme un reglage change a la souris (voir la docstring de
+        # cette fonction). S'arrete de se reprogrammer des que la fenetre video est
+        # fermee, meme logique que refresh() plus bas pour le statut.
+        if finished_event.is_set():
+            return
+        now = time.monotonic()
+        for attr, state in automation.items():
+            if not state["enabled"].get():
+                continue
+            period = max(0.5, state["period"].get())
+            points = state["points"]
+            n = len(points)
+            elapsed = now - state["start"]
+            pos = (elapsed / period % 1.0) * n
+            i0 = int(pos) % n
+            i1 = (i0 + 1) % n
+            frac = pos - int(pos)
+            v = points[i0] + (points[i1] - points[i0]) * frac
+            lo, hi = state["lo"], state["hi"]
+            controls[attr](round(lo + (hi - lo) * v, 3))
+        root.after(AUTOMATE_TICK_MS, automate_tick)
+
+    root.after(AUTOMATE_TICK_MS, automate_tick)
 
     # --- Presets : charger un jeu integre/sauvegarde, ou sauvegarder l'etat courant ---
     # Placee en dernier pour que `controls` soit deja completement rempli (le bloc
     # "Sauvegarder" en a besoin pour savoir quels attributs capturer).
     tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
+        row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="ew",
+        padx=ROW_PADX, pady=(SECTION_GAP, 0))
 
     tk.Label(root, text="Presets", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
-            ).grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
+            ).grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
+                   padx=ROW_PADX, pady=(10, SECTION_GAP))
 
     def apply_preset(overrides: dict) -> list[str]:
         """Applique les cles d'un preset aux widgets+args ; renvoie celles ignorees
@@ -1694,10 +2325,10 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         return skipped
 
     preset_var = tk.StringVar(value="")
-    r = next_row()
-    tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_shared_row()
+    tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     preset_frame = tk.Frame(root)
-    preset_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+    preset_frame.grid(row=r, column=1, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     preset_menu = tk.OptionMenu(preset_frame, preset_var, "")
     style_option_menu(preset_menu)
     preset_menu.pack(side="left")
@@ -1730,38 +2361,58 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             text += f" (ignore, deja fige au lancement: {', '.join(skipped)})"
         status["text"] = text
 
-    tk.Button(preset_frame, text="Charger", command=on_load_preset).pack(side="left", padx=(6, 0))
+    tk.Button(preset_frame, text="Charger", command=on_load_preset).pack(side="left", padx=(8, 0))
 
     def capture_overrides() -> dict:
         # Capture args (pas les widgets) : args est la source de verite deja tenue
         # a jour par chaque setter, pas besoin de relire/convertir chaque widget.
+        # Bug corrige : seul save_dir etait converti de Path en str avant le
+        # json.dumps de save_user_preset -- video/video2 (aussi des Path des que
+        # find_asset() les a resolus, voir make_video_field) levaient une
+        # TypeError JSON silencieuse des qu'une video etait active, avalee par
+        # le gestionnaire d'exceptions par defaut de Tkinter (aucune erreur
+        # visible, juste rien qui se passe) : "Sauvegarder"/"Mettre a jour"
+        # semblaient ne plus rien faire des qu'une video etait choisie, signale
+        # par l'utilisateur. Conversion generalisee a TOUT attribut Path, pas
+        # seulement save_dir : plus robuste qu'ajouter un cas special de plus
+        # par attribut au fil du temps.
         overrides = {attr: getattr(args, attr) for attr in controls}
-        if isinstance(overrides.get("save_dir"), Path):
-            overrides["save_dir"] = str(overrides["save_dir"])  # JSON n'a pas de type Path
+        for key, value in overrides.items():
+            if isinstance(value, Path):
+                overrides[key] = str(value)
         return overrides
 
     def on_update_preset() -> None:
+        # Autorise desormais a "mettre a jour" un preset INTEGRE (ex. "club"),
+        # a la demande explicite -- refuse au premier jet, par prudence
+        # excessive. Ecrit toujours dans le JSON utilisateur, jamais dans le
+        # code : `all_presets()` fait deja gagner l'utilisateur sur un nom
+        # identique (voir sa docstring), donc "mettre a jour" un preset
+        # integre cree juste une version personnalisee qui le remplace pour
+        # cette machine -- le preset d'origine, dans PRESETS, reste intact et
+        # reapparait si l'entree utilisateur est supprimee du JSON.
         name = preset_var.get()
         if not name:
             status["text"] = "aucun preset selectionne"
             return
-        if name in PRESETS:
-            status["text"] = f"'{name}' est un preset integre, ne peut pas etre modifie"
-            return
         save_user_preset(name, capture_overrides())
-        status["text"] = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
+        text = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
+        if name in PRESETS:
+            text += " -- remplace desormais le preset integre du meme nom sur cette machine"
+        status["text"] = text
 
     tk.Button(preset_frame, text="Mettre a jour", command=on_update_preset,
-             ).pack(side="left", padx=(6, 0))
+             ).pack(side="left", padx=(8, 0))
 
     save_name_var = tk.StringVar(value="")
-    r = next_row()
-    tk.Label(root, text="Sauvegarder sous").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+    r = next_shared_row()
+    tk.Label(root, text="Sauvegarder sous").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     save_preset_frame = tk.Frame(root)
-    save_preset_frame.grid(row=r, column=1, sticky="w", padx=8, pady=4)
-    tk.Entry(save_preset_frame, textvariable=save_name_var, width=14).pack(side="left")
+    save_preset_frame.grid(row=r, column=1, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    save_name_entry = tk.Entry(save_preset_frame, textvariable=save_name_var, width=14)
+    save_name_entry.pack(side="left")
 
-    def on_save_preset() -> None:
+    def on_save_preset(_evt: object = None) -> None:
         name = save_name_var.get().strip().lower()
         if not name:
             status["text"] = "nom de preset vide"
@@ -1774,15 +2425,28 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         save_name_var.set("")
         status["text"] = f"preset '{name}' sauvegarde ({USER_PRESETS_PATH})"
 
+    # Appuyer sur Entree valide, comme tous les autres champs texte de cette
+    # fenetre (couleurs, video, crossover, dossier PNG...) -- sans ce bind, taper
+    # un nom puis Entree (le reflexe naturel apres tous ces autres champs) ne
+    # faisait RIEN : seul un clic explicite sur "Sauvegarder" fonctionnait,
+    # signale par l'utilisateur comme "aucun effet". Pas de <FocusOut> ici a la
+    # difference des autres champs : ceux-la *valident* une valeur deja saisie en
+    # continu (le champ reste rempli), sauvegarder un preset est une action
+    # ponctuelle avec un nom qui se vide juste apres -- cliquer ailleurs sans
+    # avoir voulu sauvegarder ne doit pas declencher une sauvegarde surprise.
+    save_name_entry.bind("<Return>", on_save_preset)
+
     tk.Button(save_preset_frame, text="Sauvegarder", command=on_save_preset,
-             ).pack(side="left", padx=(6, 0))
+             ).pack(side="left", padx=(8, 0))
 
     tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-        row=next_row(), column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
+        row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="ew",
+        padx=ROW_PADX, pady=(SECTION_GAP, 0))
 
     status_label = tk.Label(root, text="", justify="left", anchor="w", fg=GUI_ACCENT,
                             font=GUI_FONT_MONO)
-    status_label.grid(row=next_row(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 10))
+    status_label.grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
+                      padx=ROW_PADX, pady=(8, 8))
 
     def refresh() -> None:
         status_label.config(text=status.get("text", ""))
@@ -1928,14 +2592,21 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                     last_colors = color_resolved
 
                 columns = None
+                kicks = None
                 if args.style == "pencil":
                     # Le trace est fige pour toute la photo; seule la video, si elle
                     # est active, continuera de bouger dessous pendant le balayage.
+                    # Les kicks aussi: detectes une fois sur le bloc PCM entier de la
+                    # photo, comme les hauteurs -- pas quelque chose que le balayage
+                    # recalcule au fil de l'eau.
                     columns = pencil_heights(args, pcm, gain, size)
+                    kicks = (detect_kicks(pcm, channel_count(args), capture_rate(args), size[0])
+                             if args.kick_glow else None)
                     frame = compose_pencil(size, columns, background, ink,
                                            max(1, args.line_width),
                                            video.latest() if video else None,
-                                           video_out.latest() if video_out else None)
+                                           video_out.latest() if video_out else None,
+                                           kicks=kicks, kick_glow_radius=args.kick_glow_size)
                     if png:
                         write_png(size, frame, png)
                 else:
@@ -1956,7 +2627,12 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             # par photo noierait le terminal. Ecrite avant le trace, qui occupe tout le
             # temps restant du creneau.
             level = "silence" if peak is None else f"crete {peak:5.1f} dBFS -> gain {gain:+5.1f} dB"
-            text = (f"[{time.strftime('%H:%M:%S')}] {level}"
+            # Diagnostic direct de --kick-glow: sans ca, "je ne vois pas le halo"
+            # ne dit pas si le detecteur ne trouve rien ou si le halo est juste
+            # trop discret a l'oeil -- affiche le compte a chaque photo, pas
+            # seulement quand des kicks sont trouves, pour voir aussi le cas 0.
+            kick_info = f", {len(kicks) if kicks is not None else 0} kick(s)" if args.kick_glow else ""
+            text = (f"[{time.strftime('%H:%M:%S')}] {level}{kick_info}"
                     f"{f' -> {png.name}' if png else ''}")
             status["text"] = text
             print(f"\r{text}   ", end="", flush=True)
@@ -1966,7 +2642,8 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             if (video is not None or video_out is not None) and columns is not None:
                 ok = draw_pencil_video_progressively(
                     viewer, previous_frame, columns, size, background, ink,
-                    max(1, args.line_width), video, video_out, next_at, args.draw_fps)
+                    max(1, args.line_width), video, video_out, next_at, args.draw_fps,
+                    kicks=kicks, kick_glow_radius=args.kick_glow_size)
                 if not ok:
                     break  # fenetre fermee
                 # Le canevas de depart du PROCHAIN balayage ne doit jamais porter ce
@@ -2057,6 +2734,8 @@ def main() -> None:
             if args.video2:
                 print(f"  (video hors de l'amplitude min et max: {args.video2}, en boucle, "
                       f"recadree en {size[0]}x{size[1]})")
+            if args.kick_glow:
+                print(f"  (halo blanc sur les kicks detectes, rayon {args.kick_glow_size} px)")
         else:
             print(" ".join(f'"{c}"' if " " in c else c for c in
                            render_command(args, 0.0, size, sample_png)))
@@ -2097,6 +2776,8 @@ def main() -> None:
     if args.video2:
         print(f"Video hors de l'amplitude min et max: {args.video2.name}, en boucle, "
               f"recadree en {size[0]}x{size[1]}.", flush=True)
+    if args.kick_glow:
+        print(f"Halo blanc sur les kicks detectes, rayon {args.kick_glow_size} px.", flush=True)
     if args.draw_fps > 0:
         print(f"Trace progressif a {args.draw_fps} img/s, termine pile au rafraichissement.",
               flush=True)

@@ -28,8 +28,8 @@ from pathlib import Path
 
 from common import (
     GUI_ACCENT, GUI_ACCENT_FG, GUI_BG, GUI_FG, GUI_FONT, GUI_FONT_BOLD, GUI_FONT_HEADING,
-    GUI_FONT_MONO, GUI_MUTED_FG, GUI_PANEL_BG, auto_win_size, gain_value, parse_size,
-    style_gui, style_option_menu,
+    GUI_FONT_MONO, GUI_FONT_SMALL, GUI_MUTED_FG, GUI_PANEL_BG, auto_win_size, gain_value,
+    parse_size, style_gui, style_option_menu,
 )
 
 # Correction appliquee au-dessus d'une normalisation de crete, pour que le trace
