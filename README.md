@@ -420,7 +420,9 @@ permet de **charger** un preset, d'en **sauvegarder un nouveau** ou de **mettre 
 jour** un preset utilisateur existant a partir des reglages courants — pratique
 pour retrouver en un clic une combinaison style/couleurs/gain/etc. deja reglee a
 l'oreille pendant une session precedente, ou pour affiner un preset deja
-sauvegarde sans repartir de zero.
+sauvegarde sans repartir de zero. **Charger se fait en choisissant simplement le
+preset dans le menu deroulant** — il s'applique immediatement des la selection,
+pas besoin de cliquer un bouton "Charger" en plus.
 
 Les presets sauvegardes depuis la fenetre atterrissent dans
 `~/.audio2wave/snap_presets.json` (cree au besoin) et sont **immediatement
@@ -431,11 +433,14 @@ python audio2wave_snap.py -d "<entree>" --preset mon_preset
 python audio2wave_snap.py --list-presets   # liste aussi les presets utilisateur
 ```
 
-Sauvegarder (nouveau nom) et Mettre a jour (preset selectionne dans **Charger**)
-capturent tous les deux tout ce que la fenetre expose (style, couleurs,
+Sauvegarder (nouveau nom) et Mettre a jour (preset selectionne dans le menu
+**Charger**) capturent tous les deux tout ce que la fenetre expose (style, couleurs,
 epaisseur, `--wave`, points/colonnes, echelle, filtre, crossover, gain, images/s,
 dossier PNG) — pas seulement les quelques options choisies a la main dans les
-presets integres. **Mettre a jour** peut aussi cibler un preset integre (`wave`,
+presets integres. **La taille de fenetre (largeur/hauteur) n'en fait pas
+partie** : elle reste independante des reglages visuels, un preset ne la
+change jamais, meme si elle etait differente au moment de sauvegarder.
+**Mettre a jour** peut aussi cibler un preset integre (`wave`,
 `club`, `rekordbox`, `editor`...) : ca cree une version personnalisee dans le
 JSON utilisateur qui le remplace desormais sur cette machine (`--preset club`
 lira alors cette version), sans toucher au preset d'origine dans le code —
@@ -447,6 +452,49 @@ Charger un preset qui contient une option figee au lancement
 options ne peuvent de toute facon pas se relancer en direct sans redemarrer le
 programme (voir la section `--gui` plus bas) — et l'indique dans la ligne de
 statut.
+
+### Mode VJ (enchainement de presets pour un set entier)
+
+Un bouton **Mode VJ -- Ouvrir...** dans la fenetre `--gui` ouvre un petit popup
+pour planifier un enchainement de presets sur toute la duree d'un set :
+
+1. **Ajouter** une entree : choisis un preset (integre ou utilisateur, meme
+   liste que **Charger**) et une duree en minutes, puis **Ajouter** — elle
+   rejoint la fin de la liste.
+2. Reordonne avec **Monter**/**Descendre**, retire une entree avec
+   **Supprimer**. Les durees sont relatives : deplacer une entree decale
+   automatiquement l'horaire de toutes celles qui suivent, pas besoin de
+   recalculer quoi que ce soit a la main.
+3. **Demarrer VJ** lance l'enchainement : le premier preset s'applique
+   immediatement, puis chaque suivant a l'echeance cumulee de son tour — et le
+   tout **boucle** indefiniment une fois la liste epuisee, pour couvrir un set
+   qui dure plus longtemps que prevu. **Arreter VJ** fige le preset en cours.
+
+```bash
+python audio2wave_snap.py -d "<entree>" --gui
+# Mode VJ -> Ouvrir... -> ajoute quelques presets avec leurs durees -> Demarrer VJ
+```
+
+Chaque changement planifie appelle exactement la meme logique que le bouton
+**Charger** (`apply_preset()`) : une entree qui reference une option figee au
+lancement est ignoree de la meme facon, et signalee dans le statut. Fermer le
+popup ne perd rien — l'enchainement continue de tourner en arriere-plan, et la
+liste reapparait telle quelle a la reouverture ; c'est volontaire, pour ne pas
+avoir a garder cette fenetre ouverte pendant tout le set.
+
+**L'enchainement lui-meme se sauvegarde**, en haut du popup :
+
+- **Enchainement** (menu deroulant) + **Charger** : remplace la liste en cours
+  par un enchainement deja sauvegarde.
+- **Mettre a jour** : reecrit l'enchainement selectionne dans le menu avec la
+  liste courante.
+- **Sauvegarder sous** (champ nom + bouton, Entree fonctionne aussi) : cree un
+  nouvel enchainement a partir de la liste courante.
+
+Stocke dans `~/.audio2wave/snap_vj_setlists.json`, separement des presets
+(`snap_presets.json`) — utile pour retrouver en un clic le plan d'un set
+complet joue un soir precedent, sans avoir a re-saisir chaque preset et sa
+duree.
 
 ## Styles (`--style`)
 
@@ -726,11 +774,26 @@ partie des presets (une preference de session, pas un reglage de rendu).
 python audio2wave_snap.py -d "<entree>" --gui   # coche ~ sur "Epaisseur du trait", bouton courbe pour l'editer
 ```
 
+**Taille fenetre** (largeur/hauteur en pixels, deux champs comme Crossover Hz) et
+**Plein ecran** (case juste a cote) redemarrent la fenetre video (et les
+`--video`/`--video2` actives, recadrees a la nouvelle taille) — une coupure de
+quelques centaines de ms, comme changer d'entree audio ou de video. Les champs
+de taille sont pre-remplis avec la resolution courante ; tant qu'on n'y touche
+pas, le comportement automatique (ecran entier ou un tiers de sa hauteur) reste
+actif. **Decocher "Plein ecran" est le moyen de sortir d'une fenetre ouverte en
+plein ecran sur le mauvais moniteur** (ou simplement coincee) : la nouvelle
+fenetre s'ouvre en mode normal, deplacable a la souris comme n'importe quelle
+fenetre. La nouvelle fenetre tente de reprendre la position de l'ancienne
+(comme `audio2wave_live.py`) ; en mode fenetre ca fonctionne, en plein ecran
+c'est une tentative non confirmee sur un vrai poste multi-ecran — si "Plein
+ecran" retombe encore sur le mauvais moniteur, le contournement fiable reste
+de decocher, deplacer la fenetre normale vers le bon ecran a la souris, puis
+recocher.
+
 **Ce qui reste volontairement hors de cette fenetre** : `--stereo`,
-`--split-channels`, `--rate`, `--buffer`, `--size`, `--interval` (remplace par
-BPM/temps ci-dessus), `--fullscreen`. Tous sont figes des le lancement — dans la
-commande de capture (nombre de canaux, frequence, taille du tampon) ou dans la
-fenetre ffplay deja ouverte (taille, plein ecran) — donc les changer en direct
+`--split-channels`, `--rate`, `--buffer`, `--interval` (remplace par
+BPM/temps ci-dessus). Tous sont figes des le lancement dans la commande de
+capture (nombre de canaux, frequence, taille du tampon) — donc les changer en direct
 desynchroniserait carrement le flux audio ou n'aurait aucun effet.
 
 **Changer de style reinitialise les champs couleur** (vides = defaut du nouveau

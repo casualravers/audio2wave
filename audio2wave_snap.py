@@ -38,10 +38,12 @@ except ImportError:  # tkinter absent de certaines installations minimales de Py
     filedialog = None
 
 from audio2wave import (
-    GUI_ACCENT, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL, GUI_MUTED_FG,
-    GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
+    GUI_ACCENT, GUI_ACCENT_FG, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL,
+    GUI_MUTED_FG, GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
-from audio2wave_live import list_audio_devices, primary_screen_size, require_tools
+from audio2wave_live import (
+    find_window_position, list_audio_devices, primary_screen_size, require_tools,
+)
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
 # transite par Python entre la capture et le rendu: fixer le format a la sortie de
@@ -201,6 +203,26 @@ def automate_curve_dents_de_scie(n: int) -> list[float]:
 def automate_curve_aleatoire(n: int) -> list[float]:
     return [random.random() for _ in range(n)]
 
+
+# --gui: "Mode VJ" enchaine une LISTE ORDONNEE de presets sur des durees
+# relatives (pas d'horaires absolus : deplacer une entree decale
+# automatiquement tout ce qui suit, plus simple a reordonner en direct) --
+# demande explicite pour planifier un enchainement sur un set entier. Boucle
+# a la fin (pas d'arret ni de blocage sur le dernier preset). Reutilise
+# integralement `apply_preset()` (le meme mecanisme que le bouton "Charger"),
+# donc un preset de l'enchainement peut contenir des options figees au
+# lancement (--fullscreen, etc.) sans planter -- juste ignorees, comme
+# "Charger" le fait deja.
+VJ_TICK_MS = 500                 # frequence de verification (secondes/minutes en jeu, pas besoin
+                                  # de la cadence fine d'AUTOMATE_TICK_MS)
+VJ_DEFAULT_DURATION_MIN = 5.0     # duree par defaut d'une nouvelle entree, en minutes
+
+
+def format_mmss(total_seconds: float) -> str:
+    total_seconds = max(0, round(total_seconds))
+    return f"{total_seconds // 60}:{total_seconds % 60:02d}"
+
+
 # Duree d'audio visee par colonne dessinee, quand une photo resume plusieurs secondes.
 # En dessous d'un cycle de basse (10 ms a 100 Hz), une colonne attrape un bout de cycle
 # au hasard et le trace part en peigne de traits fins; au-dela, chaque colonne resume
@@ -291,6 +313,37 @@ def all_presets() -> dict[str, dict]:
     merged = dict(PRESETS)
     merged.update(load_user_presets())
     return merged
+
+
+# Enchainements du "Mode VJ" (voir build_gui) sauvegardes depuis --gui : meme
+# mecanique que USER_PRESETS_PATH/load_user_presets/save_user_preset ci-dessus
+# (fichier JSON dans le profil utilisateur, absent/illisible = liste vide,
+# jamais une erreur bloquante), fichier separe plutot que reutiliser
+# snap_presets.json -- un enchainement (liste ordonnee de {preset, duration_s})
+# et un preset (dict d'overrides argparse) sont deux formes de donnees
+# distinctes, les melanger dans un seul fichier aurait complique la lecture des
+# deux sans rien apporter. Pas d'equivalent de PRESETS/all_presets() ici : un
+# enchainement n'a pas de version "integree au code", donc pas de fusion a
+# faire, juste ce fichier.
+VJ_SETLISTS_PATH = Path.home() / ".audio2wave" / "snap_vj_setlists.json"
+
+
+def load_vj_setlists() -> dict[str, list[dict]]:
+    if not VJ_SETLISTS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(VJ_SETLISTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_vj_setlist(name: str, entries: list[dict]) -> None:
+    setlists = load_vj_setlists()
+    setlists[name] = entries
+    VJ_SETLISTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    VJ_SETLISTS_PATH.write_text(
+        json.dumps(setlists, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
 def describe_presets() -> str:
@@ -775,7 +828,17 @@ def build_render_args(args: argparse.Namespace, graph: str, png: Path | None) ->
     ] + outputs
 
 
-def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]:
+def window_title(args: argparse.Namespace) -> str:
+    """Extrait de viewer_command pour etre reutilisable par find_window_position()
+    (meme principe qu'audio2wave_live.py) : sur un redemarrage --size/--fullscreen,
+    il faut retrouver la fenetre DEJA OUVERTE par son titre exact avant de la
+    fermer, donc calculer ce titre a partir des memes args, separement de la
+    construction de la commande."""
+    return f"audio2wave photo [{args.style}, {describe_window(args)}] - {args.device}"
+
+
+def viewer_command(args: argparse.Namespace, size: tuple[int, int],
+                   position: tuple[int, int] | None = None) -> list[str]:
     """Fenetre d'affichage, alimentee image par image.
 
     Une image par photo suffit: privee de donnees, ffplay laisse la derniere a l'ecran,
@@ -785,6 +848,13 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]
     consommer plus vite qu'on ne le nourrit, sinon elles s'empilent dans sa file et
     l'affichage prend un retard qui grandit. Trop vite, il attend simplement. Ce rythme
     est celui du trace progressif quand il est actif, et celui des photos sinon.
+
+    `position` (left, top de l'ancienne fenetre, voir find_window_position) ne sert
+    qu'en mode fenetre : passe a `-left`/`-top` pour qu'un redemarrage --size se voie
+    comme une mise a jour sur place plutot qu'une fenetre qui se ferme et se rouvre
+    ailleurs sur l'ecran (meme motif qu'audio2wave_live.py). Sans effet ici en
+    --fullscreen -- ffplay ignore -left/-top des qu'il recoit -fs ; voir
+    viewer_env() pour la tentative de ciblage du bon moniteur dans ce cas-la.
     """
     width, height = size
     if args.draw_fps > 0:
@@ -798,11 +868,34 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int]) -> list[str]
         "-video_size", f"{width}x{height}",
         "-framerate", rate,
         "-i", "-", "-autoexit",
-        "-window_title", f"audio2wave photo [{args.style}, {describe_window(args)}] - {args.device}",
+        "-window_title", window_title(args),
     ]
     if args.fullscreen:
         cmd.append("-fs")
+    elif position:
+        cmd += ["-left", str(position[0]), "-top", str(position[1])]
     return cmd
+
+
+def viewer_env(args: argparse.Namespace, position: tuple[int, int] | None) -> dict[str, str]:
+    """Environnement du sous-processus ffplay : tentative de cibler le bon moniteur
+    en plein ecran, via la variable SDL_VIDEO_WINDOW_POS (lue par SDL2 -- la
+    bibliotheque sous-jacente de ffplay -- a la creation de sa fenetre, AVANT que
+    -fs ne la fasse passer en plein ecran).
+
+    Distinct de `-left`/`-top` (voir viewer_command) : ces options d'ffplay lui-meme
+    sont documentees ignorees en `-fs` (voir find_window_position dans common.py),
+    mais SDL_VIDEO_WINDOW_POS agit un cran plus bas, avant meme que le choix
+    fenetre/plein ecran d'ffplay ne s'applique -- une piste plausible pour un
+    multi-ecran, mais NON VERIFIEE sur un vrai poste multi-moniteur (cette session
+    tourne dans un environnement distant sans acces aux moniteurs physiques de
+    l'utilisateur). A confirmer en usage reel avant de la considerer fiable ;
+    sans effet mesurable si SDL l'ignore, pas de degradation en tout cas.
+    """
+    env = dict(os.environ)
+    if args.fullscreen and position:
+        env["SDL_VIDEO_WINDOW_POS"] = f"{position[0]},{position[1]}"
+    return env
 
 
 class LiveCapture:
@@ -1800,6 +1893,18 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             scale.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
 
         def set_value(value: object) -> None:
+            # `value` peut valoir None (attribut jamais touche, ex. --columns
+            # en mode "auto" avant tout reglage manuel) des qu'un preset
+            # sauvegarde depuis capture_overrides() capture TOUS les controls,
+            # meme ceux restes a leur valeur par defaut -- un Scale n'a pas de
+            # position "auto" a afficher, contrairement a --wave/--crossover
+            # (setters dedies qui gerent deja None). Sans cette garde,
+            # recharger un tel preset plantait le callback Tk ("cannot assign
+            # a non-numeric value to a scale variable"), decouvert en testant
+            # le chargement automatique a la selection. Ne rien faire laisse
+            # la valeur courante intacte, cohere avec le sens de None ailleurs.
+            if value is None:
+                return
             var.set(value)
             on_change()
 
@@ -2227,6 +2332,74 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     add_slider("Images/s du trace", "draw_fps", 0, 60, 1, panel="right")
 
+    # --size : pre-rempli avec la taille REELE deja resolue (ecran/fullscreen si
+    # --size n'etait pas passe en ligne de commande), pas avec args.size brut
+    # (souvent None) -- pour que les champs montrent d'emblee la resolution
+    # courante plutot que rien. args.size lui-meme reste None tant que ces
+    # champs ne sont pas touches (meme principe que --wave/--bars ailleurs :
+    # y toucher fige une valeur explicite) -- ne pas y toucher laisse le
+    # comportement automatique (plein ecran/tiers de hauteur) intact.
+    width0, height0 = size
+
+    def apply_size(_evt: object = None) -> None:
+        try:
+            w = int(width_var.get().strip())
+            h = int(height_var.get().strip())
+        except ValueError:
+            return
+        if w <= 0 or h <= 0:
+            return
+        args.size = f"{w}x{h}"
+
+    def set_size(value: object) -> None:
+        if value:
+            try:
+                w, h = (int(part) for part in str(value).lower().split("x", 1))
+            except ValueError:
+                return
+            width_var.set(str(w))
+            height_var.set(str(h))
+        apply_size()
+
+    controls["size"] = set_size
+
+    r = next_row("right")
+    add_label("Taille fenetre", r, RIGHT_LABEL_COL,
+             tooltip="Largeur x hauteur de la fenetre video, en pixels. Redemarre la "
+                     "fenetre ffplay (et les videos actives) -- une coupure de quelques "
+                     "centaines de ms, comme changer d'entree audio ou de video.")
+    size_frame = tk.Frame(root)
+    size_frame.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    width_var = tk.StringVar(value=str(width0))
+    height_var = tk.StringVar(value=str(height0))
+    for var in (width_var, height_var):
+        entry = tk.Entry(size_frame, textvariable=var, width=6)
+        entry.pack(side="left", padx=(0, 6))
+        entry.bind("<Return>", apply_size)
+        entry.bind("<FocusOut>", apply_size)
+
+    # --fullscreen : bascule juste a cote de la taille, meme redemarrage de
+    # viewer -- utile en particulier pour SORTIR d'un plein ecran ouvert sur le
+    # mauvais moniteur (signale par l'utilisateur : "la fenetre s'ouvre en plein
+    # ecran sur le mauvais moniteur et je n'arrive plus a la deplacer") : decocher
+    # relance une fenetre normale, deplacable a la souris comme n'importe quelle
+    # fenetre, vers le bon moniteur.
+    fullscreen_var = tk.BooleanVar(value=args.fullscreen)
+
+    def on_fullscreen_change(value: object = None) -> None:
+        if value is not None:
+            fullscreen_var.set(bool(value))
+        args.fullscreen = fullscreen_var.get()
+
+    controls["fullscreen"] = on_fullscreen_change
+
+    fullscreen_check = tk.Checkbutton(size_frame, text="Plein ecran", variable=fullscreen_var,
+                                      command=on_fullscreen_change)
+    fullscreen_check.pack(side="left", padx=(4, 0))
+    Tooltip(fullscreen_check, "Redemarre la fenetre video en plein ecran ou non. Decoche pour "
+                             "sortir d'un plein ecran ouvert sur le mauvais moniteur : la "
+                             "nouvelle fenetre, normale, peut etre deplacee a la souris.")
+
     # --save-dir: le dossier initial est deja cree par main() avant l'ouverture de la
     # fenetre; un dossier saisi ici doit l'etre aussi, sinon write_png (qui ne cree pas
     # ses dossiers parents) echouerait des la premiere photo.
@@ -2313,14 +2486,27 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             ).grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                    padx=ROW_PADX, pady=(10, SECTION_GAP))
 
+    # "size" est dans `controls` pour que le champ "Taille fenetre" puisse etre
+    # pilote comme n'importe quel autre reglage GUI, mais NE DOIT PAS voyager
+    # dans un preset : la taille de fenetre est independante du rendu (comme
+    # --device/--video, deja hors de cette logique en n'etant simplement pas
+    # dans `controls`), demande explicite ("verifie que la taille de la fenetre
+    # ne puisse pas etre sauvegardee dans les presets, c'est independant").
+    # `--fullscreen`, lui, reste volontairement dans les presets (le preset
+    # "club" en depend deja, voir plus haut) : seule la taille en pixels est
+    # exclue ici, pas le mode plein ecran.
+    PRESET_EXCLUDED_CONTROLS = {"size"}
+
     def apply_preset(overrides: dict) -> list[str]:
         """Applique les cles d'un preset aux widgets+args ; renvoie celles ignorees
-        (figees au lancement, non exposees dans cette fenetre -- voir docstring)."""
-        skipped = [key for key in overrides if key not in controls]
+        (figees au lancement et non exposees dans cette fenetre, ou explicitement
+        exclues des presets comme "size" -- voir PRESET_EXCLUDED_CONTROLS)."""
+        skipped = [key for key in overrides
+                  if key not in controls or key in PRESET_EXCLUDED_CONTROLS]
         if "style" in overrides:
             controls["style"](overrides["style"])
         for key, value in overrides.items():
-            if key != "style" and key in controls:
+            if key != "style" and key in controls and key not in PRESET_EXCLUDED_CONTROLS:
                 controls[key](value)
         return skipped
 
@@ -2333,21 +2519,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     style_option_menu(preset_menu)
     preset_menu.pack(side="left")
 
-    def refresh_preset_menu(select: str | None = None) -> None:
-        names = sorted(all_presets())
-        menu = preset_menu["menu"]
-        menu.delete(0, "end")
-        for name in names:
-            menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
-        if select is not None:
-            preset_var.set(select)
-        elif names and preset_var.get() not in names:
-            preset_var.set(names[0])
-
-    refresh_preset_menu()
-
-    def on_load_preset() -> None:
-        name = preset_var.get()
+    def on_load_preset(name: str) -> None:
         presets = all_presets()
         if name not in presets:
             status["text"] = f"preset inconnu: {name}"
@@ -2355,13 +2527,35 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         skipped = apply_preset(presets[name])
         text = f"preset '{name}' charge"
         if skipped:
-            # Options figees au lancement (video, capture, fenetre ffplay...): un
-            # preset --gui peut les contenir (ex. "club" a --fullscreen) mais cette
-            # fenetre ne peut pas les relancer en direct, voir la docstring.
-            text += f" (ignore, deja fige au lancement: {', '.join(skipped)})"
+            # Options figees au lancement (video, capture, fenetre ffplay...) ou
+            # volontairement exclues des presets (ex. "size", voir
+            # PRESET_EXCLUDED_CONTROLS) : un preset peut les contenir (a la
+            # main dans le JSON, ou "club" pour --fullscreen) mais cette
+            # fenetre ne les applique pas depuis un preset, voir la docstring.
+            text += f" (ignore: {', '.join(skipped)})"
         status["text"] = text
 
-    tk.Button(preset_frame, text="Charger", command=on_load_preset).pack(side="left", padx=(8, 0))
+    def select_preset(name: str) -> None:
+        # Choisir dans le menu deroulant charge directement le preset -- plus
+        # de bouton "Charger" separe, a la demande explicite ("charge
+        # automatiquement lors de la selection de la liste deroulante").
+        preset_var.set(name)
+        on_load_preset(name)
+
+    def refresh_preset_menu(select: str | None = None) -> None:
+        names = sorted(all_presets())
+        menu = preset_menu["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: select_preset(n))
+        if select is not None:
+            # Rafraichissement apres Sauvegarder/Mettre a jour : le preset vient
+            # d'etre ecrit avec l'etat courant, pas la peine de le recharger.
+            preset_var.set(select)
+        elif names and preset_var.get() not in names:
+            preset_var.set(names[0])
+
+    refresh_preset_menu()
 
     def capture_overrides() -> dict:
         # Capture args (pas les widgets) : args est la source de verite deja tenue
@@ -2376,7 +2570,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         # par l'utilisateur. Conversion generalisee a TOUT attribut Path, pas
         # seulement save_dir : plus robuste qu'ajouter un cas special de plus
         # par attribut au fil du temps.
-        overrides = {attr: getattr(args, attr) for attr in controls}
+        overrides = {attr: getattr(args, attr) for attr in controls
+                    if attr not in PRESET_EXCLUDED_CONTROLS}
         for key, value in overrides.items():
             if isinstance(value, Path):
                 overrides[key] = str(value)
@@ -2422,6 +2617,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             return
         save_user_preset(name, capture_overrides())
         refresh_preset_menu(select=name)
+        refresh_vj_preset_menu()  # le nouveau preset doit aussi apparaitre dans la liste VJ
         save_name_var.set("")
         status["text"] = f"preset '{name}' sauvegarde ({USER_PRESETS_PATH})"
 
@@ -2438,6 +2634,357 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     tk.Button(save_preset_frame, text="Sauvegarder", command=on_save_preset,
              ).pack(side="left", padx=(8, 0))
+
+    # --- Mode VJ : enchaine une liste ordonnee de presets sur des durees
+    # relatives, en boucle -- pour planifier un set entier a l'avance. Popup
+    # independant (comme l'editeur de courbe plus haut), PAS inline dans cette
+    # fenetre : un premier jet inline (separateur+titre+ligne Ajouter+Listbox+
+    # ligne de controles) a pousse la fenetre a 1128 px de haut, au-dela de la
+    # zone de travail de l'ecran de test (1032 px, 1920x1080 barre des taches
+    # deduite) -- mesure a l'ecran, pas suppose : les boutons "Monter"/
+    # "Demarrer VJ"/le statut tombaient hors champ, meme piege que
+    # l'alignement des curseurs plus haut dans ce fichier. En popup, la
+    # fenetre principale ne grandit que d'UNE ligne (bouton "Ouvrir..."),
+    # et le popup lui-meme peut etre aussi haut qu'il faut sans contrainte.
+    # `vj_state` (entries/running/start/current) et `vj_tick()` -- le fil qui
+    # applique les presets planifies -- vivent ICI, dans build_gui, PAS dans
+    # open_vj_editor() : ils doivent continuer a tourner meme popup ferme
+    # (un set ne s'arrete pas parce qu'on a referme la fenetre d'edition).
+    # Seuls les widgets (listbox, boutons, champs) sont crees/oublies a
+    # l'ouverture/fermeture du popup, meme principe que open_curve_editor :
+    # les fonctions qui les touchent (refresh_vj_listbox, refresh_vj_preset_
+    # menu) verifient d'abord que le popup est ouvert plutot que de planter
+    # sur un widget detruit.
+    vj_state: dict = {
+        "entries": [], "running": False, "start": 0.0, "current": -1,
+        "editor": None, "listbox": None, "next_label": None, "toggle_btn": None,
+        "preset_var": None, "duration_var": None, "menu": None,
+        "setlist_var": None, "setlist_menu": None, "save_setlist_name_var": None,
+    }
+
+    def refresh_vj_setlist_menu(select: str | None = None) -> None:
+        menu_widget = vj_state["setlist_menu"]
+        setlist_var = vj_state["setlist_var"]
+        if menu_widget is None or setlist_var is None:
+            return
+        names = sorted(load_vj_setlists())
+        menu = menu_widget["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: setlist_var.set(n))
+        if select is not None:
+            setlist_var.set(select)
+        elif names and setlist_var.get() not in names:
+            setlist_var.set(names[0])
+        elif not names:
+            setlist_var.set("")
+
+    def vj_load_setlist() -> None:
+        setlist_var = vj_state["setlist_var"]
+        if setlist_var is None:
+            return
+        name = setlist_var.get()
+        setlists = load_vj_setlists()
+        if not name or name not in setlists:
+            status["text"] = "VJ: aucun enchainement a charger (sauvegarde-en un d'abord)"
+            return
+        # Copie les dicts (pas juste la liste) : muter vj_state["entries"] plus
+        # tard (Monter/Descendre/Supprimer) ne doit jamais modifier silencieusement
+        # ce qui vient d'etre lu depuis le JSON en memoire.
+        vj_state["entries"] = [dict(entry) for entry in setlists[name]]
+        vj_state["current"] = -1
+        refresh_vj_listbox()
+        status["text"] = f"VJ: enchainement '{name}' charge ({len(vj_state['entries'])} entree(s))"
+
+    def vj_save_setlist(_evt: object = None) -> None:
+        name_var = vj_state["save_setlist_name_var"]
+        if name_var is None:
+            return
+        name = name_var.get().strip().lower()
+        if not name:
+            status["text"] = "VJ: nom d'enchainement vide"
+            return
+        if not vj_state["entries"]:
+            status["text"] = "VJ: la liste est vide, ajoute au moins une entree avant de sauvegarder"
+            return
+        save_vj_setlist(name, vj_state["entries"])
+        refresh_vj_setlist_menu(select=name)
+        name_var.set("")
+        status["text"] = f"VJ: enchainement '{name}' sauvegarde ({VJ_SETLISTS_PATH})"
+
+    def vj_update_setlist() -> None:
+        setlist_var = vj_state["setlist_var"]
+        if setlist_var is None:
+            return
+        name = setlist_var.get()
+        if not name:
+            status["text"] = "VJ: aucun enchainement selectionne"
+            return
+        if not vj_state["entries"]:
+            status["text"] = "VJ: la liste est vide, ajoute au moins une entree avant de mettre a jour"
+            return
+        save_vj_setlist(name, vj_state["entries"])
+        status["text"] = f"VJ: enchainement '{name}' mis a jour ({VJ_SETLISTS_PATH})"
+
+    def refresh_vj_preset_menu() -> None:
+        menu_widget = vj_state["menu"]
+        preset_var = vj_state["preset_var"]
+        if menu_widget is None or preset_var is None:
+            return
+        names = sorted(all_presets())
+        menu = menu_widget["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
+        if names and preset_var.get() not in names:
+            preset_var.set(names[0])
+
+    def refresh_vj_listbox() -> None:
+        listbox = vj_state["listbox"]
+        if listbox is None:
+            return
+        # Rappelle la selection courante (l'index change de sens sinon a
+        # chaque insert/delete) et surligne l'entree active (vj_state
+        # ["current"]) en accent -- seul indice visuel de ce qui joue
+        # actuellement sans dupliquer un second widget d'etat.
+        selection = listbox.curselection()
+        selected_index = selection[0] if selection else None
+        listbox.delete(0, "end")
+        for i, entry in enumerate(vj_state["entries"]):
+            marker = "-> " if i == vj_state["current"] else "   "
+            listbox.insert(
+                "end", f"{marker}{i + 1:>2}. {format_mmss(entry['duration_s'])}  {entry['preset']}")
+        if 0 <= vj_state["current"] < len(vj_state["entries"]):
+            listbox.itemconfig(vj_state["current"], fg=GUI_ACCENT)
+        if selected_index is not None and selected_index < listbox.size():
+            listbox.selection_set(selected_index)
+
+    def vj_add_entry() -> None:
+        preset_var = vj_state["preset_var"]
+        duration_var = vj_state["duration_var"]
+        if preset_var is None or duration_var is None:
+            return
+        name = preset_var.get()
+        if not name:
+            status["text"] = "VJ: aucun preset a ajouter (sauvegarde/charge au moins un preset)"
+            return
+        try:
+            minutes = float(duration_var.get().strip().replace(",", "."))
+        except ValueError:
+            status["text"] = "VJ: duree invalide (nombre de minutes attendu)"
+            return
+        if minutes <= 0:
+            status["text"] = "VJ: la duree doit etre positive"
+            return
+        vj_state["entries"].append({"preset": name, "duration_s": minutes * 60.0})
+        vj_state["current"] = -1  # force vj_tick() a revalider la position au prochain tour
+        refresh_vj_listbox()
+        status["text"] = f"VJ: '{name}' ajoute ({format_mmss(minutes * 60.0)})"
+
+    def vj_selected_index() -> int | None:
+        listbox = vj_state["listbox"]
+        if listbox is None:
+            return None
+        selection = listbox.curselection()
+        return selection[0] if selection else None
+
+    def vj_remove_selected() -> None:
+        idx = vj_selected_index()
+        if idx is None:
+            status["text"] = "VJ: selectionne d'abord une ligne a supprimer"
+            return
+        del vj_state["entries"][idx]
+        vj_state["current"] = -1
+        refresh_vj_listbox()
+
+    def vj_move(delta: int) -> None:
+        idx = vj_selected_index()
+        if idx is None:
+            return
+        target = idx + delta
+        if not (0 <= target < len(vj_state["entries"])):
+            return
+        entries = vj_state["entries"]
+        entries[idx], entries[target] = entries[target], entries[idx]
+        vj_state["current"] = -1
+        refresh_vj_listbox()
+        vj_state["listbox"].selection_set(target)
+
+    def vj_toggle() -> None:
+        # Demarrer repart TOUJOURS du debut de la liste (current=-1, start=now)
+        # plutot que de reprendre l'ancienne position : un set qu'on relance
+        # doit repartir de son premier preset, pas d'un point arbitraire laisse
+        # par la derniere lecture.
+        vj_state["running"] = not vj_state["running"]
+        if vj_state["running"]:
+            vj_state["start"] = time.monotonic()
+            vj_state["current"] = -1
+            status["text"] = "VJ demarre"
+        else:
+            status["text"] = "VJ arrete"
+        toggle_btn = vj_state["toggle_btn"]
+        if toggle_btn is not None:
+            toggle_btn.config(text="Arreter VJ" if vj_state["running"] else "Demarrer VJ")
+        refresh_vj_listbox()
+
+    def open_vj_editor() -> None:
+        existing = vj_state["editor"]
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+
+        win = tk.Toplevel(root)
+        win.title("Mode VJ -- enchainement de presets")
+        win.configure(bg=GUI_PANEL_BG)
+
+        # --- Enchainements sauvegardes (JSON separe des presets, voir
+        # VJ_SETLISTS_PATH) : charger REMPLACE la liste en cours, sauvegarder/
+        # mettre a jour capturent la liste en cours telle quelle -- avant
+        # "Ajouter" pour que charger un enchainement existant soit le premier
+        # reflexe en ouvrant ce popup, pas une action retrouvee en bas apres
+        # avoir deja commence a construire une liste a la main.
+        setlist_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        setlist_frame.pack(fill="x", padx=14, pady=(14, 4))
+        tk.Label(setlist_frame, text="Enchainement :", bg=GUI_PANEL_BG).pack(side="left")
+        setlist_var = tk.StringVar(value="")
+        setlist_menu = tk.OptionMenu(setlist_frame, setlist_var, "")
+        style_option_menu(setlist_menu)
+        setlist_menu.pack(side="left", padx=(8, 0))
+        vj_state["setlist_var"] = setlist_var
+        vj_state["setlist_menu"] = setlist_menu
+        tk.Button(setlist_frame, text="Charger", command=vj_load_setlist,
+                 ).pack(side="left", padx=(8, 0))
+        tk.Button(setlist_frame, text="Mettre a jour", command=vj_update_setlist,
+                 ).pack(side="left", padx=(8, 0))
+        refresh_vj_setlist_menu()
+
+        save_setlist_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        save_setlist_frame.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(save_setlist_frame, text="Sauvegarder sous :", bg=GUI_PANEL_BG).pack(side="left")
+        save_setlist_name_var = tk.StringVar(value="")
+        save_setlist_entry = tk.Entry(save_setlist_frame, textvariable=save_setlist_name_var, width=14)
+        save_setlist_entry.pack(side="left", padx=(8, 0))
+        vj_state["save_setlist_name_var"] = save_setlist_name_var
+        # Meme raison qu'au meme endroit pour les presets (voir plus haut) :
+        # Entree valide, comme le reflexe naturel apres avoir tape un nom.
+        save_setlist_entry.bind("<Return>", vj_save_setlist)
+        tk.Button(save_setlist_frame, text="Sauvegarder", command=vj_save_setlist,
+                 ).pack(side="left", padx=(8, 0))
+
+        tk.Frame(win, bg=GUI_MUTED_FG, height=1).pack(fill="x", padx=14, pady=(0, 10))
+
+        add_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        add_frame.pack(fill="x", padx=14, pady=(14, 8))
+        tk.Label(add_frame, text="Ajouter :", bg=GUI_PANEL_BG).pack(side="left")
+        preset_var = tk.StringVar(value="")
+        menu = tk.OptionMenu(add_frame, preset_var, "")
+        style_option_menu(menu)
+        menu.pack(side="left", padx=(8, 0))
+        duration_var = tk.StringVar(value=str(VJ_DEFAULT_DURATION_MIN))
+        tk.Entry(add_frame, textvariable=duration_var, width=5).pack(side="left", padx=(8, 0))
+        tk.Label(add_frame, text="min", bg=GUI_PANEL_BG).pack(side="left", padx=(4, 0))
+        vj_state["preset_var"] = preset_var
+        vj_state["duration_var"] = duration_var
+        vj_state["menu"] = menu
+        tk.Button(add_frame, text="Ajouter", command=vj_add_entry).pack(side="left", padx=(8, 0))
+        refresh_vj_preset_menu()
+
+        list_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        listbox = tk.Listbox(list_frame, height=10, width=44, selectbackground=GUI_ACCENT,
+                             selectforeground=GUI_ACCENT_FG, activestyle="none",
+                             exportselection=False, font=GUI_FONT_MONO)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.pack(side="left", fill="y")
+        listbox.config(yscrollcommand=scrollbar.set)
+        vj_state["listbox"] = listbox
+        refresh_vj_listbox()
+
+        controls_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        controls_frame.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Button(controls_frame, text="Monter", command=lambda: vj_move(-1)).pack(side="left")
+        tk.Button(controls_frame, text="Descendre", command=lambda: vj_move(1),
+                 ).pack(side="left", padx=(8, 0))
+        tk.Button(controls_frame, text="Supprimer", command=vj_remove_selected,
+                 ).pack(side="left", padx=(8, 0))
+
+        run_frame = tk.Frame(win, bg=GUI_PANEL_BG)
+        run_frame.pack(fill="x", padx=14, pady=(0, 8))
+        toggle_btn = tk.Button(run_frame, text="Arreter VJ" if vj_state["running"] else "Demarrer VJ",
+                               command=vj_toggle)
+        toggle_btn.pack(side="left")
+        vj_state["toggle_btn"] = toggle_btn
+        next_label = tk.Label(run_frame, text="", fg=GUI_MUTED_FG, bg=GUI_PANEL_BG)
+        next_label.pack(side="left", padx=(16, 0))
+        vj_state["next_label"] = next_label
+
+        def on_close() -> None:
+            vj_state["editor"] = None
+            vj_state["listbox"] = None
+            vj_state["next_label"] = None
+            vj_state["toggle_btn"] = None
+            vj_state["preset_var"] = None
+            vj_state["duration_var"] = None
+            vj_state["menu"] = None
+            vj_state["setlist_var"] = None
+            vj_state["setlist_menu"] = None
+            vj_state["save_setlist_name_var"] = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        tk.Button(win, text="Fermer", command=on_close).pack(pady=(0, 12))
+        vj_state["editor"] = win
+
+    r = next_shared_row()
+    add_label("Mode VJ", r, 0,
+             tooltip="Enchaine une liste ordonnee de presets sur des durees relatives, en "
+                     "boucle -- pour planifier un set entier a l'avance.")
+    tk.Button(root, text="Ouvrir...", command=open_vj_editor).grid(
+        row=r, column=1, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+
+    def vj_tick() -> None:
+        # Tourne dans le fil tkinter (root.after), jamais dans run() : un
+        # changement de preset planifie n'est qu'un appel a apply_preset(),
+        # exactement comme un clic sur "Charger" -- run() ne voit que des
+        # attributs d'args qui changent, comme pour tout le reste de cette
+        # fenetre. S'arrete de se reprogrammer des que finished_event est
+        # positionne, meme garde que refresh()/automate_tick() plus haut.
+        if finished_event.is_set():
+            return
+        if vj_state["running"] and vj_state["entries"]:
+            total = sum(entry["duration_s"] for entry in vj_state["entries"])
+            if total > 0:
+                elapsed = (time.monotonic() - vj_state["start"]) % total
+                acc = 0.0
+                idx = len(vj_state["entries"]) - 1
+                for i, entry in enumerate(vj_state["entries"]):
+                    acc += entry["duration_s"]
+                    if elapsed < acc:
+                        idx = i
+                        break
+                if idx != vj_state["current"]:
+                    vj_state["current"] = idx
+                    entry = vj_state["entries"][idx]
+                    presets = all_presets()
+                    if entry["preset"] in presets:
+                        skipped = apply_preset(presets[entry["preset"]])
+                        text = (f"VJ: '{entry['preset']}' "
+                                f"({idx + 1}/{len(vj_state['entries'])})")
+                        if skipped:
+                            text += f" (ignore, deja fige au lancement: {', '.join(skipped)})"
+                        status["text"] = text
+                    else:
+                        # Preset supprime apres avoir ete ajoute a la liste VJ :
+                        # signale et saute, plutot que de planter le fil tkinter.
+                        status["text"] = f"VJ: preset '{entry['preset']}' introuvable, saute"
+                    refresh_vj_listbox()
+                next_label = vj_state["next_label"]
+                if next_label is not None:
+                    next_label.config(text=f"Prochain changement dans {format_mmss(acc - elapsed)}")
+        root.after(VJ_TICK_MS, vj_tick)
+
+    root.after(VJ_TICK_MS, vj_tick)
 
     tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
         row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="ew",
@@ -2471,10 +3018,24 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     actif (pour laisser tkinter posseder le fil principal), directement dans main()
     sinon.
     """
+    def stop_viewer(v: subprocess.Popen) -> None:
+        # Factorise entre le redemarrage sur changement de --size (voir plus bas)
+        # et le nettoyage final (bloc finally) : fermer stdin (EOF, -autoexit
+        # referme la fenetre de lui-meme) puis terminate()/wait() en secours si
+        # elle ne s'est pas fermee toute seule.
+        try:
+            v.stdin.close()
+        except OSError:
+            pass
+        if v.poll() is None:
+            v.terminate()
+        v.wait()
+
     last_bg = resolve_bg(args)
     last_colors = resolve_colors(args)[0]
     last_device = args.device
     last_interval = args.interval
+    last_fullscreen = args.fullscreen
     last_video = getattr(args, "video", None)
     last_video2 = getattr(args, "video2", None)
     # Un seul decodeur par video au depart, qui reboucle tout seul (-stream_loop -1);
@@ -2542,6 +3103,44 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             if args.interval != last_interval:
                 capture.set_window(chunk_size(args))
                 last_interval = args.interval
+
+            # --gui a change --size ou --fullscreen: contrairement a interval
+            # ci-dessus, la fenetre ffplay ET les VideoSource actives sont liees a
+            # une taille fixee a leur construction (comme device/video le sont a un
+            # peripherique/fichier precis) -- redemarrer le viewer et les decodeurs
+            # video est donc necessaire, pas juste une mutation d'attribut.
+            # resolve_size(args) (pas args.size brut) est comparee: args.size reste
+            # None tant que ce champ n'a pas ete touche (voir build_gui), et c'est
+            # resolve_size() qui determine alors la taille reelle a partir de
+            # l'ecran -- y compris plein ecran ou non, d'ou le suivi separe de
+            # last_fullscreen : un --size explicite fixe une resolution independante
+            # de --fullscreen (resolve_size la retourne telle quelle dans les deux
+            # cas), donc SEUL le drapeau -fs de viewer_command change quand on
+            # decoche "Plein ecran" avec une taille explicite deja fixee -- rien que
+            # la comparaison de taille seule ne detecterait.
+            current_size = resolve_size(args)
+            if current_size != size or args.fullscreen != last_fullscreen:
+                status["text"] = f"changement d'affichage -> {current_size[0]}x{current_size[1]}..."
+                # Position de la fenetre ENCORE OUVERTE, retrouvee par son titre
+                # avant de la fermer (meme technique qu'audio2wave_live.py) :
+                # reutilisee en -left/-top si la nouvelle fenetre est en mode
+                # fenetre, ou passee en tentative via SDL_VIDEO_WINDOW_POS si elle
+                # doit s'ouvrir en plein ecran (voir viewer_env, non verifie sur un
+                # vrai multi-ecran).
+                position = find_window_position(window_title(args))
+                size = current_size
+                last_fullscreen = args.fullscreen
+                stop_viewer(viewer)
+                viewer = subprocess.Popen(viewer_command(args, size, position),
+                                          stdin=subprocess.PIPE, env=viewer_env(args, position))
+                previous_frame = background * (size[0] * size[1])
+                if video is not None:
+                    video.stop()
+                    video = VideoSource(last_video, size, args.draw_fps, args.loglevel)
+                if video_out is not None:
+                    video_out.stop()
+                    video_out = VideoSource(last_video2, size, args.draw_fps, args.loglevel)
+                status["text"] = f"affichage: {size[0]}x{size[1]}{' plein ecran' if args.fullscreen else ''}"
 
             # Meme principe pour video/video2 (--style pencil): un VideoSource est lie a
             # un fichier precis a sa construction, donc un changement redemarre le
@@ -2674,13 +3273,7 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             video.stop()
         if video_out is not None:
             video_out.stop()
-        try:
-            viewer.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
-        except OSError:
-            pass
-        if viewer.poll() is None:
-            viewer.terminate()
-        viewer.wait()
+        stop_viewer(viewer)
         finished_event.set()
 
 
