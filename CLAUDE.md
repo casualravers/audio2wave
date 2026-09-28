@@ -97,10 +97,36 @@ resolution de chemins.
   plutot que figes en parametres — remplacer le producteur ne consiste donc qu'a
   swapper `relay_state["producer"]` PUIS terminer l'ancien (cet ordre precis: le
   relais reprend sur le nouveau des le swap, sans attendre la fin de
-  `terminate()`/`wait()` de l'ancien, pas de gap audio/video). Ne recolle JAMAIS les
-  octets de deux producteurs differents dans un meme `read()` (`producer`/`display`
-  relus au DEBUT de chaque iteration de boucle) : au pire une frame de transition
-  legerement decalee (invisible en pratique), jamais un flux durablement corrompu.
+  `terminate()`/`wait()` de l'ancien, pas de gap audio/video).
+  **Accumule chaque frame ENTIERE avant de la transmettre** (`relay_state["frame_size"]`
+  = largeur x hauteur x 3, pose par `run()` a chaque redemarrage "dur", voir
+  `spawn_display()`), plutot que de relayer des blocs de taille arbitraire --
+  corrige un residu signale en usage reel APRES le "chauffage" (voir
+  `wait_for_producer()`) : "il y a encore un petit saut d'image lors de la
+  variation des parametres". Cause reelle, plus grave que ce que documentait
+  une version anterieure de ce paragraphe ("au pire une frame de transition
+  legerement decalee, invisible en pratique") : rien ne garantissait que le
+  nombre d'octets deja transmis depuis l'ANCIEN producteur au moment du
+  basculement soit un multiple exact d'une frame -- ffplay (`-f rawvideo`,
+  aucun marqueur de frame dans le flux) achevait alors une frame a moitie
+  remplie par l'ancien flux avec les PREMIERS octets du nouveau, introduisant
+  un DECALAGE qui persiste ensuite sur TOUTES les frames suivantes jusqu'au
+  prochain redemarrage -- une dechirure fixe de l'image, pas seulement un
+  sursaut ponctuel. `buf` (bytearray, un seul par appel a `relay_loop()`)
+  accumule les octets du producteur courant jusqu'a `frame_size`, puis la
+  frame complete est ecrite d'un coup et `buf` repart a zero ; `last_producer`
+  detecte un changement de producteur d'une iteration a l'autre et JETTE toute
+  frame partiellement accumulee dans ce cas (elle appartenait a l'ancien flux,
+  generalement coupe hors frontiere de frame) plutot que de la completer avec
+  le nouveau. Cout : au plus une frame quasi terminee perdue par redemarrage
+  (invisible, elle allait de toute facon etre remplacee), contre un alignement
+  EXACT garanti pour toutes les frames affichees, y compris juste apres le
+  basculement. Verifie sans vrai ffmpeg/ffplay, en forcant un faux producteur
+  a livrer son flux par TRES petits blocs (4 Ko, pour garantir qu'un
+  basculement tombe bien au milieu d'une frame) puis en inspectant chaque
+  frame ENTIERE recue par l'afficheur : aucune frame ne melange les octets de
+  deux producteurs differents, et le total recu reste un multiple exact de
+  `frame_size`.
   Exploration menee avant d'ecrire ce mecanisme : remplacer le tube DIRECT
   `Popen(stdin=source.stdout)` (utilise partout ailleurs dans ce depot, voir
   `common.pipe_to_ffplay`) par un relais Python semblait a priori couteux en latence

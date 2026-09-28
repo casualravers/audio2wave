@@ -570,22 +570,53 @@ def relay_loop(relay_state: dict, stop_event: threading.Event) -> None:
     negligeable face au debit dont ffplay a besoin (voir RELAY_CHUNK_SIZE),
     largement compense par le benefice de fenetre stable.
 
-    Ne recolle JAMAIS les octets de deux producteurs differents dans un meme
-    `read()` -- `producer`/`display` sont relus au DEBUT de chaque iteration,
-    un changement de producteur en cours de route (run() met a jour
-    `relay_state["producer"]` puis termine l'ancien, voir sa docstring)
-    n'affecte donc que la PROCHAINE lecture, jamais celle deja en cours. Au
-    pire une frame de transition legerement decalee (invisible en pratique, le
-    temps d'un seul refresh), jamais un flux durablement corrompu.
+    **Accumule chaque frame ENTIERE (`relay_state["frame_size"]` = largeur x
+    hauteur x 3, mis a jour par run() a chaque redemarrage "dur", voir
+    spawn_display()) avant de la transmettre a l'afficheur, au lieu de
+    relayer des morceaux de taille arbitraire.** Corrige un residu signale en
+    usage reel apres le "chauffage" (voir wait_for_producer()) : "il y a
+    encore un petit saut d'image lors de la variation des parametres". Cause
+    identifiee en reexaminant l'ancienne version de cette fonction (qui
+    relayait des blocs `RELAY_CHUNK_SIZE` bruts) : rien ne garantissait que le
+    nombre d'octets deja transmis depuis l'ANCIEN producteur au moment du
+    basculement soit un multiple exact de la taille d'une frame -- ffplay,
+    qui ne connait que le flux d'octets continu (`-f rawvideo`, aucun marqueur
+    de frame), accumulait alors une frame a MOITIE remplie par l'ancien flux
+    puis complet ait le reste avec les PREMIERS octets du nouveau flux : pas
+    juste une frame de transition floue, mais un DECALAGE qui persiste ensuite
+    sur TOUTES les frames suivantes (chacune lue avec ce meme offset, jusqu'au
+    prochain redemarrage) -- une deformation/dechirure fixe de l'image, pas
+    seulement un sursaut ponctuel.
+
+    Desormais : `buf` accumule les octets du producteur COURANT jusqu'a
+    `frame_size`, puis la frame complete est ecrite a l'afficheur d'un coup et
+    `buf` repart a zero. `last_producer` detecte un changement de producteur
+    d'une iteration a l'autre (le meme test que l'ancienne version, juste
+    utilise differemment) : sur un changement, toute frame partiellement
+    accumulee est JETEE plutot que completee avec le nouveau flux -- elle
+    appartenait a l'ancien producteur, qui n'est generalement pas coupe pile
+    sur une frontiere de frame. Cout: au plus une frame quasi-terminee perdue
+    par redemarrage (invisible, elle allait de toute facon etre remplacee),
+    en echange d'un alignement EXACT garanti pour toutes les frames
+    affichees, y compris juste apres le basculement.
     """
+    buf = bytearray()
+    last_producer = None
     while not stop_event.is_set():
         producer = relay_state.get("producer")
         display = relay_state.get("display")
-        if producer is None or display is None:
+        frame_size = relay_state.get("frame_size")
+        if producer is None or display is None or not frame_size:
             time.sleep(0.01)
             continue
+        if producer is not last_producer:
+            # Producteur different de la derniere iteration (run() vient de
+            # basculer relay_state) : toute frame en cours d'accumulation
+            # appartenait a l'ANCIEN flux, voir la docstring plus haut.
+            buf.clear()
+            last_producer = producer
         try:
-            chunk = producer.stdout.read(RELAY_CHUNK_SIZE)
+            chunk = producer.stdout.read(min(RELAY_CHUNK_SIZE, frame_size - len(buf)))
         except (OSError, ValueError):
             # Producteur en train d'etre remplace/ferme sous nos pieds (son
             # tube cote lecture vient d'etre ferme par run()) -- pas fatal,
@@ -597,14 +628,17 @@ def relay_loop(relay_state: dict, stop_event: threading.Event) -> None:
             # detecte ce dernier cas via poll()). Rien a transmettre ce tour.
             time.sleep(0.01)
             continue
+        buf.extend(chunk)
+        if len(buf) < frame_size:
+            continue
         try:
-            display.stdin.write(chunk)
+            display.stdin.write(bytes(buf))
             display.stdin.flush()
         except (BrokenPipeError, OSError):
             # Fenetre fermee par l'utilisateur -- run() le detecte deja via
             # display.poll() dans sa boucle de service, rien a faire ici.
-            time.sleep(0.01)
-            continue
+            pass
+        buf.clear()
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -848,7 +882,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
     masquer de son mieux avec le mecanisme "dur" seamless ; ici la fenetre
     n'est simplement plus concernee du tout).
     """
-    relay_state: dict = {"producer": None, "display": None}
+    relay_state: dict = {"producer": None, "display": None, "frame_size": None}
     threading.Thread(target=relay_loop, args=(relay_state, stop_event), daemon=True).start()
 
     producer = display = None
@@ -937,6 +971,12 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                     # indefiniment), on attend la prochaine demande.
                 else:
                     old_producer, old_display = producer, display
+                    # frame_size AVANT producer/display: relay_loop() les lit
+                    # tous les deux au meme instant a chaque iteration (voir sa
+                    # docstring), donc l'ordre exact importe peu ici -- mais le
+                    # poser a part rend explicite que la taille de frame doit
+                    # TOUJOURS correspondre a l'afficheur actuellement actif.
+                    relay_state["frame_size"] = new_width * new_height * 3
                     relay_state["producer"] = new_producer
                     relay_state["display"] = new_display
                     if old_producer is not None:
