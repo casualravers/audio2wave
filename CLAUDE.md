@@ -66,36 +66,70 @@ resolution de chemins.
 - [audio2wave.py](audio2wave.py) — rendu fichier : un WAV en entree, une video en sortie,
   fond transparent pour overlay. Un seul `subprocess.run(["ffmpeg", ...])`.
 - [audio2wave_live.py](audio2wave_live.py) — temps reel : `ffmpeg` (capture dshow ->
-  rawvideo sur stdout) relie par un pipe Python a `ffplay`. Le pipe est cable via
-  `Popen(stdin=source.stdout)` et **pas** via un pipe shell, qui corromprait le flux
-  binaire sous PowerShell ; le parent doit fermer `source.stdout` pour que ffmpeg voie
-  la fermeture de la fenetre.
+  rawvideo sur stdout) relie a `ffplay` par un **relais Python** (`relay_loop()`),
+  pas par un tube direct.
   **`--gui`** ne peut pas muter des attributs relus en direct comme les deux autres
-  scripts : il n'y a pas de boucle Python par image ici, le tube `source.stdout ->
-  display.stdin` est direct (voir ci-dessus, deliberement pour la latence). `run()`
-  supervise donc un cycle spawn/attente/nettoyage (`spawn()`, factoree de l'ancien
-  `main()`) et le rejoue quand `restart_event` est positionne (clic sur "Appliquer"
-  dans `build_gui()`).
-  **Le redemarrage est masque, pas seulement declenche** : la nouvelle paire est
-  lancee *avant* que l'ancienne ne soit fermee (`RESTART_GRACE_S = 0.3` s de
-  coexistence), et `find_window_position()` (ctypes/`user32.FindWindowW` +
-  `GetWindowRect`, meme famille que `primary_screen_size()`) retrouve la position de
-  la fenetre en cours pour la passer en `-left`/`-top` a la nouvelle instance
-  ffplay : le changement se voit comme une mise a jour sur place, pas une fenetre qui
-  se ferme puis se rouvre ailleurs. Si la nouvelle paire echoue dans la fenetre de
-  grace (`poll()` non `None` sur l'un des deux process), elle est nettoyee et
-  l'ancienne paire, `source`/`display`, **n'est pas touchee** : `run()` retombe dans
-  la boucle d'attente sur la paire encore active au lieu de retenter un `spawn()`
-  immediatement — un premier brouillon retentait en boucle et finissait par tuer la
-  paire fonctionnelle, attrape par un test avec un `spawn()` qui echoue une fois puis
-  reussit. `stop_event` sort de la boucle definitivement ; il est aussi positionne
-  automatiquement des que `display.poll()` n'est plus `None` (fenetre fermee par
-  l'utilisateur), pour que ce cas arrete tout au lieu de relancer. Verifie sans
-  peripherique reel en substituant `spawn()` par une paire `ffmpeg -f lavfi testsrc
-  -> ffplay` : chevauchement bref des deux paires confirme (ancienne encore vivante
-  pendant que la nouvelle tourne deja), position reprise confirmee via
-  `find_window_position`, paire precedente preservee sur un echec simule, fermeture
-  de fenetre confirmee par `stop_event` sans nouvelle paire.
+  scripts : il n'y a pas de boucle Python par image ici pour le RENDU (deliberement,
+  pour la latence). `run()` supervise donc un cycle spawn/attente/nettoyage et le
+  rejoue quand `restart_event` est positionne (clic sur "Appliquer" dans
+  `build_gui()`, ou `--reactive`/l'automation de courbes, voir plus bas).
+  **Deux natures de redemarrage, pas une seule** — c'est le point le plus important
+  de ce script, ajoute apres coup suite a une question explicite de l'utilisateur
+  ("n'est-il vraiment pas possible d'empecher la fermeture/reouverture de la fenetre
+  ffplay lors des modifications de parametres du mode live ?") :
+  - **"Doux"** (le cas courant — couleurs, gain, style, peripherique, `--glow`/
+    `--hue-cycle`, `--reactive`...) : seul le PRODUCTEUR (`spawn_producer()`, ffmpeg
+    seul, stdout relie a un pipe Python) est remplace. L'AFFICHEUR (`spawn_display()`,
+    ffplay seul, stdin relie a un pipe Python) n'est JAMAIS touche pour ce cas — sa
+    fenetre ne clignote plus du tout.
+  - **"Dur"** (uniquement `--size`/`--fullscreen`) : ffplay ne sait pas changer sa
+    resolution ni son mode plein ecran sans se redemarrer lui-meme
+    (`-video_size`/`-fs`/`-noborder` fixes a l'ouverture) — la fenetre EST recreee,
+    avec le meme mecanisme "seamless" qu'avant (nouvelle paire lancee *avant* que
+    l'ancienne ne ferme, `RESTART_GRACE_S = 0.3` s de coexistence,
+    `find_window_position()`/`target_monitor_rect()` pour rester au meme
+    endroit/moniteur — voir "Ouverture par defaut sur le deuxieme ecran" plus bas).
+  `run()` choisit entre les deux en comparant `resolve_size(args)`/`args.fullscreen`
+  a la derniere paire (taille, plein ecran) effectivement affichee.
+  **`relay_loop()`** (un seul fil, demarre une fois pour toute la duree de `run()`)
+  pompe en continu les octets du producteur ACTIF vers l'afficheur ACTIF, tous deux
+  relus depuis `relay_state` (un dict, mis a jour par `run()` a chaque redemarrage)
+  plutot que figes en parametres — remplacer le producteur ne consiste donc qu'a
+  swapper `relay_state["producer"]` PUIS terminer l'ancien (cet ordre precis: le
+  relais reprend sur le nouveau des le swap, sans attendre la fin de
+  `terminate()`/`wait()` de l'ancien, pas de gap audio/video). Ne recolle JAMAIS les
+  octets de deux producteurs differents dans un meme `read()` (`producer`/`display`
+  relus au DEBUT de chaque iteration de boucle) : au pire une frame de transition
+  legerement decalee (invisible en pratique), jamais un flux durablement corrompu.
+  Exploration menee avant d'ecrire ce mecanisme : remplacer le tube DIRECT
+  `Popen(stdin=source.stdout)` (utilise partout ailleurs dans ce depot, voir
+  `common.pipe_to_ffplay`) par un relais Python semblait a priori couteux en latence
+  — mesure : une frame 1080p rgb24 fait ~6 Mo, soit ~180 Mo/s a copier a 30 fps, tres
+  en dessous de ce qu'un `read()`/`write()` de pipe Python encaisse (quelques ms tout
+  au plus, negligeable face au poste de latence principal, `--averaging`).
+  **Le titre de la fenetre** (mode + peripherique, voir `window_title()`) ne peut pas
+  etre repasse a un ffplay deja lance : un redemarrage "doux" qui change le mode/le
+  peripherique le laisserait perime jusqu'au prochain redemarrage "dur". Corrige par
+  `set_window_title()` (dans `common.py`, `ctypes`/`FindWindowW`+`SetWindowTextW`,
+  meme famille que `find_window_position()`) : renomme la fenetre EN PLACE, sans la
+  fermer/rouvrir.
+  Si la nouvelle tentative (producteur seul, ou paire complete) echoue dans la
+  fenetre de grace (`poll()` non `None`), elle est nettoyee et l'ancien
+  producteur/l'ancienne paire, **ne sont pas touches** : `run()` retombe dans la
+  boucle d'attente sur ce qui tourne encore au lieu de retenter immediatement — un
+  premier brouillon (avant meme l'introduction du relais) retentait en boucle et
+  finissait par tuer la paire fonctionnelle, attrape par un test avec un spawn qui
+  echoue une fois puis reussit. `stop_event` sort de la boucle definitivement ; il
+  est aussi positionne automatiquement des que `display.poll()` n'est plus `None`
+  (fenetre fermee par l'utilisateur), pour que ce cas arrete tout au lieu de
+  relancer. Verifie sans peripherique/ffmpeg/ffplay reels, en substituant
+  `spawn_producer()`/`spawn_display()` par de faux `Popen` (stdout/stdin factices
+  suffisants pour exercer `relay_loop()`) : un changement de couleur/gain/style
+  provoque bien un nouveau producteur SANS nouvel afficheur (fenetre stable), un
+  changement de taille provoque bien les deux, aucun octet d'un ancien producteur
+  n'apparait dans ce qu'un afficheur courant a recu apres son ouverture, et un
+  producteur qui echoue immediatement laisse l'ancien (producteur ou paire) intact
+  et actif.
   **Tout parametre est exposable dans `build_gui()`**, a la difference de
   `audio2wave_snap.py`/`audio2wave_ridge.py` : comme `apply()` redemarre tout le
   pipeline (rien n'est relu en direct par un `run()` par-image, voir ci-dessus), il

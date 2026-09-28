@@ -36,8 +36,8 @@ from audio2wave import (
 )
 from common import (
     capture_input_args, find_window_position, list_audio_devices, measure_level,
-    pipe_to_ffplay, primary_screen_size, require_tools, secondary_monitor_rect,
-    target_monitor_rect,
+    primary_screen_size, require_tools, secondary_monitor_rect,
+    set_window_title, target_monitor_rect,
 )
 
 try:
@@ -484,34 +484,122 @@ def viewer_command(args: argparse.Namespace, width: int, height: int,
     return cmd
 
 
-def spawn(args: argparse.Namespace, width: int, height: int,
-         position: tuple[int, int] | None = None,
-         monitor: tuple[int, int, int, int] | None = None,
-         level_path: Path | None = None) -> tuple[subprocess.Popen, subprocess.Popen]:
-    """Lance la paire producteur/afficheur, reliee par un tube direct (voir la note
-    dans audio2wave_live.py/CLAUDE.md: pas de relais Python, pour la latence).
+def spawn_producer(args: argparse.Namespace, level_path: Path | None = None) -> subprocess.Popen:
+    """Lance SEULEMENT le producteur (ffmpeg, rawvideo sur stdout), stdout relie a
+    un pipe PYTHON plutot que directement a l'afficheur -- voir relay_loop()/run()
+    pour le pourquoi : ca permet de remplacer le producteur (couleurs, gain,
+    style, peripherique...) SANS jamais toucher a la fenetre ffplay deja
+    ouverte, contrairement au tube direct `common.pipe_to_ffplay` utilise
+    partout ailleurs dans ce depot.
 
     `level_path`, fourni par run() quand --reactive est actif, est un nom de
     fichier NEUF a chaque appel (voir run(): pas reutilise ni efface ici). Cote
     appelant, effacer/recreer un meme chemin echouerait sur Windows tant que
     l'ancien producteur (encore actif pendant le court chevauchement du
-    redemarrage seamless) le tient encore ouvert en ecriture (WinError 32) —
+    redemarrage) le tient encore ouvert en ecriture (WinError 32) —
     contrairement a POSIX ou unlink() sur un fichier ouvert reste silencieux ;
     c'est run() qui efface l'ancien fichier, une fois l'ancien producteur
     confirme termine. `cwd` est fixe au dossier parent de `level_path` pour que
     add_reactive_metering puisse s'en tenir a un nom de fichier relatif dans le
     graphe de filtres (voir sa docstring : un chemin absolu Windows casse le
     parseur d'options a cause du `:` du lecteur).
-
-    Le tube lui-meme (Popen direct, pas un pipe shell, fermeture de
-    `source.stdout` cote parent) est factore dans `common.pipe_to_ffplay` — voir
-    sa docstring pour le detail de pourquoi chaque etape compte.
     """
-    return pipe_to_ffplay(
-        producer_command(args, level_path),
-        viewer_command(args, width, height, position, monitor),
+    return subprocess.Popen(
+        producer_command(args, level_path), stdout=subprocess.PIPE,
         cwd=str(level_path.parent) if level_path is not None else None,
     )
+
+
+def spawn_display(args: argparse.Namespace, width: int, height: int,
+                  position: tuple[int, int] | None = None,
+                  monitor: tuple[int, int, int, int] | None = None) -> subprocess.Popen:
+    """Lance SEULEMENT l'afficheur (ffplay), stdin relie a un pipe PYTHON que
+    relay_loop() alimente -- voir sa docstring. N'est rappelee que pour un
+    redemarrage "dur" (taille/plein ecran changes, voir run()) : ce sont les
+    deux seuls reglages qu'un ffplay deja lance ne peut pas changer sans se
+    redemarrer lui-meme (resolution/mode plein ecran fixes a l'ouverture).
+    """
+    return subprocess.Popen(
+        viewer_command(args, width, height, position, monitor), stdin=subprocess.PIPE)
+
+
+# 64 Ko : assez gros pour un debit eleve (une frame 1080p rgb24 fait ~6 Mo a 30
+# fps, soit ~180 Mo/s a relayer), assez petit pour que relay_loop() revienne
+# verifier stop_event/un changement de producteur plusieurs fois par frame
+# plutot que de rester bloquee sur un seul read() disproportionne.
+RELAY_CHUNK_SIZE = 1 << 16
+
+
+def relay_loop(relay_state: dict, stop_event: threading.Event) -> None:
+    """Pompe en continu les octets du PRODUCTEUR actif vers l'AFFICHEUR actif,
+    tous deux relus depuis `relay_state` (mis a jour par run() a chaque
+    redemarrage) plutot que figes en parametres -- c'est ce qui permet a un
+    redemarrage "doux" de remplacer le producteur SANS jamais toucher a
+    l'afficheur : la fenetre ffplay ne se ferme/rouvre plus a chaque clic sur
+    "Appliquer", seulement quand la taille/le plein ecran changent (voir
+    run()/spawn_display()). Remplace le tube direct `common.pipe_to_ffplay`
+    utilise partout ailleurs dans ce depot -- le cout mesure de cette copie
+    Python (memcpy d'un `read()`/`write()` de pipe, pas de traitement) est
+    negligeable face au debit dont ffplay a besoin (voir RELAY_CHUNK_SIZE),
+    largement compense par le benefice de fenetre stable.
+
+    Ne recolle JAMAIS les octets de deux producteurs differents dans un meme
+    `read()` -- `producer`/`display` sont relus au DEBUT de chaque iteration,
+    un changement de producteur en cours de route (run() met a jour
+    `relay_state["producer"]` puis termine l'ancien, voir sa docstring)
+    n'affecte donc que la PROCHAINE lecture, jamais celle deja en cours. Au
+    pire une frame de transition legerement decalee (invisible en pratique, le
+    temps d'un seul refresh), jamais un flux durablement corrompu.
+    """
+    while not stop_event.is_set():
+        producer = relay_state.get("producer")
+        display = relay_state.get("display")
+        if producer is None or display is None:
+            time.sleep(0.01)
+            continue
+        try:
+            chunk = producer.stdout.read(RELAY_CHUNK_SIZE)
+        except (OSError, ValueError):
+            # Producteur en train d'etre remplace/ferme sous nos pieds (son
+            # tube cote lecture vient d'etre ferme par run()) -- pas fatal,
+            # relay_state sera a jour au tour suivant.
+            time.sleep(0.01)
+            continue
+        if not chunk:
+            # EOF : producteur termine (remplace par run(), ou plante -- run()
+            # detecte ce dernier cas via poll()). Rien a transmettre ce tour.
+            time.sleep(0.01)
+            continue
+        try:
+            display.stdin.write(chunk)
+            display.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Fenetre fermee par l'utilisateur -- run() le detecte deja via
+            # display.poll() dans sa boucle de service, rien a faire ici.
+            time.sleep(0.01)
+            continue
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    """Arrete proprement un des deux process de la paire (producteur ou
+    afficheur) : ferme d'abord son tube cote Python (stdin pour l'afficheur,
+    stdout pour le producteur -- Python possede desormais les deux bouts des
+    deux tubes, voir relay_loop()) avant `terminate()`/`wait()`, pour eviter
+    de laisser un descripteur de fichier ouvert sur un process deja mort.
+    """
+    if proc.stdin is not None:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    if proc.poll() is None:
+        proc.terminate()
+    proc.wait()
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
 
 
 def discard_level_file(level_path: Path) -> None:
@@ -624,28 +712,73 @@ def reactive_watcher(args: argparse.Namespace, level_state: dict,
 def run(args: argparse.Namespace, width: int, height: int, status: dict,
        restart_event: threading.Event, stop_event: threading.Event,
        finished_event: threading.Event) -> None:
-    """Supervise la paire producteur/afficheur ; la relance quand `restart_event` est
-    positionne (reglages changes dans --gui), s'arrete quand `stop_event` l'est ou que
-    la fenetre ffplay est fermee. Tourne dans un fil separe quand --gui est actif, pour
-    laisser tkinter posseder le fil principal ; appele une seule fois sinon.
+    """Supervise producteur et afficheur ; relance le producteur (et, si besoin,
+    l'afficheur) quand `restart_event` est positionne (reglages changes dans
+    --gui), s'arrete quand `stop_event` l'est ou que la fenetre ffplay est
+    fermee. Tourne dans un fil separe quand --gui est actif, pour laisser
+    tkinter posseder le fil principal ; appele une seule fois sinon.
 
-    Un redemarrage lance la nouvelle paire AVANT de fermer l'ancienne (a la meme
-    position d'ecran, voir window_title/find_window_position), pour que l'ancienne
-    fenetre ne disparaisse qu'une fois la nouvelle deja affichee: c'est le sens de
-    --gui sur ce script, masquer le redemarrage plutot que de juste le declencher.
-    Si la nouvelle paire echoue a demarrer (mauvais reglage, peripherique perdu),
-    l'ancienne est conservee et le probleme est signale, plutot que de tout perdre.
+    **Deux natures de redemarrage, pas une seule** -- c'est le changement
+    central par rapport a la version precedente de cette fonction (qui
+    redemarrait TOUJOURS la paire complete producteur+afficheur, voir
+    l'historique git) :
 
-    --reactive ajoute deux fils de fond (voir read_reactive_level/reactive_watcher)
-    qui appellent restart_event.set() de la meme facon que le bouton Appliquer du
-    --gui: ce sont deux sources possibles du meme signal, run() ne fait pas la
-    difference entre les deux.
+    - **"Doux"** (le cas courant -- couleurs, gain, style, peripherique,
+      `--glow`/`--hue-cycle`, `--reactive`...) : seul le PRODUCTEUR (ffmpeg)
+      est remplace. L'AFFICHEUR (ffplay), deja ouvert, n'est jamais touche --
+      `relay_loop()` (fil dedie, demarre une fois pour toute la duree de
+      run()) pompe en continu les octets du producteur ACTIF vers l'afficheur
+      ACTIF, tous deux lus depuis `relay_state` ; remplacer le producteur ne
+      consiste donc qu'a swapper `relay_state["producer"]` puis terminer
+      l'ancien -- la fenetre ffplay ne clignote plus du tout. C'etait
+      exactement le symptome signale par l'utilisateur ("le mode live bug, le
+      plein ecran est actif quel que soit la valeur de la coche" puis,
+      question explicite, "n'est-il vraiment pas possible d'empecher la
+      fermeture/reouverture de la fenetre ffplay"). Le titre de la fenetre
+      (qui inclut le mode/peripherique) ne peut en revanche pas etre
+      repasse a un ffplay deja lance : `set_window_title()` (common.py, via
+      SetWindowTextW) le met a jour EN PLACE si besoin, cote appelant.
+    - **"Dur"** (uniquement `--size`/`--fullscreen`) : ffplay ne sait pas
+      changer sa resolution ni son mode plein ecran sans se redemarrer
+      lui-meme (`-video_size`/`-fs`/`-noborder` sont fixes a l'ouverture) --
+      la fenetre EST recreee ici, avec le meme mecanisme "seamless" que
+      l'ancienne version (nouvelle paire lancee AVANT que l'ancienne ne
+      ferme, position/moniteur repris via find_window_position/
+      target_monitor_rect) pour que ca reste visible comme une mise a jour
+      sur place plutot qu'une fenetre qui disparait et se rouvre ailleurs.
+
+    `run()` decide entre les deux en comparant `resolve_size(args)`/
+    `args.fullscreen` a la derniere paire (taille, plein ecran) effectivement
+    affichee -- exactement le meme principe que l'ancienne comparaison
+    `current_size != size or args.fullscreen != last_fullscreen`, sauf que
+    maintenant elle controle QUEL type de redemarrage se produit plutot que
+    SI un redemarrage se produit (tout le reste de la fenetre redemarre de
+    toute facon le producteur a chaque Appliquer, voir build_gui()).
+
+    Si une nouvelle tentative echoue a demarrer (mauvais reglage, peripherique
+    perdu), l'ancienne paire/le producteur precedent restent actifs et le
+    probleme est signale, plutot que de tout perdre -- inchange par rapport a
+    avant.
+
+    --reactive ajoute deux fils de fond (voir read_reactive_level/
+    reactive_watcher) qui appellent restart_event.set() de la meme facon que
+    le bouton Appliquer du --gui: ce sont deux sources possibles du meme
+    signal, run() ne fait pas la difference entre les deux -- et comme
+    --reactive ne touche jamais a la taille/au plein ecran, ses redemarrages
+    sont TOUJOURS "doux" desormais (l'ancienne version devait deja les
+    masquer de son mieux avec le mecanisme "dur" seamless ; ici la fenetre
+    n'est simplement plus concernee du tout).
     """
-    source = display = None
+    relay_state: dict = {"producer": None, "display": None}
+    threading.Thread(target=relay_loop, args=(relay_state, stop_event), daemon=True).start()
+
+    producer = display = None
     current_title = None
-    # Le fichier de niveau actuellement ecrit par le producteur ACTIF (source) ;
-    # jamais celui d'un producteur pas encore confirme ou deja arrete (voir plus
-    # bas: efface uniquement une fois l'ancien producteur termine).
+    current_size: tuple[int, int] | None = None
+    current_fullscreen: bool | None = None
+    # Le fichier de niveau actuellement ecrit par le producteur ACTIF ; jamais
+    # celui d'un producteur pas encore confirme ou deja arrete (voir plus bas:
+    # efface uniquement une fois l'ancien producteur termine).
     active_level_path = None
     level_state = None
     reactive_counter = 0
@@ -658,102 +791,140 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                          daemon=True).start()
     try:
         while not stop_event.is_set():
-            # Efface la demande qu'on s'appprete a traiter AVANT de lancer spawn(),
-            # pas apres: sinon une nouvelle demande arrivee pendant spawn()/le delai
-            # de grace (un redemarrage --reactive automatique, en particulier: rien
-            # ne protege son declenchement comme le ferait le temps de reaction d'un
-            # humain sur le bouton Appliquer) tombe dans la fenetre entre le succes
-            # du spawn et ce clear() et se retrouve effacee avant meme que la boucle
-            # interne ne l'ait vue passer a True -- perdue en silence, aucun
-            # redemarrage n'a lieu alors qu'un changement l'exigeait. Efface ici, en
-            # tete de boucle, rien ne l'efface plus jusqu'au prochain passage: un
-            # set() pendant spawn()/le delai de grace ou pendant la boucle interne
-            # reste donc bien vu.
+            # Efface la demande qu'on s'appprete a traiter AVANT de lancer un
+            # spawn, pas apres: sinon une nouvelle demande arrivee pendant le
+            # spawn/le delai de grace (un redemarrage --reactive automatique,
+            # en particulier: rien ne protege son declenchement comme le
+            # ferait le temps de reaction d'un humain sur le bouton Appliquer)
+            # tombe dans la fenetre entre le succes du spawn et ce clear() et
+            # se retrouve effacee avant meme que la boucle interne ne l'ait
+            # vue passer a True -- perdue en silence, aucun redemarrage n'a
+            # lieu alors qu'un changement l'exigeait. Efface ici, en tete de
+            # boucle, rien ne l'efface plus jusqu'au prochain passage.
             restart_event.clear()
-            # --size/--fullscreen (voir build_gui) ne sont pas relus "en direct":
-            # comme tout le reste de cette fenetre, ils n'ont d'effet qu'au
-            # prochain spawn(), donc resolus ICI, a chaque tour, plutot qu'une
-            # seule fois avant la boucle (ce que faisaient les parametres
-            # width/height de run() avant ce changement -- un --size/--fullscreen
-            # touche dans --gui restait alors sans aucun effet, meme apres
-            # Appliquer, puisque spawn() ne voyait jamais que la taille figee au
-            # tout premier lancement).
-            width, height = resolve_size(args)
-            # Premier lancement (current_title encore None, aucune fenetre a
-            # retrouver) : ouvre par defaut sur un DEUXIEME ecran s'il y en a
-            # un (demande explicite), sinon None laisse ffplay choisir comme
-            # avant. Une fois une fenetre deja ouverte, find_window_position
-            # reprend la main (PRESERVE la position choisie/deplacee a la
-            # main par l'utilisateur plutot que de la ramener au moniteur 2
-            # a chaque redemarrage --gui).
-            secondary = secondary_monitor_rect()
-            position = (find_window_position(current_title) if current_title
-                       else (secondary[:2] if secondary else None))
-            # `monitor` (voir target_monitor_rect() dans common.py) ne sert
-            # qu'en plein ecran (voir viewer_command()) : remplace -fs natif
-            # par une fenetre borderless calee sur le moniteur qui heberge deja
-            # la fenetre actuelle (ou le deuxieme ecran par defaut au premier
-            # lancement) -- corrige un plein ecran qui revenait sur l'ecran
-            # principal a chaque fois, signale par l'utilisateur.
-            monitor = target_monitor_rect(current_title)
+            new_width, new_height = resolve_size(args)
+            display_changed = (
+                display is None
+                or (new_width, new_height) != current_size
+                or args.fullscreen != current_fullscreen
+            )
             new_level_path = None
             if args.reactive:
-                # Nom NEUF a chaque tentative (voir spawn()/read_reactive_level):
-                # jamais le meme fichier que le producteur en cours, encore actif
-                # pendant le chevauchement du redemarrage seamless.
+                # Nom NEUF a chaque tentative (voir spawn_producer()/
+                # read_reactive_level): jamais le meme fichier que le
+                # producteur en cours, encore actif pendant le chevauchement.
                 reactive_counter += 1
                 new_level_path = (Path(tempfile.gettempdir())
                                   / f"audio2wave_live_level_{os.getpid()}_{reactive_counter}.txt")
-            try:
-                new_source, new_display = spawn(args, width, height, position, monitor, new_level_path)
-            except OSError as exc:
-                status["text"] = f"echec du lancement: {exc}"
-                print(f"\nEchec du lancement: {exc}", file=sys.stderr)
-                break
 
-            time.sleep(RESTART_GRACE_S)
-            if new_source.poll() is not None or new_display.poll() is not None:
-                new_source.terminate()
-                new_source.wait()
-                if new_display.poll() is None:
-                    new_display.terminate()
-                new_display.wait()
-                # Producteur jamais devenu actif: son fichier de niveau, si present,
-                # n'a jamais ete lu par personne et peut partir tout de suite.
-                if new_level_path is not None:
-                    discard_level_file(new_level_path)
-                if source is None:
-                    status["text"] = "echec du lancement"
+            if display_changed:
+                # Redemarrage "dur" : voir la docstring plus haut. Premier
+                # lancement (current_title encore None, aucune fenetre a
+                # retrouver) : ouvre par defaut sur un DEUXIEME ecran s'il y
+                # en a un, sinon None laisse ffplay choisir. Une fois une
+                # fenetre deja ouverte, find_window_position reprend la main
+                # (PRESERVE la position choisie/deplacee a la main par
+                # l'utilisateur plutot que de la ramener au moniteur 2 a
+                # chaque redemarrage --gui).
+                secondary = secondary_monitor_rect()
+                position = (find_window_position(current_title) if current_title
+                           else (secondary[:2] if secondary else None))
+                monitor = target_monitor_rect(current_title)
+                try:
+                    new_display = spawn_display(args, new_width, new_height, position, monitor)
+                    new_producer = spawn_producer(args, new_level_path)
+                except OSError as exc:
+                    status["text"] = f"echec du lancement: {exc}"
+                    print(f"\nEchec du lancement: {exc}", file=sys.stderr)
                     break
-                status["text"] = "echec du redemarrage, reglages precedents conserves"
-                print("\nEchec du redemarrage avec les nouveaux reglages: ancienne "
-                      "fenetre conservee.", file=sys.stderr)
-                # source/display restent l'ancienne paire, toujours active: on ne
-                # retente PAS tout de suite (sinon un reglage casse ferait boucler
-                # indefiniment sur des spawn()), on attend la prochaine demande.
-            else:
-                if source is not None:
-                    source.terminate()
-                    source.wait()
-                    if display.poll() is None:
-                        display.terminate()
-                    display.wait()
-                    # L'ancien producteur est confirme arrete: son fichier de niveau
-                    # peut maintenant etre efface (voir discard_level_file: au mieux,
-                    # Windows peut encore le tenir un instant apres coup).
+
+                time.sleep(RESTART_GRACE_S)
+                if new_display.poll() is not None or new_producer.poll() is not None:
+                    _terminate(new_producer)
+                    _terminate(new_display)
+                    # Producteur jamais devenu actif: son fichier de niveau, si
+                    # present, n'a jamais ete lu par personne et peut partir
+                    # tout de suite.
+                    if new_level_path is not None:
+                        discard_level_file(new_level_path)
+                    if display is None:
+                        status["text"] = "echec du lancement"
+                        break
+                    status["text"] = "echec du redemarrage, reglages precedents conserves"
+                    print("\nEchec du redemarrage avec les nouveaux reglages: ancienne "
+                          "fenetre conservee.", file=sys.stderr)
+                    # producer/display restent l'ancienne paire, toujours
+                    # active (relay_state n'a pas bouge): on ne retente PAS
+                    # tout de suite (sinon un reglage casse ferait boucler
+                    # indefiniment), on attend la prochaine demande.
+                else:
+                    old_producer, old_display = producer, display
+                    relay_state["producer"] = new_producer
+                    relay_state["display"] = new_display
+                    if old_producer is not None:
+                        _terminate(old_producer)
+                    if old_display is not None:
+                        _terminate(old_display)
+                    # L'ancien producteur est confirme arrete: son fichier de
+                    # niveau peut maintenant etre efface (voir
+                    # discard_level_file: au mieux, Windows peut encore le
+                    # tenir un instant apres coup).
                     if active_level_path is not None:
                         discard_level_file(active_level_path)
-                source, display = new_source, new_display
-                active_level_path = new_level_path
-                if level_state is not None:
-                    level_state["path"] = new_level_path
-                current_title = window_title(args)
-                status["text"] = (f"[{time.strftime('%H:%M:%S')}] {describe_mode(args)}, "
-                                  f"{resolve_bars(args, width)} barres, "
-                                  f"gain {resolve_gain(args):+.0f} dB")
+                    producer, display = new_producer, new_display
+                    active_level_path = new_level_path
+                    if level_state is not None:
+                        level_state["path"] = new_level_path
+                    current_size = (new_width, new_height)
+                    current_fullscreen = args.fullscreen
+                    current_title = window_title(args)
+                    width, height = new_width, new_height
+                    status["text"] = (f"[{time.strftime('%H:%M:%S')}] {describe_mode(args)}, "
+                                      f"{resolve_bars(args, width)} barres, "
+                                      f"gain {resolve_gain(args):+.0f} dB")
+            else:
+                # Redemarrage "doux" : voir la docstring plus haut. La fenetre
+                # ffplay DEJA OUVERTE (`display`) n'est jamais touchee.
+                try:
+                    new_producer = spawn_producer(args, new_level_path)
+                except OSError as exc:
+                    status["text"] = f"echec du lancement: {exc}"
+                    print(f"\nEchec du lancement: {exc}", file=sys.stderr)
+                    break
 
-            # Sert la paire courante (celle qui vient d'etre lancee, ou l'ancienne si
-            # le redemarrage a echoue) jusqu'a la prochaine demande ou la fermeture.
+                time.sleep(RESTART_GRACE_S)
+                if new_producer.poll() is not None:
+                    _terminate(new_producer)
+                    if new_level_path is not None:
+                        discard_level_file(new_level_path)
+                    status["text"] = "echec du redemarrage, reglages precedents conserves"
+                    print("\nEchec du redemarrage avec les nouveaux reglages: flux "
+                          "precedent conserve.", file=sys.stderr)
+                else:
+                    old_producer = producer
+                    relay_state["producer"] = new_producer
+                    if old_producer is not None:
+                        _terminate(old_producer)
+                    if active_level_path is not None:
+                        discard_level_file(active_level_path)
+                    producer = new_producer
+                    active_level_path = new_level_path
+                    if level_state is not None:
+                        level_state["path"] = new_level_path
+                    # Le titre affiche (mode/peripherique) ne peut pas etre
+                    # repasse a un ffplay deja lance: mis a jour EN PLACE si
+                    # besoin (voir set_window_title() dans common.py).
+                    new_title = window_title(args)
+                    if new_title != current_title:
+                        set_window_title(current_title, new_title)
+                        current_title = new_title
+                    status["text"] = (f"[{time.strftime('%H:%M:%S')}] {describe_mode(args)}, "
+                                      f"{resolve_bars(args, width)} barres, "
+                                      f"gain {resolve_gain(args):+.0f} dB")
+
+            # Sert la paire courante (celle qui vient d'etre lancee/mise a
+            # jour, ou l'ancienne si le redemarrage a echoue) jusqu'a la
+            # prochaine demande ou la fermeture.
             while not stop_event.is_set() and not restart_event.is_set():
                 if display.poll() is not None:
                     # Fenetre fermee par l'utilisateur (ou -autoexit) : on arrete tout,
@@ -762,12 +933,10 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                     break
                 time.sleep(0.1)
     finally:
-        if source is not None:
-            source.terminate()
-            source.wait()
-            if display.poll() is None:
-                display.terminate()
-            display.wait()
+        if producer is not None:
+            _terminate(producer)
+        if display is not None:
+            _terminate(display)
         if active_level_path is not None:
             discard_level_file(active_level_path)
         finished_event.set()
@@ -1161,11 +1330,13 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     """Petite fenetre de reglages.
 
     A la difference de audio2wave_snap.py/audio2wave_ridge.py, un changement ici ne
-    prend pas effet tout seul: ce script n'a pas de boucle Python par image a relire
-    (producteur et afficheur sont relies par un tube direct pour la latence, voir
-    CLAUDE.md). Chaque reglage n'est donc applique qu'au clic sur "Appliquer", qui
-    relance le pipeline avec les nouvelles valeurs — la fenetre video se referme et
-    se rouvre. Les curseurs ne redemarrent pas a chaque cran deplace, seulement au clic.
+    prend pas effet tout seul: ce script n'a pas de boucle Python par image a relire.
+    Chaque reglage n'est donc applique qu'au clic sur "Appliquer", qui relance le
+    PRODUCTEUR (ffmpeg) avec les nouvelles valeurs -- mais, depuis le relais Python
+    de run()/relay_loop() (voir sa docstring), la fenetre video elle-meme ne se
+    ferme/rouvre plus pour un tel changement, seulement quand la Taille fenetre ou
+    le Plein ecran changent (ffplay ne peut pas changer ca sans se redemarrer
+    lui-meme). Les curseurs ne redemarrent pas a chaque cran deplace, seulement au clic.
 
     `root` : la fenetre Tk a peupler, PARTAGEE entre les trois modes (voir
     "Bascule de mode EN PLACE, MEME FENETRE" dans CLAUDE.md, et la docstring de
@@ -1763,7 +1934,8 @@ def run_app(args: argparse.Namespace, width: int, height: int,
     report_latency(args)
     if args.gui:
         print("Fenetre de reglages ouverte: ferme-la ou Ctrl+C pour arreter. Chaque clic sur "
-              "Appliquer relance le pipeline (la fenetre video se referme et se rouvre).",
+              "Appliquer relance le flux audio (la fenetre video ne bouge pas, sauf "
+              "changement de taille/plein ecran).",
               flush=True)
     else:
         print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
