@@ -13,10 +13,48 @@ Quatre programmes autour des filtres de visualisation audio de ffmpeg :
   n'est efface au rafraichissement : chaque nouvelle ligne s'empile devant les
   precedentes, qui defilent et sortent par le haut comme un sismographe.
 
-## Prerequis
+## Installation
 
-ffmpeg dans le PATH : `winget install --id Gyan.FFmpeg`
-(`ffplay`, utilise par la version temps reel, est fourni avec.)
+Deux facons d'avoir ffmpeg/ffprobe/ffplay, au choix :
+
+**Pour une utilisation ponctuelle ou en developpement** — installe ffmpeg pour
+toute la machine :
+
+```bash
+winget install --id Gyan.FFmpeg
+```
+
+(`ffplay`, utilise par les versions temps reel/photo, est fourni avec. Si tu
+viens de l'installer, ouvre un nouveau terminal : le `PATH` n'est pas
+rafraichi dans les fenetres deja ouvertes.)
+
+**Pour donner le projet a quelqu'un qui n'a rien a configurer** — pas besoin
+d'installer ffmpeg ni de toucher au `PATH` :
+
+1. Telecharge un build Windows (ex. [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/),
+   lien "release essentials", ~100 Mo).
+2. Extrais `ffmpeg.exe`, `ffprobe.exe` et `ffplay.exe` (dans le sous-dossier
+   `bin/` du zip telecharge) dans un dossier `bin/` cree a la racine de ce
+   depot, a cote de `audio2wave_snap.py`.
+3. Double-clique un des fichiers `Demarrer - ....bat` a la racine.
+
+Les scripts detectent automatiquement `bin/` s'il existe et l'utilisent en
+priorite, sans rien configurer d'autre — voir `common.py` si l'un des deux
+chemins d'installation te surprend.
+
+## Lancement sans terminal (`.bat`)
+
+Trois fichiers `.bat` a la racine, un par script avec fenetre de reglages :
+
+| fichier | lance |
+|---|---|
+| `Demarrer - Photo waveform.bat` | `audio2wave_snap.py --gui` (entree audio choisie dans la fenetre) |
+| `Demarrer - Onde en direct.bat` | `audio2wave_live.py --gui` (demande le nom de l'entree audio au demarrage) |
+| `Demarrer - Vagues empilees.bat` | `audio2wave_ridge.py --gui` (demande le nom de l'entree audio au demarrage) |
+
+Double-clic, pas de ligne de commande a taper. Nécessite [Python](https://www.python.org/downloads/)
+installe (coche "Add python.exe to PATH" pendant l'installation) — le `.bat`
+previent clairement si ce n'est pas le cas plutot que d'echouer en silence.
 
 ---
 
@@ -437,7 +475,10 @@ Sauvegarder (nouveau nom) et Mettre a jour (preset selectionne dans le menu
 **Charger**) capturent tous les deux tout ce que la fenetre expose (style, couleurs,
 epaisseur, `--wave`, points/colonnes, echelle, filtre, crossover, gain, images/s,
 dossier PNG) — pas seulement les quelques options choisies a la main dans les
-presets integres. **La taille de fenetre (largeur/hauteur) n'en fait pas
+presets integres. **L'etat de la "Variation automatique" (voir plus bas) fait
+partie du preset** : pour chaque curseur automatable, la case activee ou non,
+la courbe dessinee et sa vitesse sont sauvegardees et restaurees a l'identique.
+**La taille de fenetre (largeur/hauteur) n'en fait pas
 partie** : elle reste independante des reglages visuels, un preset ne la
 change jamais, meme si elle etait differente au moment de sauvegarder.
 **Mettre a jour** peut aussi cibler un preset integre (`wave`,
@@ -548,6 +589,21 @@ Le nombre de kicks detectes par photo s'affiche dans la ligne de statut
 (console et `--gui`) des que l'option est active, meme quand il vaut 0 : utile
 pour verifier que la detection accroche bien avant de chercher le halo a l'oeil.
 
+**`--glow-live`** anime ce MEME halo autrement : au lieu de positions de kick
+detectees sur la photo entiere (donc figees jusqu'a la prochaine photo, avec
+le retard d'un `--beats`/`--bpm` complet), il suit le niveau audio EN CONTINU
+et s'applique uniformement sur tout le trait — l'intensite monte et descend en
+temps reel, sans attendre le prochain rafraichissement :
+
+```bash
+python audio2wave_snap.py -d "<entree>" --kick-glow --glow-live
+```
+
+Necessite `--kick-glow` (c'est un mode du meme halo, pas un effet a part) ;
+dans `--gui`, c'est une case "Temps reel" juste a cote de "Halo sur les
+kicks", sans effet si cette derniere n'est pas cochee. La ligne de statut
+affiche alors l'intensite courante du halo plutot qu'un compte de kicks.
+
 Ce style est **rasterise en Python, pas par ffmpeg** : aucun filtre ne dessine une
 polyligne d'enveloppe, `showwavespic` remplit une silhouette et `showwaves` trace la
 forme d'onde elle-meme. Pour chaque colonne, le segment vertical reliant la hauteur
@@ -592,6 +648,7 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--wave [n]` | sinusoide bornee par l'amplitude au lieu du contour, `pencil` seul | contour ; `24` avec l'option |
 | `--kick-glow` | halo blanc sur le trait a chaque kick detecte, `pencil` seul | desactive |
 | `--kick-glow-size <px>` | rayon du halo | `40` |
+| `--glow-live` | le meme halo, anime en temps reel par le niveau audio courant (necessite `--kick-glow`) | desactive |
 | `--crossover <g,a>` | coupures entre bandes, en Hz | `200,2000` |
 | `--gain auto\|<dB>` | `auto` normalise chaque photo sur sa propre crete | `auto` |
 | `--scale` | `lin` \| `sqrt` \| `cbrt` \| `log` | `lin` |
@@ -695,14 +752,23 @@ repeinture par pas ; a garder en tete sur une resolution plein ecran.
 ## Fenetre de reglages en direct (`--gui`)
 
 ```bash
-python audio2wave_snap.py -d "<entree>" --gui
+python audio2wave_snap.py --gui                  # choisis l'entree dans la fenetre
+python audio2wave_snap.py -d "<entree>" --gui    # ou directement en ligne de commande
 ```
+
+**`-d`/`--device` est optionnel avec `--gui`** : le menu deroulant "Entree
+audio" de la fenetre (bouton **Actualiser** pour detecter un peripherique
+branche apres coup) permet de le choisir apres coup, donc rien n'empeche de
+lancer la fenetre sans en preciser un sur la ligne de commande. Sans `--gui`,
+`-d` reste obligatoire (aucun autre moyen d'en choisir un) ; `--dry-run`
+l'exige aussi meme combine a `--gui` (il n'y a rien de reel a montrer sans
+peripherique).
 
 Ouvre une petite fenetre tkinter avec un controle par reglage : entree audio,
 tempo (BPM et temps par photo, `--bpm`/`--beats`),
 style (pencil / rekordbox / simple), couleurs du trait et de fond, epaisseur,
 `--wave` (case a cocher + oscillations), points/colonnes, `--kick-glow` (case a
-cocher + rayon du halo), echelle, filtre par
+cocher + rayon du halo + case "Temps reel" pour `--glow-live`), echelle, filtre par
 colonne, crossover (deux champs Hz), gain (case "automatique" + curseur manuel en
 dB) avec un bouton **Mesurer (tuning)**, video interieure/exterieure (`--video`/
 `--video2`, pencil seul), dossier PNG (`--save-dir`, cree au besoin), images/s du

@@ -27,9 +27,9 @@ import sys
 from pathlib import Path
 
 from common import (
-    GUI_ACCENT, GUI_ACCENT_FG, GUI_BG, GUI_FG, GUI_FONT, GUI_FONT_BOLD, GUI_FONT_HEADING,
-    GUI_FONT_MONO, GUI_FONT_SMALL, GUI_MUTED_FG, GUI_PANEL_BG, auto_win_size, gain_value,
-    parse_size, style_gui, style_option_menu,
+    BIN_DIR, GUI_ACCENT, GUI_ACCENT_FG, GUI_BG, GUI_FG, GUI_FONT, GUI_FONT_BOLD,
+    GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL, GUI_MUTED_FG, GUI_PANEL_BG,
+    auto_win_size, gain_value, parse_size, style_gui, style_option_menu,
 )
 
 # Correction appliquee au-dessus d'une normalisation de crete, pour que le trace
@@ -429,10 +429,13 @@ def main() -> None:
 
     if shutil.which("ffmpeg") is None:
         print(
-            "ffmpeg est introuvable dans le PATH.\n"
-            "Installe-le puis reessaie, par ex.:\n"
-            "  winget install --id Gyan.FFmpeg\n"
-            "ou telecharge un build sur https://www.gyan.dev/ffmpeg/builds/",
+            "ffmpeg est introuvable.\n"
+            f"Le plus simple: telecharge un build (ex. "
+            f"https://www.gyan.dev/ffmpeg/builds/, lien 'release essentials') et "
+            f"place ffmpeg.exe dans {BIN_DIR} -- detecte automatiquement, aucune "
+            f"configuration du PATH necessaire.\n"
+            "Ou installe-le pour toute la machine, par ex.:\n"
+            "  winget install --id Gyan.FFmpeg",
             file=sys.stderr,
         )
         sys.exit(1)

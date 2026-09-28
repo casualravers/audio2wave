@@ -145,6 +145,22 @@ KICK_GLOW_EXTRA_RATIO = 0.3  # epaississement du trait au pic du halo, en fracti
 # eclaircir le trait -- invisible des que le trait etait deja blanc.
 KICK_GLOW_HALO_RATIO = 0.6   # portee verticale du halo, en fraction du rayon
 
+# --glow-live: le halo suit le niveau audio COURANT plutot que des positions de
+# kick detectees sur la photo entiere (voir --kick-glow ci-dessus) -- demande
+# explicite pour une animation "en temps reel", sans le retard d'une photo
+# complete (jusqu'a --beats/--bpm de latence avec le mecanisme kicks). Mesure
+# via LiveCapture.recent_level(), qui lit la QUEUE du tampon glissant deja
+# alimente en continu par le fil _pump, independamment du rythme des photos.
+GLOW_LIVE_WINDOW_MS = 40.0   # fenetre de mesure du niveau courant: courte pour
+                              # rester "maintenant", assez longue pour un chiffre
+                              # stable (2 cycles a 50 Hz, meme ordre que
+                              # KICK_ANALYSIS_MS plus haut).
+GLOW_LIVE_ATTACK = 0.6       # lissage exponentiel a la MONTEE (reactif: repond
+                              # tout de suite a un coup)
+GLOW_LIVE_RELEASE = 0.15     # lissage exponentiel a la DESCENTE (fondu, pas une
+                              # extinction brutale) -- vu-metre a crete plutot
+                              # qu'une moyenne symetrique.
+
 # --gui: "variation automatique" fait piloter un curseur coche via '~' (epaisseur,
 # points/colonnes, rayon du halo -- voir add_slider(automatable=True) dans build_gui)
 # par une COURBE qui lui est propre, pas une forme partagee : chaque curseur a son
@@ -443,6 +459,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kick-glow-size", type=int, default=KICK_GLOW_RADIUS_PX,
                     help=f"Rayon du halo en pixels, pour --kick-glow "
                          f"(defaut: {KICK_GLOW_RADIUS_PX})")
+    p.add_argument("--glow-live", action="store_true",
+                    help="Le halo suit le niveau audio EN TEMPS REEL (anime a chaque image "
+                         "du trace progressif) plutot que des positions de kick detectees sur "
+                         "la photo entiere -- pas de retard d'une photo (--beats/--bpm). "
+                         "Necessite --kick-glow. --style pencil seul")
     p.add_argument("--crossover", default=None,
                     help=f"Coupures entre bandes en Hz, GRAVES,AIGUS, pour --style rekordbox "
                          f"(defaut: {DEFAULT_CROSSOVER[0]},{DEFAULT_CROSSOVER[1]})")
@@ -557,6 +578,9 @@ def parse_args() -> argparse.Namespace:
         p.error("--wave demande au moins une oscillation")
     if args.kick_glow_size < 1:
         p.error("--kick-glow-size doit valoir au moins 1")
+    if args.glow_live and not args.kick_glow:
+        p.error("--glow-live n'a de sens qu'avec --kick-glow (c'est le meme halo, "
+                "juste anime en temps reel plutot que sur des kicks detectes)")
     for opt in ("video", "video2"):
         path = getattr(args, opt)
         if path is not None:
@@ -951,6 +975,63 @@ class LiveCapture:
             if excess > 0:
                 del self._buf[:excess]
 
+    def recent_level(self, tail_bytes: int) -> float | None:
+        """Niveau RMS normalise (0..1) des `tail_bytes` DERNIERS octets du tampon
+        glissant, ou None si le tampon n'en contient pas encore assez.
+
+        A la difference de `latest()` (toute la fenetre de la photo, PLEINE et
+        donc figee au rythme des photos), lit une COURTE tranche de queue a
+        chaque appel -- toujours fraiche quel que soit le moment ou elle est
+        appelee, puisque `_pump` alimente `_buf` en continu independamment de
+        `run()`. Sert au halo temps reel (`--glow-live`): la mesure n'a plus a
+        attendre la prochaine photo pour refleter le son qui joue MAINTENANT.
+        """
+        with self._lock:
+            if len(self._buf) < tail_bytes:
+                return None
+            tail = bytes(self._buf[-tail_bytes:])
+        samples = array.array("h")
+        samples.frombytes(tail[: len(tail) - len(tail) % SAMPLE_BYTES])
+        if not samples:
+            return 0.0
+        ms = sum(s * s for s in samples) / len(samples)
+        return math.sqrt(ms) / 32768
+
+
+class NoDeviceCapture:
+    """Remplace `LiveCapture` tant qu'aucun peripherique n'est choisi (--gui sans
+    -d/--device, voir main()) : `latest()` ne renvoie jamais rien, donc `run()`
+    saute chaque photo (`if pcm is None: continue`) sans rien afficher, en
+    attendant que l'utilisateur en selectionne un dans le menu deroulant.
+    `ended` reste a False expres -- passer a True ferait croire a une capture
+    interrompue et arreterait `run()` (`if capture.ended: break`), alors qu'il
+    n'y a simplement encore rien a capturer. Remplace par une vraie
+    `LiveCapture` des que `args.device` devient non vide, via le MEME chemin de
+    redemarrage que choisir un autre peripherique en cours de route (voir
+    `run()`, comparaison `args.device != last_device`)."""
+    ended = False
+
+    def latest(self) -> bytes | None:
+        return None
+
+    def set_window(self, window_bytes: int) -> None:
+        pass
+
+    def recent_level(self, tail_bytes: int) -> float | None:
+        return None
+
+
+class NoDeviceProcess:
+    """Remplace `capture_proc` tant qu'aucun peripherique n'est choisi : aucun
+    vrai sous-processus a terminer, juste les deux methodes que `run()` appelle
+    dessus (redemarrage sur choix d'un peripherique, nettoyage final)."""
+
+    def terminate(self) -> None:
+        pass
+
+    def wait(self) -> None:
+        pass
+
 
 class VideoSource:
     """Decode une video en boucle a la taille exacte du canevas, et garde la derniere
@@ -1155,6 +1236,31 @@ def detect_kicks(pcm: bytes, channels: int, rate: int, width: int) -> list[int]:
     return [round(k * (width - 1) / max(1, n - 1)) for k in kicks]
 
 
+class LiveGlowMeter:
+    """Lissage attaque/relachement du niveau audio courant, pour --glow-live.
+
+    La valeur MONTE vite (`GLOW_LIVE_ATTACK`, le halo doit repondre tout de
+    suite a un coup) mais REDESCEND plus lentement (`GLOW_LIVE_RELEASE`, un
+    fondu plutot qu'une extinction brutale) -- un vu-metre a crete, pas une
+    simple moyenne glissante symetrique qui lisserait aussi les attaques.
+    Un lissage exponentiel a un seul coefficient suffit (pas de fenetre a
+    stocker) : `recent_level()` est deja assez bruite sur une fenetre courte
+    (`GLOW_LIVE_WINDOW_MS`) pour beneficier d'un peu de continuite d'une
+    image du balayage progressif a l'autre.
+    """
+
+    def __init__(self, attack: float = GLOW_LIVE_ATTACK,
+                release: float = GLOW_LIVE_RELEASE) -> None:
+        self.attack = attack
+        self.release = release
+        self.value = 0.0
+
+    def push(self, level: float) -> float:
+        rate = self.attack if level > self.value else self.release
+        self.value += (level - self.value) * rate
+        return self.value
+
+
 def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int]
                    ) -> list[tuple[int, int, tuple[int, ...]]]:
     """Pour chaque colonne: (haut de l'enveloppe, bas de l'enveloppe, hauteurs a encrer).
@@ -1203,7 +1309,8 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
                          video_out: bytes | None, start: int, end: int,
                          full: bool = True, draw_ink: bool = True,
                          kicks: list[int] | None = None,
-                         kick_glow_radius: int = KICK_GLOW_RADIUS_PX) -> None:
+                         kick_glow_radius: int = KICK_GLOW_RADIUS_PX,
+                         live_glow: float | None = None) -> None:
     """Peint les colonnes [start, end) du canevas: le fond d'abord (le canevas peut
     porter une photo precedente), la video interieure entre les bornes de l'enveloppe,
     la video exterieure au-dela, puis le trait.
@@ -1249,6 +1356,14 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
     "s'eclaircirait" vers du blanc sans aucun effet visible avec la couleur pencil
     par defaut (deja blanche). Ignore si `draw_ink` est faux, le halo suit le
     trait comme le reste.
+
+    `live_glow` (0..1, voir LiveGlowMeter/--glow-live), quand fourni, REMPLACE le
+    calcul par distance a `kicks` : la MEME intensite s'applique a TOUTES les
+    colonnes du halo, plutot qu'un halo localise pres de positions figees sur la
+    photo. `kicks` est alors ignore (les deux mecanismes ne se cumulent pas,
+    voir --glow-live) -- c'est ce qui permet d'animer le halo au niveau audio
+    COURANT, rappele a chaque image du balayage progressif, sans devoir attendre
+    la prochaine photo comme le fait la detection de kicks (voir sa docstring).
     """
     width, height = size
     stride = width * 3
@@ -1286,14 +1401,17 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
                         video_out[col0 + c:col0 + c + rows * stride:stride]
 
         if draw_ink:
-            glow = 0.0
-            if kicks:
-                for kx in kicks:
-                    d = abs(x - kx)
-                    if d <= kick_glow_radius:
-                        g = 1 - d / kick_glow_radius
-                        if g > glow:
-                            glow = g
+            if live_glow is not None:
+                glow = live_glow
+            else:
+                glow = 0.0
+                if kicks:
+                    for kx in kicks:
+                        d = abs(x - kx)
+                        if d <= kick_glow_radius:
+                            g = 1 - d / kick_glow_radius
+                            if g > glow:
+                                glow = g
             extra = round(glow * kick_glow_radius * KICK_GLOW_EXTRA_RATIO)
             halo_px = round(glow * kick_glow_radius * KICK_GLOW_HALO_RATIO)
             for index, y_now in enumerate(heights):
@@ -1323,19 +1441,21 @@ def compose_pencil(size: tuple[int, int], columns: list[tuple[int, ...]], backgr
                    ink: bytes, thickness: int, video: bytes | None = None,
                    video_out: bytes | None = None, draw_ink: bool = True,
                    kicks: list[int] | None = None,
-                   kick_glow_radius: int = KICK_GLOW_RADIUS_PX) -> bytes:
+                   kick_glow_radius: int = KICK_GLOW_RADIUS_PX,
+                   live_glow: float | None = None) -> bytes:
     """Image complete du style pencil, fond compris.
 
     `draw_ink=False` omet le trait (fond + video seuls) : sert a construire le
     canevas de depart du balayage suivant dans run(), pour que l'ancien contour ne
     survive jamais au-dela de sa propre photo (voir draw_pencil_video_progressively).
-    `kicks`/`kick_glow_radius`: voir paint_pencil_columns, --kick-glow.
+    `kicks`/`kick_glow_radius`/`live_glow`: voir paint_pencil_columns, --kick-glow/
+    --glow-live.
     """
     width, height = size
     canvas = bytearray(background * (width * height))
     paint_pencil_columns(canvas, size, columns, background, ink, thickness, video, video_out,
                          0, width, draw_ink=draw_ink, kicks=kicks,
-                         kick_glow_radius=kick_glow_radius)
+                         kick_glow_radius=kick_glow_radius, live_glow=live_glow)
     return bytes(canvas)
 
 
@@ -1459,7 +1579,9 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
                                     video: VideoSource | None, video_out: VideoSource | None,
                                     deadline: float, fps: int,
                                     kicks: list[int] | None = None,
-                                    kick_glow_radius: int = KICK_GLOW_RADIUS_PX) -> bool:
+                                    kick_glow_radius: int = KICK_GLOW_RADIUS_PX,
+                                    live_glow_source: Callable[[], float | None] | None = None
+                                    ) -> bool:
     """Variante de draw_progressively pour --video/--video2: la video continue de
     jouer pendant le balayage, et se superpose lentement a la photo precedente sur
     tout le creneau, comme le reste du trace (voir draw_progressively).
@@ -1512,15 +1634,27 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
     photo precedente (c'est le point de draw_progressively/superposition lente
     ci-dessus) ; seul le trait est exclu de ce qui est transmis d'un balayage a
     l'autre.
+
+    `live_glow_source` (voir LiveGlowMeter/--glow-live), quand fourni, est
+    rappelee a CHAQUE image de ce balayage (pas seulement une fois par photo
+    comme `kicks`) : le halo qui en resulte doit donc pouvoir se repeindre sur
+    la portion DEJA REVELEE meme quand aucune colonne neuve n'apparait a ce
+    tick (le niveau audio bouge plus vite que le balayage) -- sinon il
+    resterait fige a l'intensite du tick ou chaque colonne a ete revelee, ce
+    qui viderait --glow-live de son interet. Restreint a `[0, drawn)`, jamais
+    au-dela: contrairement a `video_out` juste en dessous, le trait ne doit
+    jamais apparaitre sur des colonnes pas encore atteintes par le front.
     """
     width, height = size
     span = deadline - time.monotonic()
     if fps <= 0 or span <= 0:  # pas le temps de dessiner: image d'un coup
         canvas = bytearray(previous)
+        live_glow = live_glow_source() if live_glow_source else None
         paint_pencil_columns(canvas, size, columns, background, ink, thickness,
                              video.latest() if video else None,
                              video_out.latest() if video_out else None, 0, width,
-                             kicks=kicks, kick_glow_radius=kick_glow_radius)
+                             kicks=kicks, kick_glow_radius=kick_glow_radius,
+                             live_glow=live_glow)
         return send_frame(viewer, canvas)
 
     canvas = bytearray(previous)
@@ -1534,20 +1668,33 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
         target = width if progress >= 1 else max(drawn, int(width * progress))
         frame_video = video.latest() if video else None
         frame_video_out = video_out.latest() if video_out else None
+        live_glow = live_glow_source() if live_glow_source else None
+        glow_refresh = live_glow is not None and drawn > 0
         if target != drawn:
-            # Colonnes deja revelees: seule la video interieure bouge, fond et
-            # trait restent tels quels (poses lors de leur premiere apparition).
+            # Colonnes deja revelees: seule la video interieure (et le halo
+            # temps reel, si actif) bougent, fond et trait restent tels quels
+            # (poses lors de leur premiere apparition).
             if drawn > 0:
                 paint_pencil_columns(canvas, size, columns, background, ink, thickness,
                                      frame_video, None, 0, drawn, full=False,
-                                     kicks=kicks, kick_glow_radius=kick_glow_radius)
+                                     kicks=kicks, kick_glow_radius=kick_glow_radius,
+                                     live_glow=live_glow)
             # Colonnes tout juste decouvertes: fond, video interieure et trait.
             paint_pencil_columns(canvas, size, columns, background, ink, thickness,
                                  frame_video, None, drawn, target, full=True,
-                                 kicks=kicks, kick_glow_radius=kick_glow_radius)
+                                 kicks=kicks, kick_glow_radius=kick_glow_radius,
+                                 live_glow=live_glow)
             drawn = target
-        elif frame_video_out is None:
+        elif frame_video_out is None and not glow_refresh:
             continue
+        elif glow_refresh:
+            # Rien de neuf revele ce tick, mais le halo temps reel a pu changer
+            # depuis le dernier: repeint la portion deja revelee pour le
+            # refleter, meme si target == drawn.
+            paint_pencil_columns(canvas, size, columns, background, ink, thickness,
+                                 frame_video, None, 0, drawn, full=False,
+                                 kicks=kicks, kick_glow_radius=kick_glow_radius,
+                                 live_glow=live_glow)
         if frame_video_out is not None:
             # video_out (hors bande) ne suit PAS le front du balayage: repeinte sur
             # toute la largeur a chaque pas, y compris au-dela des colonnes deja
@@ -1558,7 +1705,8 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
             # la zone hors bande, jamais le trait ni la video interieure.
             paint_pencil_columns(canvas, size, columns, background, ink, thickness,
                                  None, frame_video_out, 0, width, full=False,
-                                 kicks=kicks, kick_glow_radius=kick_glow_radius)
+                                 kicks=kicks, kick_glow_radius=kick_glow_radius,
+                                 live_glow=live_glow)
         if not send_frame(viewer, canvas):
             return False
     return True
@@ -2026,10 +2174,31 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         # from_=MAX, to=MIN (pas l'inverse) : la gauche du curseur est le plus lent,
         # la droite le plus rapide, voir AUTOMATE_PERIOD_MIN_S/MAX_S plus haut.
         tk.Scale(speed_row, from_=AUTOMATE_PERIOD_MAX_S, to=AUTOMATE_PERIOD_MIN_S, resolution=1,
-                orient="horizontal", variable=state["period"], length=140, showvalue=True,
+                orient="horizontal", variable=state["period"], length=140, showvalue=False,
                 ).pack(side="left", padx=(8, 0))
+        # `showvalue=True` afficherait juste "40" a l'extremite lente -- un chiffre
+        # brut et eleve la ou l'utilisateur s'attend a une "vitesse" minimale, lu
+        # comme incoherent malgre la tooltip juste au-dessus (signale par
+        # l'utilisateur : "pour une vitesse au min ... affiche la valeur de 40").
+        # Une etiquette separee avec l'unite ("40 s/cycle") lit le meme chiffre
+        # comme une DUREE, ou un grand nombre = un cycle long = lent se comprend
+        # sans repasser par la tooltip.
+        speed_value_label = tk.Label(speed_row, width=9)
+        speed_value_label.pack(side="left", padx=(6, 0))
+
+        def update_speed_label(*_args: object) -> None:
+            speed_value_label.config(text=f"{state['period'].get():.0f} s/cycle")
+
+        # `state["period"]` (le DoubleVar) survit d'une ouverture de l'editeur a
+        # l'autre (voir plus haut : seuls les widgets sont recrees), donc la trace
+        # doit etre retiree a la fermeture (`on_close`) sous peine de s'empiler a
+        # chaque reouverture -- une trace d'une session precedente appellerait
+        # alors `.config()` sur un `speed_value_label` deja detruit.
+        trace_id = state["period"].trace_add("write", update_speed_label)
+        update_speed_label()
 
         def on_close() -> None:
+            state["period"].trace_remove("write", trace_id)
             state["editor"] = None
             state["canvas"] = None
             win.destroy()
@@ -2129,13 +2298,38 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     controls["kick_glow"] = on_kick_glow_change
 
+    # --glow-live (voir LiveGlowMeter) : meme halo que ci-dessus, mais anime par
+    # le niveau audio COURANT (mesure en continu) plutot que des positions de
+    # kick figees sur la photo -- demande explicite d'une animation "en temps
+    # reel", sans le retard d'un --beats entier avant qu'un coup ne se voie.
+    # Case a cocher juste a cote (pas une ligne separee) : c'est un MODE du
+    # meme halo, pas un effet independant -- n'a d'effet que si la case
+    # "Halo sur les kicks" ci-contre est aussi cochee (voir run()).
+    glow_live_var = tk.BooleanVar(value=args.glow_live)
+
+    def on_glow_live_change(value: object = None) -> None:
+        if value is not None:
+            glow_live_var.set(bool(value))
+        args.glow_live = glow_live_var.get()
+
+    controls["glow_live"] = on_glow_live_change
+
     r = next_row("left")
-    kick_glow_check = tk.Checkbutton(root, text="Halo sur les kicks", variable=kick_glow_var,
-                                     command=on_kick_glow_change)
-    kick_glow_check.grid(row=r, column=0, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    kick_glow_frame = tk.Frame(root)
+    kick_glow_frame.grid(row=r, column=0, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    kick_glow_check = tk.Checkbutton(kick_glow_frame, text="Halo sur les kicks",
+                                     variable=kick_glow_var, command=on_kick_glow_change)
+    kick_glow_check.pack(side="left")
     Tooltip(kick_glow_check, "Ajoute un halo blanc sur le trait a chaque attaque (kick) "
                             "detectee dans le signal. --style pencil seul, purement "
                             "decoratif.")
+    glow_live_check = tk.Checkbutton(kick_glow_frame, text="Temps reel",
+                                     variable=glow_live_var, command=on_glow_live_change)
+    glow_live_check.pack(side="left", padx=(10, 0))
+    Tooltip(glow_live_check, "Le halo suit le niveau audio en continu au lieu de positions "
+                            "de kick detectees sur la photo entiere: anime a chaque image "
+                            "du trace, sans le retard d'une photo complete. Sans effet si "
+                            "'Halo sur les kicks' n'est pas coche.")
 
     add_slider("Rayon du halo", "kick_glow_size", 5, 150, 5,
               tooltip="En pixels, pour le halo sur les kicks ci-dessus.", automatable=True)
@@ -2497,17 +2691,69 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # exclue ici, pas le mode plein ecran.
     PRESET_EXCLUDED_CONTROLS = {"size"}
 
+    # Cle reservee (prefixe "_", ne collisionne avec aucun `dest` argparse) qui
+    # porte l'etat de la "Variation automatique" (case ~, courbe, vitesse) par
+    # attribut automatable dans le JSON d'un preset -- demande explicite
+    # ("j'ai l'impression que tu as oublie de prendre en compte les
+    # automations de parametres dans les presets"). Auparavant deliberement
+    # absent (voir plus haut : "une preference de session plutot qu'un
+    # attribut de rendu a figer"), mais l'utilisateur a confirme le vouloir
+    # inclus. `--preset <nom>` en ligne de commande (qui passe le dict entier
+    # a `p.set_defaults(**overrides)`) tolere cette cle en plus sans effet
+    # (argparse accepte n'importe quel nom de `dest`, meme absent de toute
+    # option definie -- juste un attribut de namespace inutilise cote CLI, ou
+    # cette fenetre --gui n'existe pas).
+    AUTOMATION_PRESET_KEY = "_automation"
+
+    def capture_automation() -> dict:
+        return {
+            attr: {
+                "enabled": bool(state["enabled"].get()),
+                "points": list(state["points"]),
+                "period": float(state["period"].get()),
+            }
+            for attr, state in automation.items()
+        }
+
+    def apply_automation(data: dict) -> None:
+        # Cles absentes de `automation` (preset plus ancien, ou courbe d'un
+        # attribut qui n'est plus automatable) silencieusement ignorees --
+        # meme tolerance que `skipped` pour les `controls` disparus.
+        for attr, entry in data.items():
+            state = automation.get(attr)
+            if state is None or not isinstance(entry, dict):
+                continue
+            points = entry.get("points")
+            if isinstance(points, list) and len(points) == len(state["points"]):
+                state["points"] = [float(v) for v in points]
+            period = entry.get("period")
+            if isinstance(period, (int, float)):
+                state["period"].set(float(period))
+            enabled = bool(entry.get("enabled", False))
+            state["enabled"].set(enabled)
+            if enabled:
+                # Repart du tout premier point de la courbe, pas d'une phase
+                # arbitraire de l'horloge globale -- meme raison que on_toggle
+                # (voir plus haut) quand la case ~ est cochee a la main.
+                state["start"] = time.monotonic()
+            redraw_curve(attr)  # no-op si l'editeur de cet attribut n'est pas ouvert
+
     def apply_preset(overrides: dict) -> list[str]:
         """Applique les cles d'un preset aux widgets+args ; renvoie celles ignorees
         (figees au lancement et non exposees dans cette fenetre, ou explicitement
         exclues des presets comme "size" -- voir PRESET_EXCLUDED_CONTROLS)."""
         skipped = [key for key in overrides
-                  if key not in controls or key in PRESET_EXCLUDED_CONTROLS]
+                  if key != AUTOMATION_PRESET_KEY
+                  and (key not in controls or key in PRESET_EXCLUDED_CONTROLS)]
         if "style" in overrides:
             controls["style"](overrides["style"])
         for key, value in overrides.items():
-            if key != "style" and key in controls and key not in PRESET_EXCLUDED_CONTROLS:
+            if (key != "style" and key != AUTOMATION_PRESET_KEY
+                    and key in controls and key not in PRESET_EXCLUDED_CONTROLS):
                 controls[key](value)
+        automation_data = overrides.get(AUTOMATION_PRESET_KEY)
+        if isinstance(automation_data, dict):
+            apply_automation(automation_data)
         return skipped
 
     preset_var = tk.StringVar(value="")
@@ -2575,6 +2821,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         for key, value in overrides.items():
             if isinstance(value, Path):
                 overrides[key] = str(value)
+        overrides[AUTOMATION_PRESET_KEY] = capture_automation()
         return overrides
 
     def on_update_preset() -> None:
@@ -3050,6 +3297,29 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     # muter un canevas partage entre les photos (voir leur docstring).
     previous_frame = background * (size[0] * size[1])
 
+    # --glow-live : mesure le niveau audio EN CONTINU (LiveCapture.recent_level lit
+    # la queue du tampon glissant, alimente par _pump independamment du rythme des
+    # photos), lue a CHAQUE image du balayage progressif plutot qu'une fois par
+    # photo comme detect_kicks -- l'animation du halo n'a alors plus a attendre la
+    # prochaine photo pour refleter le son qui joue MAINTENANT. `glow_live_window_bytes`
+    # ne change pas en cours de route: --rate/--stereo/--split-channels restent figes
+    # pour toute la session (voir plus haut, changement d'entree audio), seul `-i`
+    # differe d'un peripherique a l'autre. `gain` (lu par la fermeture ci-dessous)
+    # est celui de la DERNIERE photo composee, pas resonde a chaque image du
+    # balayage -- il ne change de toute facon qu'une fois par photo.
+    glow_live_window_bytes = round(
+        capture_rate(args) * GLOW_LIVE_WINDOW_MS / 1000) * SAMPLE_BYTES * channel_count(args)
+    glow_meter = LiveGlowMeter()
+
+    def read_live_glow() -> float | None:
+        if not (args.kick_glow and args.glow_live):
+            return None
+        level = capture.recent_level(glow_live_window_bytes)
+        if level is None:
+            return None
+        factor = 10 ** (gain / 20)
+        return glow_meter.push(min(1.0, level * factor))
+
     # Cadence calee sur l'horloge, et non sur la fin du rendu: sinon chaque photo
     # arriverait avec le retard cumule des rendus precedents et glisserait par rapport
     # au tempo. La premiere photo attend d'avoir une fenetre pleine.
@@ -3195,17 +3465,22 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                 if args.style == "pencil":
                     # Le trace est fige pour toute la photo; seule la video, si elle
                     # est active, continuera de bouger dessous pendant le balayage.
-                    # Les kicks aussi: detectes une fois sur le bloc PCM entier de la
-                    # photo, comme les hauteurs -- pas quelque chose que le balayage
-                    # recalcule au fil de l'eau.
+                    # Les kicks aussi (sauf --glow-live, voir plus bas): detectes une
+                    # fois sur le bloc PCM entier de la photo, comme les hauteurs --
+                    # pas quelque chose que le balayage recalcule au fil de l'eau.
                     columns = pencil_heights(args, pcm, gain, size)
+                    # --glow-live pilote le halo par une mesure continue (voir
+                    # read_live_glow/draw_pencil_video_progressively), pas par des
+                    # positions figees sur cette photo: detect_kicks n'a plus lieu
+                    # d'etre calcule dans ce mode (cout evite, pas juste ignore).
                     kicks = (detect_kicks(pcm, channel_count(args), capture_rate(args), size[0])
-                             if args.kick_glow else None)
+                             if args.kick_glow and not args.glow_live else None)
                     frame = compose_pencil(size, columns, background, ink,
                                            max(1, args.line_width),
                                            video.latest() if video else None,
                                            video_out.latest() if video_out else None,
-                                           kicks=kicks, kick_glow_radius=args.kick_glow_size)
+                                           kicks=kicks, kick_glow_radius=args.kick_glow_size,
+                                           live_glow=read_live_glow())
                     if png:
                         write_png(size, frame, png)
                 else:
@@ -3230,7 +3505,15 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             # ne dit pas si le detecteur ne trouve rien ou si le halo est juste
             # trop discret a l'oeil -- affiche le compte a chaque photo, pas
             # seulement quand des kicks sont trouves, pour voir aussi le cas 0.
-            kick_info = f", {len(kicks) if kicks is not None else 0} kick(s)" if args.kick_glow else ""
+            if args.kick_glow and args.glow_live:
+                # Pas de kicks a compter dans ce mode (voir plus haut) -- l'intensite
+                # courante du meter sert de diagnostic equivalent: confirme que le
+                # halo suit bien le niveau audio, sans attendre de le voir a l'ecran.
+                kick_info = f", halo temps reel {glow_meter.value:.2f}"
+            elif args.kick_glow:
+                kick_info = f", {len(kicks) if kicks is not None else 0} kick(s)"
+            else:
+                kick_info = ""
             text = (f"[{time.strftime('%H:%M:%S')}] {level}{kick_info}"
                     f"{f' -> {png.name}' if png else ''}")
             status["text"] = text
@@ -3238,11 +3521,18 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
 
             # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
             # bord droit au moment ou la photo suivante prend sa place.
-            if (video is not None or video_out is not None) and columns is not None:
+            # --glow-live route aussi par ce chemin (meme sans video/video2): c'est
+            # le seul des deux a rappeler un callback a chaque image du balayage
+            # (voir live_glow_source plus bas) -- draw_progressively, plus simple,
+            # ne fait que recopier un `frame` deja fige.
+            glow_live_active = args.kick_glow and args.glow_live
+            if (video is not None or video_out is not None or glow_live_active) \
+                    and columns is not None:
                 ok = draw_pencil_video_progressively(
                     viewer, previous_frame, columns, size, background, ink,
                     max(1, args.line_width), video, video_out, next_at, args.draw_fps,
-                    kicks=kicks, kick_glow_radius=args.kick_glow_size)
+                    kicks=kicks, kick_glow_radius=args.kick_glow_size,
+                    live_glow_source=read_live_glow if glow_live_active else None)
                 if not ok:
                     break  # fenetre fermee
                 # Le canevas de depart du PROCHAIN balayage ne doit jamais porter ce
@@ -3295,7 +3585,12 @@ def main() -> None:
             print(f'  -d "{name}"')
         return
 
-    if not args.device:
+    if not args.device and not args.gui:
+        # En --gui, le menu deroulant "Entree audio" (deja dans la fenetre,
+        # voir refresh_devices()) permet de choisir le peripherique APRES le
+        # lancement -- demande explicite ("je veux pouvoir lancer la gui sans
+        # avoir a preciser le device -d en ligne de commande"). Sans --gui il
+        # n'y a aucun autre moyen d'en choisir un, l'erreur reste bloquante.
         print("Indique une entree avec -d/--device (ou --list-devices pour les lister).",
               file=sys.stderr)
         sys.exit(2)
@@ -3309,6 +3604,15 @@ def main() -> None:
 
     size = resolve_size(args)
     sample_png = (args.save_dir / "waveform_<horodatage>.png") if args.save_dir else None
+
+    if args.dry_run and not args.device:
+        # --dry-run affiche la commande qui serait lancee: sans peripherique
+        # (permis avec --gui seul, voir plus haut) il n'y a rien de reel a
+        # montrer -- contrairement a --gui seul, ce cas n'a pas de fenetre pour
+        # en choisir un ensuite (--dry-run rend la main avant toute fenetre).
+        print("--dry-run a besoin d'un peripherique: indique -d/--device (ou "
+              "--list-devices pour les lister).", file=sys.stderr)
+        sys.exit(2)
 
     if args.dry_run:
         print(" ".join(f'"{c}"' if " " in c else c for c in capture_command(args)))
@@ -3327,7 +3631,9 @@ def main() -> None:
             if args.video2:
                 print(f"  (video hors de l'amplitude min et max: {args.video2}, en boucle, "
                       f"recadree en {size[0]}x{size[1]})")
-            if args.kick_glow:
+            if args.kick_glow and args.glow_live:
+                print(f"  (halo blanc anime en temps reel, rayon {args.kick_glow_size} px)")
+            elif args.kick_glow:
                 print(f"  (halo blanc sur les kicks detectes, rayon {args.kick_glow_size} px)")
         else:
             print(" ".join(f'"{c}"' if " " in c else c for c in
@@ -3340,7 +3646,10 @@ def main() -> None:
         args.save_dir.mkdir(parents=True, exist_ok=True)
 
     if args.rate is None:
-        native = probe_device_rate(args)
+        # Sans peripherique encore choisi (--gui, voir plus haut), interroger
+        # une entree vide n'aurait aucun sens -- reste sur le repli
+        # (DEFAULT_CAPTURE_RATE) le temps que l'utilisateur en selectionne un.
+        native = probe_device_rate(args) if args.device else None
         if native:
             args.rate = native
             print(f"Capture a {native} Hz, la frequence du peripherique: aucun "
@@ -3369,7 +3678,10 @@ def main() -> None:
     if args.video2:
         print(f"Video hors de l'amplitude min et max: {args.video2.name}, en boucle, "
               f"recadree en {size[0]}x{size[1]}.", flush=True)
-    if args.kick_glow:
+    if args.kick_glow and args.glow_live:
+        print(f"Halo blanc anime en temps reel (niveau audio courant), rayon "
+              f"{args.kick_glow_size} px.", flush=True)
+    elif args.kick_glow:
         print(f"Halo blanc sur les kicks detectes, rayon {args.kick_glow_size} px.", flush=True)
     if args.draw_fps > 0:
         print(f"Trace progressif a {args.draw_fps} img/s, termine pile au rafraichissement.",
@@ -3378,12 +3690,24 @@ def main() -> None:
 
     if args.gui:
         print("Fenetre de reglages ouverte: ferme-la ou Ctrl+C pour arreter.", flush=True)
+    if not args.device:
+        print("Aucune entree audio choisie: selectionne-la dans le menu deroulant "
+              "'Entree audio' de la fenetre --gui.", flush=True)
 
     background = probe_color(resolve_bg(args))
     ink = probe_color(resolve_colors(args)[0])
-    capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
+    # Sans peripherique (--gui seul, voir plus haut) : pas de vrai ffmpeg dshow a
+    # lancer sur une entree qui n'existe pas encore. `NoDeviceProcess`/
+    # `NoDeviceCapture` tiennent la place jusqu'a ce que args.device change --
+    # `run()` les remplace alors par une vraie capture, exactement comme il le
+    # fait deja pour un changement de peripherique en cours de route.
+    if args.device:
+        capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
+        capture = LiveCapture(capture_proc.stdout, chunk_size(args))
+    else:
+        capture_proc = NoDeviceProcess()
+        capture = NoDeviceCapture()
     viewer = subprocess.Popen(viewer_command(args, size), stdin=subprocess.PIPE)
-    capture = LiveCapture(capture_proc.stdout, chunk_size(args))
 
     status: dict = {}
     # Pont vers le bouton "Mesurer" de --gui: la LiveCapture courante, remplacee par

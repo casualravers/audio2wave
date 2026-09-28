@@ -12,6 +12,7 @@ Stdlib seulement, comme le reste du depot.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -141,15 +142,51 @@ def gain_value(raw: str) -> float | str:
         raise argparse.ArgumentTypeError(f"gain invalide: {raw} (un nombre en dB, ou 'auto')")
 
 
+# Dossier optionnel a cote des scripts (ffmpeg.exe/ffprobe.exe/ffplay.exe) : permet
+# de distribuer le projet a une machine non-developpeur sans installer ffmpeg ni
+# toucher au PATH systeme soi-meme -- voir add_bundled_ffmpeg_to_path() juste apres,
+# et les .bat de lancement a la racine du depot (README, section Installation).
+BIN_DIR = Path(__file__).resolve().parent / "bin"
+
+
+def add_bundled_ffmpeg_to_path() -> None:
+    """Place BIN_DIR en tete du PATH du PROCESSUS COURANT si le dossier existe --
+    sans effet sinon, le PATH systeme reste seul utilise (comportement inchange
+    pour qui a deja ffmpeg installe normalement, BIN_DIR absent). Tous les appels
+    ffmpeg/ffprobe/ffplay de ce depot invoquent l'outil par son nom seul (jamais un
+    chemin absolu) : c'est la recherche dans le PATH, faite par l'OS a l'appel de
+    chaque subprocess.run/Popen, qui les resout -- prefixer le PATH ici (une seule
+    fois, tot) suffit donc a faire passer un binaire local devant le PATH systeme,
+    sans toucher au moindre site d'appel des quatre scripts.
+
+    Appelee au NIVEAU MODULE (une fois a l'import de common.py, pas dans chaque
+    main()) : les quatre scripts importent tous ce module, et certains verifient
+    ffmpeg AVANT meme d'appeler require_tools() (audio2wave.py a son propre
+    controle inline) -- un appel explicite dans chaque main() risquerait d'arriver
+    trop tard pour l'un d'eux si le code y bouge un jour.
+    """
+    if BIN_DIR.is_dir():
+        os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ.get("PATH", "")
+
+
+add_bundled_ffmpeg_to_path()
+
+
 def require_tools() -> None:
     missing = [tool for tool in ("ffmpeg", "ffplay") if shutil.which(tool) is None]
     if missing:
         print(
             f"Introuvable dans le PATH: {', '.join(missing)}.\n"
-            "Installe ffmpeg (ffplay est fourni avec), par ex.:\n"
-            "  winget install --id Gyan.FFmpeg\n"
-            "Si tu viens de l'installer, ouvre un nouveau terminal: le PATH n'est pas\n"
-            "rafraichi dans les fenetres deja ouvertes.",
+            "Deux facons de corriger ca:\n"
+            f"  1. Telecharge un build (ex. https://www.gyan.dev/ffmpeg/builds/, "
+            f"lien 'release essentials') et place ffmpeg.exe/ffprobe.exe/ffplay.exe "
+            f"dans {BIN_DIR} -- aucune configuration du PATH necessaire, detecte "
+            f"automatiquement au prochain lancement.\n"
+            "  2. Installe ffmpeg pour toute la machine (ffplay est fourni avec), "
+            "par ex.:\n"
+            "       winget install --id Gyan.FFmpeg\n"
+            "     Si tu viens de l'installer, ouvre un nouveau terminal: le PATH "
+            "n'est pas rafraichi dans les fenetres deja ouvertes.",
             file=sys.stderr,
         )
         sys.exit(1)

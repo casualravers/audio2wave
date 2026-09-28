@@ -375,6 +375,28 @@ resolution de chemins.
   stricte. Un `Tooltip` sur le label "Vitesse" precise desormais le sens
   ("droite = plus rapide, gauche = plus lent") : cette fenetre popup n'avait
   jusque-la aucune info-bulle, a la difference de la fenetre principale.
+  **Bug corrige, distinct du precedent : le chiffre affiche par le `Scale`
+  restait un nombre brut de secondes** (`showvalue=True`), lu comme incoherent
+  malgre la direction desormais correcte et la tooltip juste au-dessus —
+  signale par l'utilisateur ("pour une vitesse au min, le slider est a gauche,
+  mais affiche la valeur de 40") : un grand chiffre nu a l'extremite "lente"
+  ne se lit pas naturellement comme une "vitesse minimale" sans repasser par
+  la tooltip. `showvalue=False` desormais, remplace par une etiquette
+  separee (`speed_value_label`, largeur fixe pour ne pas faire sauter le
+  reste de la ligne) mise a jour via `trace_add("write", ...)` sur
+  `state["period"]`, affichant `f"{periode:.0f} s/cycle"` : le MEME chiffre
+  se lit alors comme une DUREE de cycle (grand = cycle long = lent), plus
+  besoin de deviner l'unite. **Piege de reouverture** : `state["period"]`
+  (le `tk.DoubleVar`) SURVIT d'une ouverture de l'editeur a l'autre (voir
+  plus haut, seuls les widgets sont recrees a chaque `open_curve_editor`) —
+  une trace posee dessus sans etre retiree a la fermeture s'empilerait a
+  chaque reouverture, et la plus ancienne appellerait `.config()` sur un
+  `speed_value_label` deja detruit par la fermeture precedente. `on_close()`
+  retire donc la trace (`trace_remove("write", trace_id)`) avant de detruire
+  la fenetre. Verifie : la valeur affichee aux deux extremites correspond
+  bien a `AUTOMATE_PERIOD_MAX_S`/`MIN_S` avec l'unite, et fermer/rouvrir
+  l'editeur puis redeplacer le curseur ne leve aucune exception (la trace de
+  la session precedente ne s'est pas accumulee).
   Rouvrir l'editeur
   d'un attribut deja ouvert relve juste sa fenetre (`winfo_exists()` +
   `lift()`) plutot que d'en dupliquer une deuxieme. `on_curve_drag` retrouve
@@ -401,10 +423,34 @@ resolution de chemins.
   l'utilisateur qui vient de cocher la case. `automate_tick()` s'arrete de se
   reprogrammer des que `finished_event` est positionne (fenetre video fermee),
   meme garde que `refresh()` (statut) juste apres dans le code — sans ca, `root`
-  detruit ferait echouer le prochain `root.after`. Ni `automation` ni l'etat des
-  editeurs ne sont dans `controls` : deliberement absents des presets
-  (`capture_overrides()` ne capture que `controls`), une preference de session
-  plutot qu'un attribut de rendu a figer dans un preset. Verifie en pilotant les
+  detruit ferait echouer le prochain `root.after`. `automation` n'est PAS dans
+  `controls` (`capture_overrides()` ne capture que `controls`), mais est
+  desormais capture par les presets quand meme, via une cle separee dediee
+  (`AUTOMATION_PRESET_KEY = "_automation"`, voir la section Presets plus bas)
+  plutot qu'en l'ajoutant a `controls` : un preset --gui melangerait sinon
+  deux natures de donnees dans le meme espace de cles (`dest` argparse vs
+  etat d'automation par attribut), et `--preset <nom>` en ligne de commande
+  passe le dict entier tel quel a `set_defaults()` — y meler des cles qui ne
+  sont pas des `dest` valides aurait ete plus fragile a suivre que d'isoler
+  une seule cle previsible. **Revenu sur le choix initial ("une preference de
+  session plutot qu'un attribut de rendu a figer dans un preset")** a la
+  demande explicite de l'utilisateur apres relecture ("j'ai l'impression que
+  tu as oublie de prendre en compte les automations de parametres dans les
+  presets") : l'etat de chaque curseur automatable (`enabled`, `points`,
+  `period`) est desormais inclus. `capture_automation()`/`apply_automation()`
+  (definies juste avant `apply_preset()`, dans la section Presets) font le
+  pont : la premiere lit `automation` telle quelle (les `tk.BooleanVar`/
+  `tk.DoubleVar` converties en `bool`/`float` pour rester JSON-serialisables,
+  `points` copiee en liste neuve) ; la seconde reapplique `points`/`period`
+  puis `enabled` EN DERNIER (comme `on_toggle` a la main : cocher `enabled`
+  reinitialise `state["start"]`, pour repartir du premier point de la courbe
+  plutot que de sauter a une phase arbitraire). Cles d'attributs absents de
+  `automation` (preset plus ancien sans cette section, ou attribut qui n'est
+  plus automatable) silencieusement ignorees, meme tolerance que `skipped`
+  pour les `controls` disparus. `apply_preset()` traite `_automation` a part
+  du reste des cles (ni applique via `controls`, ni ajoute a `skipped` — ce
+  n'est pas une option ignoree, elle est bien geree, juste par un chemin
+  different). Verifie en pilotant les
   widgets de l'editeur par de vrais evenements Tk (`invoke()`/`event_generate`,
   pas de mock) et de vrais ecoulements de `time.monotonic()` sur quelques
   secondes : le preset "carre" colle bien la valeur pres des bornes (pas au
@@ -460,7 +506,41 @@ resolution de chemins.
   l'ouverture de la fenetre (le cas d'usage vise : brancher des platines en cours
   de route) ; la valeur courante reste dans la liste meme si elle en disparait
   (peripherique debranche), pour ne pas la changer sous les pieds de
-  l'utilisateur. `--video`/`--video2` sont des champs texte resolus par
+  l'utilisateur.
+  **`-d`/`--device` est desormais optionnel en `--gui`**, a la demande
+  explicite ("je veux pouvoir lancer la gui sans avoir a preciser le device -d
+  en ligne de commande") : puisque ce menu deroulant permet deja de choisir
+  (ou changer) le peripherique APRES le lancement, l'exiger AVANT n'apportait
+  rien d'autre qu'une friction (`--list-devices` puis copier-coller le nom
+  exact, souvent recopie a chaque lancement). `main()` refuse toujours l'absence
+  de `-d` quand `--gui` n'est PAS passe (aucun autre moyen d'en choisir un), et
+  quand `--dry-run` est demande meme avec `--gui` (il n'y a rien de reel a
+  montrer sans peripherique, et `--dry-run` rend la main avant toute fenetre --
+  pas de rattrapage possible ensuite). Sans peripherique, `capture_proc`/
+  `capture` ne sont PAS un vrai `subprocess.Popen`/`LiveCapture` (ouvrir un
+  flux dshow sur une entree vide n'a pas de sens) mais `NoDeviceProcess`/
+  `NoDeviceCapture` (juste apres `LiveCapture`, avant `VideoSource`) : la
+  premiere n'a que `terminate()`/`wait()` en no-op (les deux seules methodes
+  que `run()` appelle sur `capture_proc`), la seconde `latest()` qui renvoie
+  toujours `None` (`run()` saute alors la photo, `if pcm is None: continue`,
+  sans rien afficher) et `ended` fige a `False` (mettre `True` ferait croire a
+  une capture interrompue et arreterait `run()`, `if capture.ended: break`,
+  alors qu'il n'y a simplement rien encore a capturer). Des que l'utilisateur
+  choisit un peripherique dans le menu, **aucun code nouveau** ne le gere : la
+  comparaison `args.device != last_device` deja en place pour changer de
+  peripherique EN COURS DE ROUTE (voir plus haut) voit la meme chose qu'un
+  changement normal (`None`/`""` -> un nom), et termine/remplace
+  `capture_proc`/`capture` par les vrais exactement comme d'habitude -- values
+  du `--rate auto` initial (probe saute tant qu'il n'y a pas de peripherique,
+  repli sur `DEFAULT_CAPTURE_RATE`) inchangees, meme comportement qu'un
+  changement de peripherique qui ne re-sonde pas non plus le debit natif du
+  nouveau. Verifie sans vrai ffmpeg/ffplay (memes `Popen`/`VideoSource` factices
+  que le test de redemarrage taille/plein ecran) : lancer sans `-d` ne leve pas
+  `sys.exit`, ne spawn aucune commande contenant `"dshow"` tant qu'aucun
+  peripherique n'est choisi, `run()` ne plante pas en boucle (`NoDeviceCapture`
+  ne fait jamais croire a une capture interrompue), et choisir un peripherique
+  dans le menu declenche bien un spawn `dshow` par la suite. `--video`/
+  `--video2` sont des champs texte resolus par
   `find_asset()` (extrait de la logique de `parse_args()`, chemin tel quel puis
   dans `--asset-dir`) : un chemin introuvable est signale en statut sans toucher
   a `args.video`/`args.video2`, pour ne pas couper une video en cours sur une
@@ -673,7 +753,8 @@ resolution de chemins.
 capture DirectShow (`capture_input_args`, `list_audio_devices`, `measure_level`),
 tube ffmpeg -> ffplay (`pipe_to_ffplay`, avec le `source.stdout.close()` — voir sa
 docstring), utilitaires ecran (`primary_screen_size`, `find_window_position`),
-verification des outils (`require_tools`), et le socle des reglages `--gui`
+verification des outils (`require_tools`, `add_bundled_ffmpeg_to_path` — voir
+juste apres), et le socle des reglages `--gui`
 (`parse_size`, `auto_win_size`, `gain_value`, palette `GUI_*`, `style_gui`,
 `style_option_menu`). Extrait pour etre importable **sans** tirer la logique de
 rendu d'`audio2wave.py` (THEMES/compose_scene/gradient_source/resolve_theme
@@ -702,6 +783,51 @@ rester synchronises a la main** :
 | correction de gain par style | `AUTO_GAIN_BOOST_DB` | `STYLE_BOOST_DB` |
 | valeurs | analyzer `+18`, radio `-22` (40 dB d'ecart) | idem |
 | barres par defaut | en dur dans `build_filter` | `DEFAULT_ANALYZER_BARS` / `RADIO_POINTS_PER_WIDTH` |
+
+### Installation sans configuration (ffmpeg embarque, `.bat` de lancement)
+
+Demande explicite : pouvoir installer/lancer le projet sur la machine d'un
+non-developpeur, sans terminal ni configuration du `PATH`. Deux morceaux,
+independants l'un de l'autre :
+
+**`BIN_DIR`/`add_bundled_ffmpeg_to_path()`** (dans `common.py`, tout en haut,
+juste avant `require_tools`) : si un dossier `bin/` existe a cote des scripts
+(gitignore, voir plus bas), il est place en TETE du `PATH` du processus, une
+fois, a l'IMPORT de `common.py` — pas dans chaque `main()`, parce que
+`audio2wave.py` verifie ffmpeg AVANT meme d'appeler `require_tools()` (son
+propre controle inline, historique) et qu'un appel explicite par script
+risquerait d'arriver trop tard pour l'un d'eux si ce code bouge un jour.
+Fonctionne sans toucher aucun site d'appel `subprocess` des quatre scripts :
+tous invoquent `ffmpeg`/`ffprobe`/`ffplay` par leur nom seul (jamais un chemin
+absolu code en dur), c'est la recherche dans le `PATH` faite par l'OS a
+CHAQUE appel qui les resout — préfixer le `PATH` une seule fois, tot, suffit
+donc a faire passer un binaire local devant celui deja installe sur la
+machine (verifie : un `bin/ffmpeg.exe` factice est bien resolu par
+`shutil.which("ffmpeg")` avant tout `ffmpeg` du `PATH` systeme). Sans effet
+si `bin/` n'existe pas : comportement inchange pour qui a deja ffmpeg
+installe normalement, c'est le cas d'usage d'origine qui doit rester intact.
+`bin/` est gitignore (comme `asset/`/`output/`) : ce sont des binaires
+tiers (~100 Mo, licence LGPL/GPL propre a ffmpeg), jamais du code source —
+chacun les recupere separement (lien dans le README), jamais commites dans
+ce depot.
+
+**Trois `.bat`** a la racine (un par script qui expose `--gui` — pas
+`audio2wave.py`, qui n'en a pas) : `cd /d "%~dp0"` (fonctionne quel que soit
+le dossier de lancement, un double-clic Explorateur part toujours du dossier
+du fichier, mais une execution depuis un raccourci pointant ailleurs
+pourrait ne pas l'assumer), verifie `python` dans le `PATH` avec un message
+clair sinon, puis lance `--gui`. `Demarrer - Photo waveform.bat`
+(`audio2wave_snap.py`) ne demande rien de plus : `-d`/`--device` y est
+optionnel (voir plus haut), l'entree audio se choisit dans la fenetre.
+`audio2wave_live.py`/`audio2wave_ridge.py`, eux, exigent encore `-d` au
+demarrage (pas etendus a cette session) : leurs `.bat` (`Demarrer - Onde en
+direct.bat`/`Demarrer - Vagues empilees.bat`) listent donc les peripheriques
+(`--list-devices`) puis demandent son nom exact via `set /p` avant de lancer
+`--gui` avec. `if errorlevel 1 pause` en fin de chaque `.bat` : sans ca, une
+fenetre `cmd` qui plante (ffmpeg manquant, peripherique introuvable...) se
+referme instantanement, illisible pour qui ne l'a pas lancee depuis un
+terminal deja ouvert — garder la fenetre ouverte sur l'erreur est le seul
+diagnostic disponible pour ce public.
 
 ### Invariants du pipeline de filtres
 
@@ -788,6 +914,77 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   est desactive) ; calcules une fois par photo dans `run()` comme `columns`, pas
   recalcules pendant le balayage — un kick ne bouge pas plus que le contour
   pendant que sa photo est affichee.
+- **`--glow-live` anime le MEME halo par le niveau audio COURANT plutot que par
+  des kicks detectes sur la photo entiere** — demande explicite ("j'aimerais
+  que le halo puisse avoir une animation en temps reel et non avec 4 temps de
+  retard") : `kicks` marque des positions figees sur une photo deja capturee,
+  recalculees seulement a la PROCHAINE photo (`--beats`/`--bpm`, jusqu'a
+  plusieurs secondes de latence) — le probleme n'est pas que `kicks` soit
+  "en retard" par un bug, c'est le principe meme d'une photo (un instantane du
+  passe recent) qui l'impose. `--glow-live` contourne ca en lisant le niveau
+  audio EN CONTINU via `LiveCapture.recent_level(tail_bytes)` (nouvelle
+  methode : RMS des DERNIERS octets du tampon glissant, PAS `latest()` qui
+  attend que la fenetre COMPLETE de la photo se remplisse) — fraiche a chaque
+  appel puisque `_pump` alimente `_buf` en continu, independamment du rythme
+  des photos. `paint_pencil_columns`/`compose_pencil` recoivent un nouveau
+  parametre `live_glow: float | None` qui, fourni, REMPLACE le calcul par
+  distance a `kicks` et s'applique UNIFORMEMENT a toutes les colonnes (pas de
+  position "ou" le halo est fort, seulement une intensite globale qui monte et
+  descend) — les deux mecanismes ne se cumulent pas, `run()` ne calcule meme
+  plus `kicks` (cout evite) quand `--glow-live` est actif.
+  **La partie delicate : `draw_pencil_video_progressively` doit rappeler la
+  mesure a CHAQUE image du balayage progressif**, pas une fois par photo comme
+  `kicks` — sans ca `--glow-live` n'apporterait rien de plus qu'une valeur
+  figee differente. `live_glow_source` (une fermeture, voir `read_live_glow`
+  dans `run()`) y est appelee a chaque tick ; la portion DEJA REVELEE du
+  balayage (`[0, drawn)`) doit alors pouvoir se repeindre meme quand AUCUNE
+  colonne neuve n'apparait ce tick-la (le niveau bouge plus vite que le front
+  du balayage) — nouveau garde-fou `glow_refresh` dans la boucle, en plus de
+  la condition `target != drawn` deja existante pour `video`. Strictement
+  borne a `[0, drawn)` : contrairement a `video_out` (qui, lui, peint sur toute
+  la largeur `[0, width)` par design, voir plus haut), le halo ne doit JAMAIS
+  apparaitre sur des colonnes pas encore atteintes par le front, sous peine de
+  reveler le trait en avance sur le balayage. `run()` route donc aussi le cas
+  `--glow-live` SANS `--video`/`--video2` par `draw_pencil_video_progressively`
+  (seule variante qui rappelle un callback par image) plutot que par le
+  `draw_progressively` plus simple (qui ne fait que recopier un `frame` deja
+  fige) — condition de dispatch etendue avec `glow_live_active = args.kick_glow
+  and args.glow_live`.
+  **`LiveGlowMeter`** (attaque/relachement exponentiel, deux coefficients
+  distincts `GLOW_LIVE_ATTACK`/`GLOW_LIVE_RELEASE`) lisse `recent_level()` :
+  MONTE vite (repond tout de suite a un coup) mais REDESCEND plus lentement
+  (fondu, pas une extinction brutale) — un vu-metre a crete, pas une moyenne
+  symetrique qui lisserait aussi les attaques que le halo est cense montrer.
+  Le niveau brut est mis a l'echelle par le MEME facteur de gain que la photo
+  courante (`10 ** (gain / 20)`, `gain` recalcule une fois par photo comme
+  d'habitude) avant d'entrer dans le meter, pour que le halo reste proportionne
+  a ce que montre le trait a l'ecran (un morceau calme auto-gagne pour remplir
+  le cadre produit aussi un halo visible, pas un halo quasi-nul faute de
+  niveau absolu suffisant). `GLOW_LIVE_WINDOW_MS` (40 ms, deux cycles a 50 Hz,
+  meme ordre de grandeur que `KICK_ANALYSIS_MS`) fixe la fenetre de mesure :
+  assez courte pour rester "maintenant", assez longue pour un chiffre stable.
+  **Case a cocher "Temps reel"** juste a cote de "Halo sur les kicks" dans
+  `--gui` (meme `Frame`, pas une ligne separee) : c'est un MODE du meme halo,
+  pas un effet independant — sans effet si "Halo sur les kicks" n'est pas
+  aussi coche (memes deux booleens `kick_glow`/`glow_live` cote CLI, avec
+  `p.error` si `--glow-live` est passe seul en ligne de commande, mais pas de
+  validation equivalente cote GUI : les deux cases peuvent y etre cochees dans
+  n'importe quel ordre sans que "Temps reel" seul ait le moindre effet tant
+  que "Halo sur les kicks" reste decochee). Le statut `--gui`/console
+  remplace le compte de kicks par `"halo temps reel {valeur}"` (intensite
+  courante du meter, pas un compte) quand `--glow-live` est actif : meme
+  logique diagnostic que le compte de kicks (confirmer que la mesure vit,
+  sans avoir a le voir a l'ecran). Verifie : `recent_level()` renvoie une
+  valeur fraiche independamment de `latest()` (qui, lui, attend la fenetre
+  complete) ; `live_glow` s'applique de facon uniforme (toutes les colonnes)
+  la ou `kicks` reste localise (loin d'une position de kick, le fond reste
+  inchange) ; `LiveGlowMeter` monte au moins autant qu'il ne redescend sur un
+  meme pas ; et, bout en bout avec un flux PCM synthetique dont le niveau
+  change A MI-BALAYAGE (fake `Popen`/`LiveCapture` reelle, pas de vrai
+  ffmpeg/ffplay), les valeurs de `live_glow` recues par `paint_pencil_columns`
+  au fil d'UN SEUL balayage sont bien distinctes — la preuve directe que le
+  halo ne depend plus d'une valeur figee au moment de la composition de la
+  photo, contrairement a `kicks`.
 - **`--style pencil` ne passe pas par ffmpeg** : aucun filtre ne dessine une polyligne
   d'enveloppe (`showwavespic` remplit une silhouette, `showwaves` trace la forme d'onde).
   `render_pencil` peint pour chaque colonne le segment vertical reliant la hauteur
