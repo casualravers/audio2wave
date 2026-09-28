@@ -385,6 +385,30 @@ def report_latency(args: argparse.Namespace) -> None:
     )
 
 
+def producer_warmup_seconds(args: argparse.Namespace) -> float:
+    """Estime le temps qu'il faut a un producteur FRAICHEMENT lance pour produire
+    un flux deja stabilise (fenetre FFT remplie ET moyenne --averaging convergee),
+    plutot que quelques trames "a froid" (quasi silence/bruit, le temps que ces
+    fenetres se remplissent). Sert a `wait_for_producer()` (voir sa docstring) :
+    un redemarrage qui bascule le relais des qu'un producteur survit sans
+    attendre cette convergence fait apparaitre la remontee "a froid" comme un
+    a-coup au moment precis du basculement -- signale par l'utilisateur en
+    usage reel ("il y a un effet d'a-coup un peu violent").
+
+    Capture (`args.buffer`) + fenetre FFT (`win_size`/`rate`) + UNE PLEINE
+    fenetre `--averaging` (pas la moitie, a la difference de `report_latency()`
+    qui donne un DELAI MOYEN pour le regime permanent -- ici on veut que la
+    moyenne ait fini de converger avant de montrer quoi que ce soit).
+    """
+    if args.style == "radio":
+        # showwaves lit les echantillons directement: ni fenetre FFT ni
+        # moyenne, seule la capture doit se remplir.
+        return args.buffer / 1000
+    rate = args.max_freq * 2 if args.max_freq > 0 else 44100
+    win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
+    return args.buffer / 1000 + win_size / rate + args.averaging / max(args.fps, 1)
+
+
 def add_reactive_metering(filter_graph: str, level_filename: str) -> str:
     """Ajoute une derivation de mesure de niveau au graphe de `build_filter()`, pour
     --reactive.
@@ -600,6 +624,58 @@ def _terminate(proc: subprocess.Popen) -> None:
             proc.stdout.close()
         except OSError:
             pass
+
+
+# Borne haute du "chauffage" (voir wait_for_producer()) : un --averaging genereux
+# a bas --fps ne doit pas rendre un simple changement de couleur perceptible
+# comme "fige" plusieurs secondes -- au pire un a-coup residuel plutot qu'un
+# Appliquer qui semble ne plus repondre.
+PRODUCER_WARMUP_CAP_S = 2.0
+
+
+def wait_for_producer(producer: subprocess.Popen, args: argparse.Namespace,
+                      stop_event: threading.Event, *watched: subprocess.Popen) -> bool:
+    """Remplace l'ancien `time.sleep(RESTART_GRACE_S)` : ne se contente pas
+    d'ATTENDRE, DRAINE ACTIVEMENT `producer.stdout` pendant l'attente -- sinon
+    ffmpeg, dont personne ne lit encore le flux (`relay_loop()` ne bascule sur
+    ce producteur qu'APRES ce succes), bloque tres vite sur son propre tube
+    (une seule frame rgb24 depasse largement un tube anonyme Windows) et son
+    traitement -- donc sa fenetre `--averaging` -- se FIGE au lieu d'avancer en
+    temps reel. Sans ce drain, le premier octet relaye apres le basculement
+    etait donc une trame "a froid" tres ancienne, suivie d'un RATTRAPAGE
+    BRUTAL de tout le retard accumule d'un coup des que le relais commencait
+    enfin a lire -- observe en usage reel comme "un effet d'a-coup un peu
+    violent", pas une remontee progressive.
+
+    Duree : au moins `RESTART_GRACE_S` (detecte un plantage immediat, comme
+    avant), au plus `PRODUCER_WARMUP_CAP_S` -- entre les deux,
+    `producer_warmup_seconds(args)` estime le temps necessaire a la fenetre
+    FFT/`--averaging` pour converger en temps reel.
+
+    `watched` (l'afficheur, uniquement pour un redemarrage "dur" -- voir
+    run()) : proc supplementaires dont la mort pendant l'attente vaut aussi
+    echec, exactement comme l'ancienne verification `new_display.poll() is
+    not None or new_producer.poll() is not None`.
+
+    Renvoie `False` (rien nettoye ici, a la charge de l'appelant) si
+    `producer` ou l'un des `watched` meurt pendant l'attente, ou si
+    `stop_event` est positionne entre-temps (arret en cours : inutile de
+    finir de chauffer un producteur qui ne servira jamais).
+    """
+    duration = max(RESTART_GRACE_S, min(producer_warmup_seconds(args), PRODUCER_WARMUP_CAP_S))
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        if stop_event.is_set():
+            return False
+        if producer.poll() is not None or any(w.poll() is not None for w in watched):
+            return False
+        try:
+            chunk = producer.stdout.read(RELAY_CHUNK_SIZE)
+        except (OSError, ValueError):
+            return False
+        if not chunk:
+            return False
+    return producer.poll() is None and all(w.poll() is None for w in watched)
 
 
 def discard_level_file(level_path: Path) -> None:
@@ -838,8 +914,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                     print(f"\nEchec du lancement: {exc}", file=sys.stderr)
                     break
 
-                time.sleep(RESTART_GRACE_S)
-                if new_display.poll() is not None or new_producer.poll() is not None:
+                if not wait_for_producer(new_producer, args, stop_event, new_display):
                     _terminate(new_producer)
                     _terminate(new_display)
                     # Producteur jamais devenu actif: son fichier de niveau, si
@@ -892,8 +967,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                     print(f"\nEchec du lancement: {exc}", file=sys.stderr)
                     break
 
-                time.sleep(RESTART_GRACE_S)
-                if new_producer.poll() is not None:
+                if not wait_for_producer(new_producer, args, stop_event):
                     _terminate(new_producer)
                     if new_level_path is not None:
                         discard_level_file(new_level_path)

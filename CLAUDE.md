@@ -114,22 +114,54 @@ resolution de chemins.
   meme famille que `find_window_position()`) : renomme la fenetre EN PLACE, sans la
   fermer/rouvrir.
   Si la nouvelle tentative (producteur seul, ou paire complete) echoue dans la
-  fenetre de grace (`poll()` non `None`), elle est nettoyee et l'ancien
-  producteur/l'ancienne paire, **ne sont pas touches** : `run()` retombe dans la
-  boucle d'attente sur ce qui tourne encore au lieu de retenter immediatement — un
-  premier brouillon (avant meme l'introduction du relais) retentait en boucle et
-  finissait par tuer la paire fonctionnelle, attrape par un test avec un spawn qui
-  echoue une fois puis reussit. `stop_event` sort de la boucle definitivement ; il
-  est aussi positionne automatiquement des que `display.poll()` n'est plus `None`
-  (fenetre fermee par l'utilisateur), pour que ce cas arrete tout au lieu de
-  relancer. Verifie sans peripherique/ffmpeg/ffplay reels, en substituant
-  `spawn_producer()`/`spawn_display()` par de faux `Popen` (stdout/stdin factices
-  suffisants pour exercer `relay_loop()`) : un changement de couleur/gain/style
-  provoque bien un nouveau producteur SANS nouvel afficheur (fenetre stable), un
-  changement de taille provoque bien les deux, aucun octet d'un ancien producteur
-  n'apparait dans ce qu'un afficheur courant a recu apres son ouverture, et un
-  producteur qui echoue immediatement laisse l'ancien (producteur ou paire) intact
-  et actif.
+  fenetre de grace (`wait_for_producer()`, voir juste apres), elle est nettoyee
+  et l'ancien producteur/l'ancienne paire, **ne sont pas touches** : `run()`
+  retombe dans la boucle d'attente sur ce qui tourne encore au lieu de retenter
+  immediatement — un premier brouillon (avant meme l'introduction du relais)
+  retentait en boucle et finissait par tuer la paire fonctionnelle, attrape par
+  un test avec un spawn qui echoue une fois puis reussit. `stop_event` sort de
+  la boucle definitivement ; il est aussi positionne automatiquement des que
+  `display.poll()` n'est plus `None` (fenetre fermee par l'utilisateur), pour
+  que ce cas arrete tout au lieu de relancer.
+  **`wait_for_producer()` "chauffe" le nouveau producteur avant de le montrer**,
+  ajoute apres coup suite a un retour utilisateur en usage reel ("il y a un
+  effet d'a-coup un peu violent" au changement de parametre, malgre la fenetre
+  desormais stable). Cause : l'ancien `time.sleep(RESTART_GRACE_S)` attendait
+  sans jamais LIRE `new_producer.stdout` (`relay_loop()` ne bascule dessus
+  qu'APRES ce succes) — ffmpeg, dont personne ne draine le tube, sature tres
+  vite un pipe anonyme Windows (une seule frame rgb24 fait plusieurs Mo) et
+  BLOQUE, donc sa fenetre `--averaging` ne progresse plus du tout pendant
+  l'attente. Au basculement, le relais lisait donc d'abord une trame ancienne
+  "a froid" (quasi silence, la moyenne n'avait jamais eu la chance de
+  converger), PUIS rattrapait tout le retard accumule d'un coup — un
+  rattrapage brutal, pas une remontee progressive, precisement l'"a-coup"
+  signale. `wait_for_producer()` remplace ce sleep aveugle par une boucle qui
+  LIT ET JETTE `producer.stdout` (memes lectures que `relay_loop()`, juste
+  sans les repasser a l'afficheur) pendant `producer_warmup_seconds(args)`
+  (capture + fenetre FFT + une PLEINE fenetre `--averaging`, pas la moitie
+  comme `report_latency()` qui donne un delai MOYEN pour le regime permanent —
+  ici il faut que la moyenne ait fini de converger avant de montrer quoi que
+  ce soit), borne entre `RESTART_GRACE_S` (plancher, detecte toujours un
+  plantage immediat) et `PRODUCER_WARMUP_CAP_S = 2.0` (plafond : un
+  `--averaging` genereux a bas `--fps` ne doit pas rendre un simple
+  changement de couleur perceptible comme fige plusieurs secondes). Drainer
+  activement (plutot que juste attendre plus longtemps) est le point
+  important : ca laisse ffmpeg tourner en temps reel jusqu'a convergence
+  pendant l'attente, donc le PREMIER octet vraiment relaye apres le
+  basculement est deja un flux stabilise. `watched` (l'afficheur, uniquement
+  pour un redemarrage "dur") generalise l'ancienne verification `poll()` des
+  deux process a la fois. Verifie sans peripherique/ffmpeg/ffplay reels, en
+  substituant `spawn_producer()`/`spawn_display()` par de faux `Popen`
+  (stdout/stdin factices suffisants pour exercer `relay_loop()`) : un
+  changement de couleur/gain/style provoque bien un nouveau producteur SANS
+  nouvel afficheur (fenetre stable), un changement de taille provoque bien
+  les deux, aucun octet d'un ancien producteur n'apparait dans ce qu'un
+  afficheur courant a recu apres son ouverture, un producteur qui echoue
+  immediatement laisse l'ancien (producteur ou paire) intact et actif, ET
+  (nouveau) `wait_for_producer()` lit bien plusieurs fois `producer.stdout`
+  pendant l'attente (pas un simple sleep), detecte une mort survenant EN
+  COURS d'attente (pas seulement au tout debut), et s'interrompt
+  immediatement si `stop_event` est deja positionne.
   **Tout parametre est exposable dans `build_gui()`**, a la difference de
   `audio2wave_snap.py`/`audio2wave_ridge.py` : comme `apply()` redemarre tout le
   pipeline (rien n'est relu en direct par un `run()` par-image, voir ci-dessus), il
