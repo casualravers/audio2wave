@@ -2,3 +2,9 @@
 output/
 asset/
 __pycache__/
+
+# ffmpeg/ffprobe/ffplay embarques (voir common.py: add_bundled_ffmpeg_to_path),
+# pour lancer le projet sur une machine sans les installer/configurer soi-meme.
+# Binaires tiers, pas du code source: jamais commites (~100 Mo, licence LGPL/GPL
+# a part) -- chacun les recupere via le lien du README, dans son propre depot.
+bin/
