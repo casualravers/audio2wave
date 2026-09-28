@@ -213,14 +213,93 @@ def primary_screen_size() -> tuple[int, int] | None:
     return (width, height) if width > 0 and height > 0 else None
 
 
+def _enum_monitor_rects() -> list[tuple[int, int, int, int, bool]]:
+    """Liste (left, top, width, height, est_principal) de TOUS les moniteurs, via
+    EnumDisplayMonitors/GetMonitorInfoW. Liste vide si l'API echoue -- jamais
+    d'exception qui remonte, les fonctions qui s'appuient dessus (plus bas)
+    degradent silencieusement vers "aucun moniteur secondaire connu" plutot
+    que de planter une fenetre --gui pour un probleme d'affichage.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        MONITORINFOF_PRIMARY = 0x1
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.wintypes.DWORD),
+                ("rcMonitor", ctypes.wintypes.RECT),
+                ("rcWork", ctypes.wintypes.RECT),
+                ("dwFlags", ctypes.wintypes.DWORD),
+            ]
+
+        user32 = ctypes.windll.user32
+        out: list[tuple[int, int, int, int, bool]] = []
+
+        monitor_enum_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.wintypes.RECT), ctypes.c_void_p)
+
+        def callback(hmonitor, _hdc, _rect, _data):
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                r = info.rcMonitor
+                out.append((r.left, r.top, r.right - r.left, r.bottom - r.top,
+                          bool(info.dwFlags & MONITORINFOF_PRIMARY)))
+            return 1
+
+        user32.EnumDisplayMonitors(None, None, monitor_enum_proc(callback), 0)
+    except Exception:
+        return []
+    return out
+
+
+def secondary_monitor_rect() -> tuple[int, int, int, int] | None:
+    """(left, top, width, height) d'un DEUXIEME moniteur, si l'utilisateur en a
+    plusieurs -- None sur un poste mono-ecran, ou si l'API Windows echoue.
+
+    `EnumDisplayMonitors` n'enumere pas forcement les moniteurs dans l'ordre "1,
+    2, 3..." affiche par les parametres d'affichage Windows (l'ordre n'est pas
+    garanti) -- plutot que de deviner lequel porte le numero 2, on prend le
+    premier moniteur qui n'est PAS le principal (`est_principal` faux). Avec
+    exactement deux ecrans (le cas le plus courant), c'est strictement
+    equivalent a "le deuxieme ecran" ; avec trois ecrans ou plus, un choix
+    arbitraire parmi les secondaires, mais reste sense (n'importe quel ecran
+    secondaire vaut mieux que le principal, deja pris par les fenetres de
+    travail habituelles). Verifie sur un vrai poste a deux moniteurs :
+    EnumDisplayMonitors renvoie bien deux rectangles, primaire exclu.
+    """
+    for left, top, width, height, is_primary in _enum_monitor_rects():
+        if not is_primary:
+            return (left, top, width, height)
+    return None
+
+
+def monitor_rect_at(point: tuple[int, int]) -> tuple[int, int, int, int] | None:
+    """(left, top, width, height) du moniteur qui contient `point` -- sert a
+    determiner sur quel ecran une fenetre EXISTANTE se trouve deja (voir
+    find_window_position juste apres), pour y refaire tenir un plein ecran
+    (voir target_monitor_rect). None si `point` ne tombe dans aucun moniteur
+    connu (l'API a echoue, ou coordonnees hors de tout ecran)."""
+    x, y = point
+    for left, top, width, height, _is_primary in _enum_monitor_rects():
+        if left <= x < left + width and top <= y < top + height:
+            return (left, top, width, height)
+    return None
+
+
 def find_window_position(title: str) -> tuple[int, int] | None:
     """Position (left, top) d'une fenetre ouverte, identifiee par son titre exact.
 
     Sert a faire apparaitre la nouvelle fenetre ffplay au meme endroit que
     l'ancienne lors d'un redemarrage --gui : le changement se voit alors comme une
     mise a jour de l'affichage, pas comme une fenetre qui se ferme puis se rouvre
-    ailleurs sur l'ecran. Sans effet en --fullscreen (ffplay ignore -left/-top),
-    ou le probleme ne se pose de toute facon pas.
+    ailleurs sur l'ecran. Egalement utilisee par target_monitor_rect() pour
+    retrouver sur QUEL MONITEUR la fenetre actuelle se trouve (le plein ecran
+    "borderless" ci-dessous a lui aussi besoin de -left/-top, contrairement au
+    `-fs` natif d'ffplay qui les ignore).
     """
     try:
         import ctypes
@@ -234,6 +313,36 @@ def find_window_position(title: str) -> tuple[int, int] | None:
         return rect.left, rect.top
     except Exception:
         return None
+
+
+def target_monitor_rect(existing_window_title: str | None) -> tuple[int, int, int, int] | None:
+    """Rect (left, top, width, height) du moniteur a remplir pour un plein ecran
+    "borderless" (voir plus bas) : celui qui heberge deja la fenetre ENCORE
+    OUVERTE si `existing_window_title` en retrouve une (redemarrage --size/
+    --fullscreen depuis --gui -- reste sur le MEME ecran que la fenetre
+    actuelle, meme si ce n'est pas le second), sinon le deuxieme moniteur par
+    defaut (`secondary_monitor_rect`, premier lancement ou fenetre introuvable).
+    `None` sur un poste mono-ecran (ou si l'API echoue) : `-fs` natif suffit
+    alors, pas besoin de borderless (voir viewer_command() dans les trois
+    scripts --gui).
+
+    **Remplace `SDL_VIDEO_WINDOW_POS`** (tentative precedente pour cibler un
+    moniteur en plein ecran natif `-fs`, jamais confirmee fonctionner : signale
+    par l'utilisateur en usage reel, "quand je clique sur le bouton plein ecran
+    la fenetre se reouvre sur l'ecran numero 1") : plutot que d'esperer que SDL2
+    lise cette variable au bon moment, ffplay ouvre une fenetre BORDERLESS
+    (`-noborder`) positionnee/dimensionnee exactement sur le moniteur cible via
+    `-left`/`-top`/`-x`/`-y` -- les MEMES options `-left`/`-top` deja confirmees
+    fiables pour le mode fenetre normal (voir find_window_position), pas un
+    mecanisme distinct et non verifie.
+    """
+    if existing_window_title:
+        position = find_window_position(existing_window_title)
+        if position:
+            rect = monitor_rect_at(position)
+            if rect:
+                return rect
+    return secondary_monitor_rect()
 
 
 def capture_input_args(device: str, buffer_ms: int) -> list[str]:

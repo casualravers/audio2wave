@@ -2,6 +2,11 @@
 rem Lance audio2wave_snap.py --gui: double-clic, aucun terminal ni argument a
 rem connaitre. L'entree audio se choisit dans la fenetre (menu deroulant
 rem "Entree audio"), pas besoin de la preciser ici.
+rem Cette fenetre a des boutons "Live"/"Ridge" pour basculer vers les deux
+rem autres modes SANS jamais ouvrir de nouvelle fenetre: les reglages du
+rem mode suivant se chargent DANS cette meme fenetre (meme entree audio
+rem conservee) -- pas besoin des .bat dedies pour changer de mode en cours
+rem de route, ils servent juste a demarrer directement sur un autre mode.
 setlocal
 cd /d "%~dp0"
 

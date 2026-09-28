@@ -611,27 +611,19 @@ resolution de chemins.
   (donc `resolve_size(args)` constant) : cocher puis decocher "Plein ecran"
   redemarre bien le viewer deux fois, avec `-fs` present puis absent, alors que
   la taille annoncee reste identique aux deux tours.
-  **Ciblage du bon moniteur, tentative non verifiee sur un vrai multi-ecran** :
-  signale par l'utilisateur ("quand je coche plein ecran, cela redemarre sur le
-  mauvais moniteur") apres le premier jet ci-dessus. `window_title(args)`
-  (extrait de `viewer_command`, meme scission qu'`audio2wave_live.py`) et
-  `find_window_position()` (deja dans `common.py`, importee via
-  `audio2wave_live.py`) retrouvent la position de la fenetre ENCORE OUVERTE par
-  son titre exact, juste avant de la fermer. Deux usages distincts de cette
-  position, selon `args.fullscreen` : en mode fenetre, `-left`/`-top` (comme
-  `audio2wave_live.py`) ; en plein ecran, ces options sont documentees ignorees
-  par ffplay des qu'il recoit `-fs` (voir la docstring de
-  `find_window_position`) — `viewer_env()` tente donc `SDL_VIDEO_WINDOW_POS`
-  dans l'environnement du sous-processus a la place : cette variable est lue
-  par SDL2 (la bibliotheque graphique sous-jacente d'ffplay) au moment de la
-  creation de sa fenetre, UN CRAN AVANT qu'`-fs` ne la fasse passer en plein
-  ecran — piste plausible pour influencer quel ecran regoit le plein ecran,
-  mais **non confirmee empiriquement** : cette session tourne dans un
-  environnement distant sans acces aux moniteurs physiques de l'utilisateur,
-  impossible d'observer le resultat reel d'un `SDL_VIDEO_WINDOW_POS` a cote
-  d'un `-fs`. Sans effet mesurable si SDL2/ffplay l'ignorent malgre tout (pas
-  de degradation, juste retour au comportement precedent). A confirmer en
-  usage reel avant de considerer ce point clos.
+  **Ciblage du bon moniteur** : signale par l'utilisateur ("quand je coche
+  plein ecran, cela redemarre sur le mauvais moniteur"), puis a nouveau apres
+  un premier correctif insuffisant ("quand je clique sur le bouton plein
+  ecran la fenetre se reouvre sur l'ecran numero 1"). `window_title(args)`/
+  `find_window_position()` retrouvent la position de la fenetre ENCORE
+  OUVERTE par son titre exact avant de la fermer, comme pour le mode fenetre
+  normal -- mais `-fs` natif d'ffplay IGNORE `-left`/`-top` des qu'il est
+  present, d'ou une fenetre BORDERLESS (`-noborder`) calee explicitement sur
+  le moniteur cible a la place, plutot que la variable d'environnement
+  `SDL_VIDEO_WINDOW_POS` (tentative jamais confirmee, precisement la cause du
+  second signalement). Voir "Ouverture par defaut sur le deuxieme ecran" plus
+  bas dans ce fichier pour le detail complet (les deux jets, `viewer_command`
+  final, `target_monitor_rect()`).
   **Le bouton "Mesurer (tuning)"** est l'equivalent de `--tune`
   (`audio2wave_live.py`) mais lu depuis la capture deja en cours au lieu d'une
   mesure separee : `capture_state["capture"].latest()` donne la derniere fenetre
@@ -735,17 +727,93 @@ resolution de chemins.
   suffisant ici. Exception : les couleurs (`ink`/`background`) sont sondees une
   fois en octets RGB avant la boucle (cout d'un sous-processus ffmpeg) ; `run()`
   compare `args.colors`/`args.bg_color` a la valeur vue au tour precedent et ne
-  resonde que si elle a change. `--beats`/`--bpm`/`--interval`/`--size`/
-  `--fullscreen` ne sont volontairement pas exposes dans la fenetre : ils
-  determinent la taille du bloc de capture ou de la fenetre ffplay, pas juste le
-  rendu d'une ligne, et les changer demanderait de redemarrer capture/canevas/
-  ffplay plutot que de simplement relire un attribut. Expose aussi **`--gain`**
-  (case "auto" + curseur manuel en dB, meme mecanique que `audio2wave_snap.py`,
-  mais lu par `RidgeGain.resolve` plutot que `resolve_gain`, voir plus haut) et
-  **`--save-dir`** (`mkdir(parents=True, exist_ok=True)` a la validation, `run()`
-  relit `args.save_dir` a chaque ligne pour le chemin du PNG) : les deux
-  manquaient face a `audio2wave_snap.py --gui` sans raison technique, seulement
-  pas encore ajoutes.
+  resonde que si elle a change. `--beats`/`--bpm`/`--interval` restent
+  volontairement hors de cette fenetre : ils determinent la taille du bloc de
+  capture, pas juste le rendu d'une ligne, et les changer demanderait de
+  redemarrer la capture plutot que de simplement relire un attribut.
+  **`--size`/`--fullscreen`, eux, SONT exposes** (voir "Rapprochement des
+  fenetres --gui" plus bas) : redemarrer la fenetre ffplay pour changer sa
+  taille n'a rien d'impossible, contrairement a la capture. Expose aussi
+  **`--gain`** (case "auto" + curseur manuel en dB, meme mecanique que
+  `audio2wave_snap.py`, mais lu par `RidgeGain.resolve` plutot que
+  `resolve_gain`, voir plus haut) et **`--save-dir`** (`mkdir(parents=True,
+  exist_ok=True)` a la validation, `run()` relit `args.save_dir` a chaque
+  ligne pour le chemin du PNG) : les deux manquaient face a
+  `audio2wave_snap.py --gui` sans raison technique, seulement pas encore
+  ajoutes.
+
+**Rapprochement des trois fenetres `--gui`** — demande explicite ("modifie les
+GUI de live et ridge pour les rendre le plus similaires a snap, ou plein
+d'ameliorations ont ete apportees") : `audio2wave_snap.py --gui` avait accumule
+au fil des sessions un vocabulaire visuel (sections nommees, info-bulles,
+marges regulees) et deux reglages (`--size`/`--fullscreen` pilotables en
+direct) qu'`audio2wave_live.py`/`audio2wave_ridge.py` n'avaient jamais recus,
+sans raison de fond -- juste pas encore fait. Trois morceaux, dans les deux
+fichiers :
+1. **`Tooltip` deplacee dans `audio2wave_live.py`** (n'existait qu'en local
+   dans `audio2wave_snap.py`), juste avant son `build_gui()` -- `common.py` est
+   deliberement exempt de tkinter (voir son docstring, importe aussi par des
+   projets externes sans GUI comme `audioreactive-warp`), et `audio2wave.py`
+   n'importe pas non plus tkinter (pas de `--gui`) : `audio2wave_live.py` est
+   donc le seul point d'import stable qui a deja tkinter ET est deja importe
+   par les deux autres (meme mecanique que `find_window_position`/
+   `list_audio_devices`/`primary_screen_size`/`require_tools`, deja partages
+   depuis ce meme fichier). `audio2wave_snap.py` importe desormais
+   `Tooltip` d'ici au lieu de la definir en local ; `audio2wave_ridge.py`
+   l'importe aussi (elle n'avait aucune info-bulle avant ce changement).
+2. **`ROW_PADX`/`ROW_PADY`/`SECTION_GAP` + `add_label`/`add_section_title`/
+   `add_separator`, memes valeurs et memes noms que dans
+   `audio2wave_snap.py`**, recrees localement dans les deux `build_gui()` (pas
+   factorisables sans widget partage entre les trois `root` Tk distincts) :
+   `live` gagne des sections SOURCE/APPARENCE/SORTIE, `ridge` des sections
+   FORME/COULEURS/GAIN/SORTIE, la ou les deux n'avaient qu'une liste plate de
+   lignes. `ridge` garde son `next_row()` local (un seul panneau, pas besoin du
+   `panel`/`cols()` de `audio2wave_snap.py`, qui EST a deux panneaux -- inutile
+   ici vu le nombre de reglages, largement sous ce qui justifierait la
+   complexite d'un decoupage gauche/droite). Quelques labels verbeux
+   raccourcis avec la precision deplacee en info-bulle, meme motif que
+   `audio2wave_snap.py` (ex. "Lissage du gain (lignes)" -> label "Lissage
+   (lignes)" + tooltip).
+3. **`--size`/`--fullscreen` pilotables depuis les deux fenetres**, chacun
+   selon l'architecture de son script (voir les deux puces precedentes de
+   cette section pour le detail par fichier) :
+   - `audio2wave_ridge.py` : memes principes que `audio2wave_snap.py` --gui
+     (voir sa propre section plus haut) -- `run()` compare `resolve_size(args)`
+     (pas `args.size` brut) et `args.fullscreen` a chaque tour, `stop_viewer()`
+     (nouvelle petite fonction, factorisee avec le nettoyage final du
+     `finally`) puis relance `viewer` a la nouvelle taille et RECONSTRUIT
+     `canvas` (aplat de fond) : le relief accumule ne peut pas survivre a un
+     changement de resolution, contrairement au decalage habituel de
+     `shift_canvas`. Pas de ciblage de moniteur
+     (`find_window_position`/`SDL_VIDEO_WINDOW_POS`, "non confirme" meme cote
+     `audio2wave_snap.py`, voir plus haut) : pas demande, et ce script n'a
+     qu'une seule fenetre video a repositionner, contrairement a
+     `audio2wave_snap.py` qui doit aussi recreer ses `VideoSource`.
+   - `audio2wave_live.py` : **pas de mecanique de redemarrage dediee** --
+     `apply()` (le bouton "Appliquer") redemarre de toute facon tout le
+     pipeline (voir la docstring de `run()`), donc `--size`/`--fullscreen` n'y
+     sont que deux champs de plus captures au clic, comme tout le reste de
+     cette fenetre. **Bug trouve et corrige en ecrivant le test** :
+     `run()` recevait `width`/`height` comme parametres FIGES a l'appel
+     (resolus une seule fois par `run_app()` avant le premier `spawn()`), donc
+     meme apres avoir change la Taille fenetre et clique Appliquer,
+     `spawn(args, width, height, ...)` continuait a utiliser l'ancienne
+     valeur -- le champ semblait n'avoir aucun effet. Corrige en resolvant
+     `width, height = resolve_size(args)` EN TETE de la boucle `while not
+     stop_event.is_set():` (`run()`), a chaque tour plutot qu'une seule fois
+     avant : coherent avec le reste de cette fenetre, ou rien n'est jamais
+     fige avant un redemarrage.
+   Verifie sans vrai ffmpeg/ffplay (memes principes que
+   `check_mode_switch.py`) : changer Taille fenetre + cocher Plein ecran dans
+   `audio2wave_ridge.py --gui` redemarre bien `viewer` avec la nouvelle
+   `-video_size`/`-fs`, sans nouveau sous-processus python ; dans
+   `audio2wave_live.py --gui`, cliquer Appliquer avec une Taille fenetre
+   modifiee fait bien un `spawn()` a la NOUVELLE taille (pas celle figee a
+   l'ouverture -- c'est le bug ci-dessus, reproduit avant correction). Piege
+   rencontre en ecrivant ce test : `entry.event_generate("<Return>")` sans
+   `entry.focus_set()` prealable ne semble PAS declencher le bind sur cette
+   plateforme (constate empiriquement) -- focus_set() d'abord, comme le ferait
+   un vrai clic dans le champ avant Entree.
 
 ### Couplage entre les fichiers
 
@@ -771,8 +839,10 @@ bien attributs du module) pour que les imports existants d'`audio2wave_snap.py`/
 (theme de `--gui`, voir plus haut) ; `audio2wave_snap.py` importe
 `gain_value`/`parse_size`/`style_gui`/`style_option_menu`/`GUI_*` du premier et
 `require_tools`/`list_audio_devices`/`primary_screen_size` du second ;
-`audio2wave_ridge.py` importe ces trois derniers et `style_gui`/`GUI_*` (pas
-`style_option_menu`, ridge n'a pas d'`OptionMenu`) directement d'`audio2wave.py`,
+`audio2wave_ridge.py` importe ces trois derniers et `style_gui`/`style_option_menu`/
+`GUI_*` (le premier utilise desormais un `OptionMenu` aussi, pour son propre
+selecteur d'entree audio -- voir "Rapprochement des trois fenetres --gui" plus
+bas) directement d'`audio2wave.py`,
 en plus d'une dizaine de fonctions et constantes d'`audio2wave_snap.py` (voir la
 liste ci-dessus) — modifier ces signatures casse les scripts en aval. Sont en
 revanche **dupliques et doivent
@@ -783,6 +853,161 @@ rester synchronises a la main** :
 | correction de gain par style | `AUTO_GAIN_BOOST_DB` | `STYLE_BOOST_DB` |
 | valeurs | analyzer `+18`, radio `-22` (40 dB d'ecart) | idem |
 | barres par defaut | en dur dans `build_filter` | `DEFAULT_ANALYZER_BARS` / `RADIO_POINTS_PER_WIDTH` |
+
+### Ouverture par defaut sur le deuxieme ecran
+
+Demande explicite : "Par defaut, ouvre la fenetre ffplay sur le deuxieme
+ecran." Avant ce changement, le mecanisme de ciblage de moniteur (`-left`/
+`-top`, voir plus haut la section `--gui` de `audio2wave_snap.py`) ne
+servait qu'a PRESERVER une position deja choisie lors d'un redemarrage
+--size/--fullscreen (`find_window_position()`, qui retrouve une fenetre DEJA
+OUVERTE par son titre) -- rien ne positionnait la toute PREMIERE fenetre,
+qui atterrissait ou ffplay/Windows la place par defaut (generalement l'ecran
+principal). Deux jets, le second corrigeant une regression du premier sur le
+plein ecran precisement :
+
+**`common.py` gagne trois fonctions d'enumeration de moniteurs**, a cote de
+`primary_screen_size()`/`find_window_position()` (toutes trois via ctypes,
+`EnumDisplayMonitors`/`GetMonitorInfoW`) :
+- `secondary_monitor_rect()` -> `(left, top, width, height)` du premier
+  moniteur dont les flags n'indiquent PAS `MONITORINFOF_PRIMARY`, ou `None`
+  sur un poste mono-ecran/si l'API echoue. **L'ordre d'enumeration
+  d'`EnumDisplayMonitors` n'est pas garanti correspondre au numero "1, 2,
+  3..." affiche dans les parametres d'affichage Windows** : plutot que de
+  deviner lequel est le "deuxieme", on prend le premier moniteur NON
+  PRINCIPAL -- avec exactement deux ecrans (le cas le plus courant), c'est
+  strictement equivalent a "le deuxieme ecran" ; avec trois ecrans ou plus,
+  un choix arbitraire parmi les secondaires, mais reste sense (n'importe
+  quel ecran secondaire vaut mieux que le principal, deja pris par les
+  fenetres de travail habituelles). **Verifie sur un vrai poste a deux
+  moniteurs** : `EnumDisplayMonitors` renvoie bien deux rectangles, primaire
+  exclu -- `(0, -1080, 1920, 1080)` pour le second sur ce poste de test (un
+  moniteur empile au-dessus du principal).
+- `monitor_rect_at(point)` -> le rect du moniteur qui CONTIENT `point`
+  (recherche lineaire dans la meme liste de rects, pas de struct-par-valeur
+  Win32 a passer via ctypes) -- sert a determiner sur QUEL ecran une fenetre
+  deja ouverte se trouve.
+- `target_monitor_rect(existing_window_title)` -> le rect a remplir en plein
+  ecran : celui qui heberge deja la fenetre ENCORE OUVERTE si
+  `existing_window_title` en retrouve une (`find_window_position` +
+  `monitor_rect_at`), sinon `secondary_monitor_rect()` (premier lancement,
+  ou fenetre introuvable). `None` (poste mono-ecran) laisse `-fs` natif
+  suffire.
+
+**Jet 1 (position par defaut, mode fenetre)** : le premier lancement de
+`viewer`/`spawn()` dans les trois scripts utilise `secondary_monitor_rect()`
+(son origine, tronquee en `(left, top)`) comme `position` par defaut au lieu
+de `None`. `audio2wave_ridge.py` n'avait JUSQU'ICI aucun ciblage de moniteur
+du tout (`viewer_command()` gagne un parametre `position`, meme signature
+qu'`audio2wave_snap.py`). Ca fonctionne bien pour le mode FENETRE, confirme
+par l'utilisateur en usage reel.
+
+**Jet 2 (bug signale en usage reel : "quand je clique sur le bouton plein
+ecran la fenetre se reouvre sur l'ecran numero 1")** : le premier jet visait
+le plein ecran via `SDL_VIDEO_WINDOW_POS` (une variable d'environnement lue
+par SDL2, la bibliotheque sous-jacente d'ffplay, cense s'appliquer AVANT que
+`-fs` ne fasse passer la fenetre en plein ecran) -- jamais confirme
+fonctionner, et l'utilisateur a rapporte exactement le symptome que cette
+incertitude laissait craindre. **Remplace entierement par une fenetre
+BORDERLESS** (`-noborder`) positionnee/dimensionnee EXACTEMENT sur le
+moniteur cible via `-left`/`-top`/`-x`/`-y` -- les MEMES options deja
+confirmees fiables pour le mode fenetre normal (jet 1), pas un mecanisme
+distinct et non verifie. `-fs` natif reste le repli uniquement si aucun
+moniteur cible n'est determinable (poste mono-ecran). `viewer_command()`
+dans les trois scripts gagne un parametre `monitor` en plus de `position` :
+```python
+if args.fullscreen:
+    if monitor:
+        left, top, width, height = monitor
+        cmd += ["-noborder", "-left", str(left), "-top", str(top),
+               "-x", str(width), "-y", str(height)]
+    else:
+        cmd.append("-fs")
+elif position:
+    cmd += ["-left", str(position[0]), "-top", str(position[1])]
+```
+`SDL_VIDEO_WINDOW_POS`/`viewer_env()` (les trois versions, une par script) et
+le parametre `viewer_env` de `common.pipe_to_ffplay()` sont retires
+entierement -- code mort une fois le borderless en place, aucune raison de
+garder une tentative non fiable a cote de son remplacement.
+**`resolve_size()` (partagee par `audio2wave_snap.py`/`audio2wave_ridge.py`,
+version separee dans `audio2wave_live.py`) prefere desormais la resolution
+du DEUXIEME moniteur a celle du principal en plein ecran**, quand un
+deuxieme moniteur existe : sans ca, une fenetre borderless calee sur le
+moniteur 2 mais dessinee a la resolution du moniteur 1 se retrouverait mal
+dimensionnee (etiree ou flottant dans un coin) des que les deux ecrans ont
+des resolutions differentes.
+
+Verifie sans vrai ffmpeg/ffplay dans les trois scripts (`secondary_monitor_rect()`/
+`target_monitor_rect()` monkeypatchees pour renvoyer un rect fixe et
+reconnaissable) : le TOUT PREMIER `ffplay` lance par chacun recoit bien
+`-left`/`-top` en mode fenetre, et `-noborder`/`-left`/`-top`/`-x`/`-y`
+(jamais `-fs`) en `--fullscreen` -- pas seulement les redemarrages, qui
+avaient deja `position` pour `audio2wave_snap.py` avant ce changement.
+
+### `--fullscreen` actif par defaut
+
+Demande explicite : "Met le mode plein écran par défaut coché." `--fullscreen`
+(les trois scripts `--gui`) passe d'`action="store_true"` (defaut `False`) a
+`action=argparse.BooleanOptionalAction, default=True` -- genere automatiquement
+`--fullscreen`/`--no-fullscreen` (disponible depuis Python 3.9, deja suppose
+par ce depot en 3.10+ pour `X | Y`), pas besoin d'ajouter un flag separe a la
+main. Sans argument, le plein ecran est donc desormais actif d'emblee ;
+`--no-fullscreen` reste le seul moyen de revenir a une fenetre normale en
+ligne de commande. La case "Plein ecran" de chaque fenetre `--gui` (voir les
+sections `--gui` de chaque script plus haut) lit deja `args.fullscreen` comme
+valeur initiale (`fullscreen_var = tk.BooleanVar(value=args.fullscreen)`) --
+**coche automatiquement** des que ce defaut change, sans le moindre code GUI
+a toucher : c'est args.fullscreen qui a change, pas le widget. `audio2wave.py`
+(rendu fichier, pas de fenetre) n'a pas cette option, aucun changement la-bas.
+
+### Renommage des `.bat` en programmes anglais
+
+Demande explicite : "renomme en anglais les noms de programmes en francais."
+Les trois `.bat` de lancement (voir plus bas, "Installation sans
+configuration") portaient des noms descriptifs en francais distincts des
+noms de code deja anglais utilises PARTOUT AILLEURS dans l'interface
+(`Snap`/`Live`/`Ridge` -- titres de fenetre, boutons de bascule, en-tetes,
+voir "Bascule de mode EN PLACE" plus haut) :
+- `Demarrer - Photo waveform.bat` -> **`Demarrer - Snap.bat`**
+- `Demarrer - Onde en direct.bat` -> **`Demarrer - Live.bat`**
+- `Demarrer - Vagues empilees.bat` -> **`Demarrer - Ridge.bat`**
+
+`Demarrer` (le verbe, "Start") reste en francais : ce n'est pas un NOM DE
+PROGRAMME, juste l'action du lanceur, coherente avec le reste de
+l'interface deja en francais (menus, statuts, tooltips) — seule la partie
+qui NOMME le programme est concernee par la demande. Contenu interne de
+chaque `.bat` inchange (aucune reference a son propre nom de fichier a
+l'interieur). `README.md` (tableau `.bat`, en-tetes de section "Rendu
+fichier"/"Temps reel"/"Photo de waveform"/"Vagues empilees" -> "File
+render"/"Live"/"Snap"/"Ridge") et ce fichier mis a jour en consequence.
+Renommage fait au niveau du systeme de fichiers (`Move-Item`), pas juste
+une edition de contenu -- necessaire pour que les liens/references externes
+(raccourcis bureau existants d'un utilisateur, s'il y en a) suivent le
+nouveau nom au prochain telechargement du depot ; un raccourci DEJA CREE par
+un utilisateur vers l'ancien nom cesserait de fonctionner (limite connue de
+tout renommage de fichier, pas specifique a ce changement).
+
+### Suppression des lanceurs Live/Ridge
+
+Demande explicite : "Supprime les launcher live et ridge, le seul launcher
+est celui de snap qui est l'unique point d'entree." `Demarrer - Live.bat`/
+`Demarrer - Ridge.bat` supprimes (`Remove-Item`, pas juste un contenu vide --
+meme logique que le renommage juste au-dessus, un fichier absent plutot
+qu'un fichier mort a laisser trainer) : redondants depuis "Bascule de mode
+EN PLACE, MEME FENETRE" (voir plus bas) -- `live`/`ridge` sont desormais
+TOUJOURS atteignables depuis la fenetre de `snap` (boutons de bascule, meme
+`root` Tk partagee), les avoir en plus comme point de depart direct n'etait
+plus qu'une redondance historique de l'epoque ou chaque mode avait sa propre
+fenetre. `Demarrer - Snap.bat` reste seul (voir "Installation sans
+configuration" juste apres) : c'est le seul mode ou `-d`/`--device` est
+optionnel en `--gui` (voir sa propre section plus haut), donc le seul qui
+peut demarrer sans rien demander avant l'ouverture de la fenetre -- un
+prerequis pour etre LE point d'entree unique, que `live`/`ridge` (qui
+exigent encore `-d` au lancement direct) ne remplissaient pas. `README.md`
+(tableau `.bat` reduit a une seule ligne, section "Jongler entre les trois
+modes" precisant desormais que `live`/`ridge` se lancent DEPUIS cette meme
+fenetre plutot que directement) et ce fichier mis a jour en consequence.
 
 ### Installation sans configuration (ffmpeg embarque, `.bat` de lancement)
 
@@ -811,23 +1036,284 @@ tiers (~100 Mo, licence LGPL/GPL propre a ffmpeg), jamais du code source —
 chacun les recupere separement (lien dans le README), jamais commites dans
 ce depot.
 
-**Trois `.bat`** a la racine (un par script qui expose `--gui` — pas
-`audio2wave.py`, qui n'en a pas) : `cd /d "%~dp0"` (fonctionne quel que soit
-le dossier de lancement, un double-clic Explorateur part toujours du dossier
-du fichier, mais une execution depuis un raccourci pointant ailleurs
-pourrait ne pas l'assumer), verifie `python` dans le `PATH` avec un message
-clair sinon, puis lance `--gui`. `Demarrer - Photo waveform.bat`
-(`audio2wave_snap.py`) ne demande rien de plus : `-d`/`--device` y est
-optionnel (voir plus haut), l'entree audio se choisit dans la fenetre.
-`audio2wave_live.py`/`audio2wave_ridge.py`, eux, exigent encore `-d` au
-demarrage (pas etendus a cette session) : leurs `.bat` (`Demarrer - Onde en
-direct.bat`/`Demarrer - Vagues empilees.bat`) listent donc les peripheriques
-(`--list-devices`) puis demandent son nom exact via `set /p` avant de lancer
-`--gui` avec. `if errorlevel 1 pause` en fin de chaque `.bat` : sans ca, une
-fenetre `cmd` qui plante (ffmpeg manquant, peripherique introuvable...) se
+**Un seul `.bat` a la racine desormais, `Demarrer - Snap.bat`** (voir
+"Suppression des lanceurs Live/Ridge" plus bas pour l'historique) :
+`cd /d "%~dp0"` (fonctionne quel que soit le dossier de lancement, un
+double-clic Explorateur part toujours du dossier du fichier, mais une
+execution depuis un raccourci pointant ailleurs pourrait ne pas l'assumer),
+verifie `python` dans le `PATH` avec un message clair sinon, puis lance
+`audio2wave_snap.py --gui` (`-d`/`--device` y est optionnel, voir plus haut :
+l'entree audio se choisit dans la fenetre). `if errorlevel 1 pause` en fin de
+`.bat` : sans ca, une fenetre `cmd` qui plante (ffmpeg manquant...) se
 referme instantanement, illisible pour qui ne l'a pas lancee depuis un
 terminal deja ouvert — garder la fenetre ouverte sur l'erreur est le seul
 diagnostic disponible pour ce public.
+
+**Bascule de mode EN PLACE, MEME FENETRE reelle** — quatre jets successifs,
+chacun a la demande explicite de l'utilisateur, chacun resserrant un peu plus
+ce que "en place" veut dire :
+1. Lanceur SEPARE (`audio2wave_launcher.py`), une petite fenetre avec juste
+   l'entree audio et trois boutons, qui ouvrait ensuite la fenetre `--gui`
+   du script choisi ("une seule GUI ... qui serait la GUI generale afin de
+   controler tous les programmes").
+2. Boutons "Live"/"Ridge" integres directement dans la fenetre de `snap`
+   ("fusionner la gui du lanceur et celle de snap"), mais qui lancaient
+   encore l'autre script en SOUS-PROCESSUS (`subprocess.Popen`) : une
+   fenetre de plus s'ouvrait a cote de celle de `snap`, qui restait ouverte.
+3. Meme processus Python, mais chaque mode gardait encore sa PROPRE fenetre
+   Tk : le clic fermait proprement la session en cours (fil `run()`,
+   sous-processus ffmpeg/ffplay, fenetre Tk -- `root.destroy()`) puis
+   rappelait `enter_gui()` du mode suivant, qui appelait `tk.Tk()` une
+   deuxieme fois -- une nouvelle fenetre OS apparaissait donc a la place de
+   l'ancienne (pas de coexistence, mais un destroy+create quand meme
+   visible, sans doute un clignotement/une re-apparition a une position
+   legerement differente sur certains gestionnaires de fenetres).
+4. **Celui retenu** : "que le changement de mode ... charge les elements de
+   la gui en question dans la fenetre deja ouverte" — la fenetre Tk (`root`)
+   elle-meme est desormais PARTAGEE d'un bout a l'autre de la session,
+   passee de bascule en bascule ; `tk.Tk()` n'est appele qu'UNE SEULE FOIS
+   pour toute la duree du programme, peu importe le nombre de bascules.
+   Toujours pas une fusion des MOTEURS de rendu (option ecartee des la
+   discussion initiale, confirmee a chaque jet) -- `audio2wave_live.py` n'a
+   pas de boucle Python par image, contrairement a `snap`/`ridge` qui
+   recomposent chaque image ; chaque mode garde son propre `run()`, ses
+   propres sous-processus ffmpeg/ffplay. Seuls le PROCESSUS PYTHON *et*
+   desormais la FENETRE TK elle-meme sont partages.
+
+**Mecanique (identique dans les trois fichiers)** : chaque `build_gui()`
+recoit deux parametres optionnels, `root: tk.Tk | None = None` et
+`on_switch_mode: Callable[[str], None] | None = None` (tous deux `None` par
+defaut, ex. appel direct dans un test -- `root=None` en cree une nouvelle,
+`on_switch_mode=None` fait juste afficher un message aux boutons de bascule
+plutot que de planter). Avec un `root` deja fourni, `build_gui()` commence
+par le VIDER de ses widgets existants (`for child in root.winfo_children():
+child.destroy()`, ce qui inclut aussi d'eventuelles `Toplevel` encore
+ouvertes -- editeur de courbe, popup Mode VJ) avant de reconstruire dedans,
+exactement comme un `tk.Tk()` flambant neuf. **Elle n'appelle plus JAMAIS
+`root.mainloop()`/`root.destroy()` elle-meme** (voir plus bas qui s'en
+charge) : `refresh()` (statut, tick de 200 ms) continue de detecter une VRAIE
+fermeture de fenetre (`finished_event` set sans qu'un switch ne soit en
+cours) et d'appeler `root.destroy()` a ce moment-la, mais rien de plus.
+
+Les boutons de bascule ("Live"/"Ridge" dans `snap` ; "Snap"/"Ridge" dans
+`live` ; "Snap"/"Live" dans `ridge` -- notation anglaise uniforme partout,
+"Snap" ayant remplace un premier jet en francais "Photo") appellent une
+fonction locale
+`request_switch(mode_name)` qui, avant de deleguer a `on_switch_mode`
+(fourni par `run_app()`, c'est `handle_switch`) :
+```python
+refresh_after_id: dict[str, str | None] = {"id": None}
+def request_switch(mode_name: str) -> None:
+    ...
+    if refresh_after_id["id"] is not None:
+        root.after_cancel(refresh_after_id["id"])
+        refresh_after_id["id"] = None
+    on_switch_mode(mode_name)
+```
+**annule le prochain `refresh()` deja programme** (`root.after_cancel`). Sans
+ca, ce tick reste en attente dans la file d'evenements Tk et se declencherait
+PLUS TARD, une fois le mode suivant deja construit dans la meme `root` -- il
+tenterait alors de mettre a jour un `status_label` deja detruit (celui de
+CETTE session, remplace par celui du mode suivant) et leverait un `TclError`.
+L'annuler AVANT `on_switch_mode()` garantit qu'aucun tick perime ne peut plus
+se declencher, plutot que de laisser `refresh()` verifier un drapeau a
+chaque appel (approche ecartee : l'annulation est plus simple et plus sure,
+`refresh()` n'a besoin d'aucune connaissance d'un switch en cours).
+
+`handle_switch` (construit par `run_app()`, voir plus bas) enchaine sur le
+mode suivant, plutot que de juste noter une intention pour un appelant plus
+haut dans la pile (ancien modele du jet 3, quand chaque mode avait sa propre
+fenetre et `enter_gui()` n'etait rappele qu'APRES que `root.mainloop()` soit
+revenu) :
+```python
+def handle_switch(mode_name: str) -> None:
+    stop_event.set()
+    switch_done = threading.Event()
+    def wait_for_stop() -> None:
+        thread.join()
+        switch_done.set()
+    threading.Thread(target=wait_for_stop, daemon=True).start()
+    def poll_switch() -> None:
+        if not switch_done.is_set():
+            root.after(50, poll_switch)
+            return
+        if mode_name == "live":
+            import audio2wave_live
+            audio2wave_live.enter_gui(args.device, root=root)
+        elif mode_name == "ridge":
+            import audio2wave_ridge
+            audio2wave_ridge.enter_gui(args.device, root=root)
+    root.after(50, poll_switch)
+```
+`stop_event.set()` declenche l'arret propre habituel du fil `run()` (ferme
+`capture_proc`/`viewer` dans son `finally`, positionne `finished_event`).
+**Attendre cette fin de facon ASYNCHRONE (fil separe + sondage `root.after`,
+jamais un `thread.join()` direct dans le callback de clic) est le point
+CRITIQUE de ce mecanisme, corrige apres coup suite a un retour utilisateur en
+usage reel** ("la fenetre de gui se ferme et une autre est reouverte") : un
+premier jet appelait `thread.join()` directement dans `handle_switch`,
+execute synchroniquement DANS le callback du bouton -- ca gelait la boucle
+d'evenements Tk pendant les quelques centaines de ms que prend l'arret propre
+de ffmpeg/ffplay, assez longtemps pour que Windows marque la fenetre "ne
+repond pas" (effet fenetre fantome/gel du compositeur), PUIS l'affichage se
+mette a jour d'un coup une fois le callback termine -- percu par
+l'utilisateur comme "la fenetre se ferme et une autre se rouvre", alors que
+techniquement c'est TOUJOURS la meme fenetre, jamais fermee (confirme par
+ailleurs : `tk.Tk()` bien appele une seule fois). Les tests automatises de ce
+depot ne l'avaient pas detecte car ils ne font jamais tourner de vrai
+gestionnaire de fenetres Windows -- seul un retour en usage reel l'a revele.
+**Correction** : `wait_for_stop()` (fil separe, daemon) fait le `thread.join()`
+bloquant a la place du callback de clic, puis positionne `switch_done` ;
+`poll_switch()`, reprogrammee via `root.after(50, ...)` (meme cadence que
+`refresh()`), sonde cet evenement SANS jamais bloquer -- la boucle Tk continue
+de tourner et de repondre normalement pendant toute l'attente, aucune raison
+pour Windows de la geler. Une fois `switch_done` positionne, `poll_switch()`
+enchaine sur `enter_gui()` du mode cible -- cette derniere etape (destruction
+des anciens widgets + construction des nouveaux) reste, elle, synchrone et
+rapide (pur Python/Tcl, pas d'attente de sous-processus), donc sans effet de
+gel percu. `request_switch()` (voir plus haut) fige un dernier message de
+statut directement sur le widget (`status_label.config(text=f"Bascule vers
+{mode_name}...")`) avant d'appeler `on_switch_mode` : `refresh()` ne tourne
+plus pour l'actualiser pendant l'attente (son `after` a deja ete annule),
+sans ce message fige la ligne de statut resterait sur son dernier contenu
+sans indice que quelque chose se passe. `enter_gui(device, root=root)`
+reconstruit `args` via `sys.argv` synthetique + `parse_args()` (inchange
+depuis le jet 3), puis `run_app(args, size, root=root)` (voir plus bas), qui
+reconstruit les widgets DANS `root` et repart, sans jamais rappeler
+`mainloop()`. Import PARESSEUX inchange (`import audio2wave_live` DANS la
+fonction, jamais en tete de fichier) : meme necessite qu'au jet 3,
+`audio2wave_ridge.py` important deja `audio2wave_snap`/`audio2wave_live` en
+tete de fichier, un import en tete inverse creerait un cycle -- verifie a
+nouveau, six ordres d'import possibles, tous sans erreur.
+
+**`run_app(args, size, root=None)` possede desormais le cycle de vie de
+`root.mainloop()`, pas `build_gui()`** -- c'est le changement structurel
+central de ce jet. `owns_root = root is None` distingue le tout PREMIER
+appel (depuis `main()`, aucune fenetre encore ouverte) des appels IMBRIQUES
+(depuis `handle_switch()`, `root` deja fourni) :
+```python
+owns_root = root is None
+if owns_root:
+    root = tk.Tk()
+root._a2w_active = {"stop_event": stop_event, "thread": thread}
+build_gui(args, size, ..., root=root, on_switch_mode=handle_switch)
+if owns_root:
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
+    active = getattr(root, "_a2w_active", None)
+    if active is not None:
+        active["stop_event"].set()
+        active["thread"].join()
+```
+Seul l'appel PROPRIETAIRE (`owns_root=True`) appelle `root.mainloop()`, et une
+SEULE fois pour toute la session : un appel IMBRIQUE (bascule) construit son
+fil de rendu, reconstruit les widgets dans la `root` deja fournie, puis
+RETOURNE aussitot -- son retour remonte naturellement jusqu'au callback de
+clic qui a demarre la bascule (`request_switch` -> `handle_switch` ->
+`enter_gui` -> `run_app`), qui rend lui-meme la main a Tk, qui continue de
+faire tourner le `mainloop()` de l'appel proprietaire, plus bas dans la pile
+d'appels Python, exactement la ou il attendait deja. Rappeler `mainloop()` a
+chaque bascule (ce qu'aurait fait une traduction naive de l'ancien modele)
+aurait empile un niveau de boucle Tk supplementaire par bascule, sans jamais
+se depiler avant la toute derniere fermeture -- inutile ici, Tk n'a besoin
+que d'UNE boucle active en permanence.
+**`root._a2w_active`** (attribut ajoute sur `root` lui-meme, pas un parametre
+de plus a faire voyager dans toutes les signatures) resout un probleme
+distinct : quand l'utilisateur ferme VRAIMENT la fenetre (bouton OS, pas une
+bascule), c'est TOUJOURS `refresh()` du mode ACTUELLEMENT affiche qui detecte
+`finished_event` et appelle `root.destroy()` -- ce qui fait revenir
+`root.mainloop()`, mais dans l'appel PROPRIETAIRE, qui peut etre TRES
+different (plusieurs bascules plus tot) du mode qui vient de se fermer. Sans
+un moyen de retrouver le `thread`/`stop_event` du DERNIER mode actif, l'appel
+proprietaire ne saurait pas quoi `join()` a la sortie de `mainloop()`. Chaque
+`run_app()` (proprietaire ou non) met a jour `root._a2w_active` a chaque
+nouvelle session ; l'appel proprietaire relit cet attribut une fois
+`mainloop()` revenu et attend PROPREMENT ce fil-la, quel qu'il soit -- sans
+ca, le fil de rendu du DERNIER mode affiche (un `daemon=True`) serait
+simplement tue sans passer par son `finally` (ffmpeg/ffplay potentiellement
+non termines proprement) des que le processus Python quitte juste apres.
+
+**`enter_gui(device, root=None)`** (inchange dans son role, juste un
+parametre `root` de plus qui traverse jusqu'a `run_app()`) reste le point
+d'entree d'UN switch entrant, et **`main()`** reste inchange (aide propre au
+premier lancement, delegue toujours a `run_app(args, size)` sans `root` --
+`owns_root` y vaudra donc toujours `True`).
+
+**`live`/`ridge` ont desormais aussi un selecteur d'entree audio** ("il
+manque le select de l'input audio sur les gui", ajoute apres coup -- avant
+ce changement, seul `snap` en avait un, `-d` restait fige pour toute la
+session dans les deux autres). Leurs boutons de bascule n'ont pas besoin de
+verifier qu'une entree est choisie avant de basculer (une entree est
+TOUJOURS deja connue une fois la fenetre ouverte, `-d` reste obligatoire au
+premier lancement -- voir plus bas), a la difference de `snap` dont
+`request_switch()` refuse et affiche `"Choisis d'abord une entree audio pour
+passer en mode ..."` si le menu "Entree audio" est encore vide (son entree
+n'est, elle, jamais garantie : voir `-d`/`--device` desormais optionnel en
+`--gui` dans la section snap plus haut). Menu deroulant + bouton
+"Actualiser" (`list_audio_devices()`), meme widget qu'a `snap` (mais ni
+`device_state`/`capture_state` ni bouton "Mesurer" -- pas demande ici).
+**`ridge`** relit `args.device` a chaque tour de `run()` (meme mecanique que
+`snap` pour son propre menu, voir sa section) et redemarre juste la capture
+sur un changement (`capture_proc`/`LiveCapture`, format de sortie
+inchange -- `chunk_size` ne bouge pas puisque `--rate`/`--stereo` restent
+figes pour toute la session). **`live`**, lui, n'a pas de boucle Python par
+image a relire "en direct" (voir plus haut) : le device choisi n'est donc
+capture QUE dans `apply()`, exactement comme la Taille fenetre/le Plein
+ecran juste apres -- pas de mecanique de redemarrage dediee, `spawn()`
+redemarre de toute facon tout le pipeline avec la valeur courante d'`args`
+au prochain clic sur "Appliquer". `style_option_menu`/`GUI_FONT_SMALL`
+desormais importes dans `audio2wave_ridge.py` (ce script n'avait jusqu'ici
+aucun `OptionMenu`, seulement des sections/tooltips/curseurs -- voir
+"Rapprochement des trois fenetres --gui" plus haut, qui documentait encore
+cette absence). Verifie sans vrai ffmpeg/ffplay (memes principes que le
+reste de cette section) : choisir une autre entree dans le menu de `ridge`
+redemarre bien la capture avec la NOUVELLE entree (`-i audio=<nom>` dans la
+commande capturee), sans toucher au viewer ni relancer de script ; dans
+`live`, choisir une autre entree puis cliquer Appliquer fait bien un
+`spawn()` avec le NOUVEAU device (pas celui fige a l'ouverture).
+
+**Notation anglaise uniforme pour les trois modes** ("Utilise partout une
+notation en anglais pour snap, live et ridge"), a la demande explicite apres
+avoir constate l'incoherence accumulee au fil des sessions : `snap` etait
+tantot designe par son nom de code (`snap`, deja utilise dans le titre de sa
+fenetre) tantot par "Photo" (bouton de bascule dans `live`/`ridge`, ancien
+"Reglages photo" en en-tete de sa propre fenetre), `ridge` tantot "ridge"
+tantot "Vagues"/"vagues" (titre de sa fenetre de reglages ET de sa fenetre
+video ffplay). Desormais **`Snap`/`Live`/`Ridge` partout ou un mode est
+nomme dans l'interface** : titres des deux fenetres (reglages Tk et video
+ffplay, `window_title()`), en-tete de chaque fenetre de reglages ("Reglages
+Snap"/"Reglages Live"/"Reglages Ridge"), et les boutons de bascule
+eux-memes. Les noms de VARIABLES/PARAMETRES internes (`mode_name == "snap"`,
+etc.) etaient deja en anglais depuis le debut, inchanges. Les noms de
+fichiers `.bat` (`Demarrer - Photo waveform.bat` etc.), eux, sont restes
+inchanges A CE MOMENT-LA (la demande portait alors sur ce qui est AFFICHE
+dans l'interface, pas sur les noms de fichiers) -- renommes ensuite, a la
+demande explicite d'une session suivante ("renomme en anglais les noms de
+programmes en francais") : voir "Renommage des `.bat` en programmes anglais"
+plus bas.
+
+Verifie bout en bout, SANS vrai ffmpeg/ffplay (`subprocess.Popen`/
+`list_audio_devices`/`require_tools`/`probe_color`/`probe_device_rate`
+remplaces par des factices dans les trois modules) : **`tk.Tk` compte ses
+propres appels** (monkeypatch autour du vrai constructeur) -- demarre en
+`snap` sans peripherique, choisit une entree, clique "Live", puis "Ridge"
+depuis `live`, puis "Snap" depuis `ridge`, retour a `snap` avec la MEME
+entree tout du long : le compteur reste a **1** sur l'integralite du
+round-trip, la preuve directe qu'aucune fenetre OS supplementaire n'a jamais
+ete creee. La bascule etant ASYNCHRONE (voir plus haut, `poll_switch`) :
+`bouton.invoke()` revient AVANT que le mode suivant n'ait fini de se
+reconstruire, le test sonde donc `root.title()` (`wait_for_title()`, meme
+cadence de 50 ms que `poll_switch`) avant chaque etape suivante plutot que
+de presumer la bascule deja terminee au retour de `invoke()`. A aucun moment
+un `subprocess.Popen` ne relance un script
+(`sys.executable` + un chemin `.py`) -- seuls les `capture_proc`/`viewer`
+factices (ffmpeg/ffplay) sont spawns. Meme piege deja rencontre et
+redocumente ici : les trois modules font `import tkinter as tk`, donc
+`snap.tk`/`live.tk`/`ridge.tk` sont la MEME reference vers le module
+`tkinter` -- patcher `tk.Tk` sur l'un des trois le patche sur les trois a la
+fois.
 
 ### Invariants du pipeline de filtres
 
@@ -1264,6 +1750,118 @@ cas special de plus a chaque nouvel attribut `Path` ajoute un jour. Verifie avec
 un vrai `--video` choisi via le bouton "Parcourir..." (mock d'`askopenfilename`,
 meme mecanisme que le test de ce bouton) puis une sauvegarde de preset : le JSON
 ecrit contient bien une chaine, pas un objet illisible.
+
+### Presets + automation de courbes pour les trois modes
+
+`audio2wave_snap.py` avait deja les presets et la "variation automatique"
+(voir ci-dessus), mais ecrits en local avant que le besoin ne se pose
+ailleurs. A la demande explicite ("ajoute la possibilite d'avoir des presets
+et des automations de courbes pour tous les modes"), `audio2wave_live.py`/
+`audio2wave_ridge.py` les recoivent aussi -- via deux classes reutilisables,
+**`PresetStore`** et **`AutomationManager`**, definies dans
+`audio2wave_live.py` (juste apres `Tooltip`, meme raison de s'y trouver :
+elles ont besoin de tkinter, dont `common.py` reste exempt). `audio2wave_snap.py`
+**garde sa version en place**, pas migree vers ces classes : elle est deja
+ecrite, testee et documentee, migrer du code qui marche vers une
+factorisation commune n'aurait fait courir un risque de regression sans
+necessite. Un peu de duplication entre les trois fichiers en resulte
+(assumee, pas un oubli).
+
+**`PresetStore(builtin, path, aliases=None)`** reprend exactement la logique
+d'`all_presets()`/`load_user_presets()`/`save_user_preset()`/`preset_value()`
+d'`audio2wave_snap.py`, juste parametree par instance plutot qu'un jeu de
+fonctions module-level par script : `builtin` (un dict nom -> overrides
+argparse, integre au code) fusionne avec les presets utilisateur (JSON dans
+le profil, `path` -- fichier separe par script : `live_presets.json`/
+`ridge_presets.json`, jamais partage avec `snap_presets.json`), l'utilisateur
+prioritaire sur un nom identique. `.resolve` sert directement de `type=` a
+`p.add_argument("--preset", ...)`. `PRESETS`/`PRESET_ALIASES` de chaque
+script restent volontairement COURTS (2 entrees chacun) : la demande porte
+sur la CAPACITE d'avoir des presets, pas sur une collection exhaustive --
+"Sauvegarder sous" en ajoute en quelques secondes depuis la fenetre.
+`audio2wave_live.py` : `club` (analyzer/bar, theme ember, gain fort, plein
+ecran) et `calme` (radio/line, theme ocean, gain doux). `audio2wave_ridge.py` :
+`large` (espacement/bruit/trait genereux) et `dense` (serre). Dans les deux
+scripts, `--preset`/`--list-presets` suivent le MEME mecanisme que
+`audio2wave_snap.py` (`p.set_defaults(**overrides)` puis un second
+`p.parse_args()`, voir sa propre section) -- geres DANS `parse_args()`
+(`--list-presets` imprime et `sys.exit(0)`), avant les validations
+specifiques a chaque script.
+
+**`AutomationManager(root, tooltip_cls, panel_bg, muted_fg, accent)`** reprend
+integralement la mecanique de "Variation automatique" d'`audio2wave_snap.py`
+(memes constantes `AUTOMATE_*`, memes 5 presets de courbe `automate_curve_sinus/
+triangle/carre/dents_de_scie/aleatoire`, meme editeur de courbe en Toplevel
+avec Canvas glissable a la souris et curseur de vitesse `from_=MAX, to=MIN`
+inverse -- voir sa docstring pour le detail deja etabli et le bug d'inversion
+deja corrige une fois, pas a reproduire). Une instance par fenetre --gui
+(creee a CHAQUE `build_gui()`, jamais partagee entre bascules de mode : chaque
+mode a son propre jeu de curseurs automatables). `.register(holder, attr,
+label, lo, hi)` construit la case '~'/le bouton "courbe" SOUS un curseur deja
+cree (meme raison d'alignement qu'`audio2wave_snap.py`) ; `.tick(controls,
+finished_event)` est a programmer par l'appelant via `root.after(AUTOMATE_TICK_MS,
+...)`, se reprogramme ensuite elle-meme. `.capture()`/`.apply(data)` (cle
+reservee `AutomationManager.AUTOMATION_KEY = "_automation"`, memes noms que
+`AUTOMATION_PRESET_KEY` cote `audio2wave_snap.py`) permettent d'inclure l'etat
+d'automation dans un preset, exactement comme `audio2wave_snap.py` le fait deja.
+
+**`audio2wave_ridge.py`** : integration directe, sans surprise -- `run()` relit
+deja `args` a chaque ligne (voir sa docstring), donc `.tick()` n'est qu'une
+mutation d'attribut de plus parmi celles deja relues en direct. Curseurs
+automatables : Espacement, Deformation, Epaisseur (meme choix de nombre que
+`audio2wave_snap.py`, memes reglages visuellement decoratifs).
+
+**`audio2wave_live.py`** : integration plus delicate, a cause de son
+architecture (voir sa docstring de `build_gui()`/`run()`) -- RIEN n'y prend
+effet sans un redemarrage complet du pipeline ffmpeg/ffplay (`restart_event`,
+voir "Appliquer"). Redemarrer a `AUTOMATE_TICK_MS` (50 ms, la cadence de
+`.tick()`) aurait signifie des dizaines de `ffmpeg`/`ffplay` relances par
+seconde -- absurde. `automation_restart_tick()` (fonction locale de
+`build_gui()`, separee de `.tick()`) reutilise donc **`restart_event`**, le
+MEME mecanisme "seamless" que `--reactive` plus haut dans ce fichier (la
+nouvelle paire est lancee avant que l'ancienne ne se ferme, voir sa
+docstring de `run()`), mais a un rythme bien plus lent et FIXE
+(`AUTO_RESTART_INTERVAL_S = 2.0`, constante locale) : tant qu'au moins un
+curseur automatable est coche, elle appelle `apply()` (le meme code que le
+bouton "Appliquer") toutes les 2 secondes. Entre deux redemarrages, `.tick()`
+continue de deplacer le CURSEUR affiche (retour visuel immediat, cadence
+normale de 50 ms) sans que ca ne change quoi que ce soit au rendu tant que
+le prochain redemarrage n'a pas eu lieu -- assume comme une derive
+perceptible plutot qu'un temps reel, coherent avec la nature deja
+"purement decorative" de cette fonctionnalite. Curseurs automatables : Halo,
+Derive de teinte (les deux memes reglages decoratifs mis en avant par
+`audio2wave_snap.py`, pour la meme raison). **`on_load_preset()` declenche
+`apply()` immediatement** (contrairement a `audio2wave_snap.py`, ou charger un
+preset prend effet sans action supplementaire) : sans ce redemarrage explicite,
+un preset charge resterait invisible tant que l'utilisateur ne clique pas
+lui-meme sur "Appliquer", incoherent avec l'effet immediat attendu d'une
+selection dans le menu "Charger".
+Bug trouve et corrige en ecrivant le test de ce mecanisme : `fullscreen`
+n'etait pas dans `controls` (case a cocher construite a la main, comme
+`device`/`style`/`shape`/`stereo`/`theme`, jamais passee par
+`add_slider`/`add_entry`/`add_dropdown` qui enregistrent automatiquement) --
+un preset contenant `fullscreen=True` (ex. "club") l'ignorait donc
+silencieusement (liste `skipped`), le champ jamais mis a jour. Corrige en
+ajoutant `controls["fullscreen"] = fullscreen_var.set` a cote de sa creation,
+meme demarche que pour `device`/`style`/`shape`/`stereo`/`theme` juste avant.
+`"size"` reste volontairement HORS de `controls` dans les deux scripts
+(jamais enregistre, plutot qu'un ensemble d'exclusion dedie comme
+`PRESET_EXCLUDED_CONTROLS` cote `audio2wave_snap.py`) : plus simple pour
+arriver au meme resultat (independant du rendu, jamais capture dans un
+preset) puisque rien d'autre n'a besoin de le piloter via `controls` ici (pas
+de "Variation automatique" sur une taille de fenetre, et pas de Mode VJ dans
+ces deux scripts -- non demande, non ajoute).
+
+Verifie sans vrai ffmpeg/ffplay dans les deux scripts : `--list-presets`/
+`--preset <nom>` en CLI affichent/appliquent bien les bons overrides ;
+selectionner un preset dans le menu "Charger" de la fenetre mute bien les
+attributs attendus (`audio2wave_ridge.py` : mutation directe d'`args`, verifiee
+sans delai ; `audio2wave_live.py` : verifiee apres avoir attendu le spawn()
+declenche par l'`apply()` immediat) ; cocher '~' sous un curseur automatable
+fait bien avancer sa valeur tout seul (`args.ridge_spacing` cote
+`audio2wave_ridge.py`, la position du curseur Halo cote `audio2wave_live.py`,
+suivie jusqu'a ce qu'`automation_restart_tick()` declenche un nouveau spawn
+avec le halo deplace).
 
 ### Frequence d'echantillonnage
 
