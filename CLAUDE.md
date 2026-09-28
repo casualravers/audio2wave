@@ -188,6 +188,27 @@ resolution de chemins.
   pendant l'attente (pas un simple sleep), detecte une mort survenant EN
   COURS d'attente (pas seulement au tout debut), et s'interrompt
   immediatement si `stop_event` est deja positionne.
+  **Le fond anime d'un `--theme` (filtre `gradients`) "sautait" a chaque
+  redemarrage**, signale en usage reel juste apres le fix precedent
+  (alignement de frame) : "quand je bouge des params, cela peut faire se
+  decaler verticalement le pattern". Cause identifiee par mesure directe
+  (`ffmpeg -f lavfi gradients=...` lance deux fois avec les MEMES parametres,
+  hors de ce depot) : les options `x0`/`y0`/`x1`/`y1`/`seed` du filtre
+  valent `-1` (aleatoire) par defaut, donc CHAQUE nouveau process ffmpeg tire
+  une TOUTE NOUVELLE orientation de degrade -- confirme, deux lancements
+  identiques produisent des premieres images differentes (hash MD5 distincts).
+  Comme un redemarrage "doux" relance un process ffmpeg entier (voir plus
+  haut), le fond changeait donc d'orientation a CHAQUE reglage modifie --
+  invisible avant l'introduction du relais (la fenetre se rouvrait de toute
+  facon a chaque fois), devenu visible depuis qu'elle reste stable. Corrige
+  par `args.gradient_seed` (`parse_args()`, `random.randint(0, 2**31-1)`,
+  genere UNE FOIS par lancement/bascule de mode -- jamais regenere par un
+  redemarrage interne) transmis a `gradient_source()` (`audio2wave.py`,
+  parametre `seed` optionnel, `audio2wave_snap.py`/`ridge.py` ne l'utilisent
+  pas car ils n'ont pas ce probleme de redemarrage repete). Verifie par la
+  meme mesure directe qu'au diagnostic, avec `seed=` fixe cette fois : deux
+  lancements ffmpeg identiques produisent alors des premieres images
+  STRICTEMENT identiques (memes hash MD5).
   **Tout parametre est exposable dans `build_gui()`**, a la difference de
   `audio2wave_snap.py`/`audio2wave_ridge.py` : comme `apply()` redemarre tout le
   pipeline (rien n'est relu en direct par un `run()` par-image, voir ci-dessus), il
@@ -259,6 +280,39 @@ resolution de chemins.
   l'algorithme de `reactive_watcher` d'un vrai ffmpeg (level_state pilote a la
   main) : un pic d'une seule lecture ne redemarre rien, un changement plus long
   que la fenetre de lissage si.
+  **Plus de bouton "Appliquer"** — demande explicite ("enleve le bouton
+  appliquer et applique les params automatiquement a la place"), une fois le
+  relais/l'alignement de frame en place ayant rendu les redemarrages assez
+  discrets pour ca. `apply()` (inchangee : relit tous les widgets d'un coup,
+  positionne `restart_event`) est desormais declenchee par `schedule_apply()`,
+  cablee via `.trace_add("write", schedule_apply)` sur CHAQUE `tk.Variable`
+  exposee ici (`add_slider`/`add_entry`/`add_dropdown` la posent
+  automatiquement ; les controles construits a la main --
+  device/style/shape/stereo/theme/taille/plein ecran -- la posent
+  explicitement a leur creation) : un `trace_add("write", ...)` fire sur TOUTE
+  ecriture de la variable, quelle qu'en soit la source (glisser un curseur,
+  taper dans un champ, choisir un menu, cocher une case), une seule ligne par
+  fabrique suffit donc a couvrir tout ce qui passe par elles.
+  **DEBOUNCE plutot qu'un redemarrage par evenement** : glisser un curseur
+  ecrit sa variable des dizaines de fois par seconde, et CHAQUE redemarrage
+  rouvre le peripherique DirectShow (`capture_input_args`) -- les enchainer a
+  ce rythme risquerait de vrais soucis pilote, pas seulement un exces de
+  process ffmpeg. `schedule_apply()` reprogramme `apply()` a
+  `APPLY_DEBOUNCE_MS` (400 ms) dans le futur via `root.after(...)`, en
+  annulant le `after()` precedent a chaque nouvel appel -- `apply()` ne part
+  reellement qu'une fois l'utilisateur immobile sur ce delai. Un curseur
+  "automatable" coche (voir `AutomationManager`) repousse ce debounce EN
+  CONTINU tant qu'il tourne (`tick()` ecrit sa variable toutes les
+  `AUTOMATE_TICK_MS`=50 ms) : `schedule_apply()` ne se declenche donc jamais
+  de lui-meme pour un reglage automatise, exactement le comportement d'avant
+  ce changement -- `automation_restart_tick()` (rythme fixe
+  `AUTO_RESTART_INTERVAL_S`) reste seule responsable de les rejouer, sans
+  modification.
+  Verifie sans vrai ffmpeg/ffplay : aucun bouton "Appliquer" ne subsiste dans
+  la fenetre ; deplacer un curseur (Gain) declenche bien un redemarrage tout
+  seul, sans invoquer quoi que ce soit d'autre ; une rafale de 6 changements
+  espaces de 50 ms (bien sous le debounce) ne produit bien qu'UN SEUL
+  redemarrage, avec la DERNIERE valeur de la rafale.
 - [audio2wave_snap.py](audio2wave_snap.py) — photo fixe, rafraichie au meme rythme que sa
   duree, tracee progressivement. Duree en temps plutot qu'en secondes (`--bpm`/`--beats`,
   defaut 4 temps soit une mesure a 4/4). Deux familles de rendu: `--style pencil` (defaut)

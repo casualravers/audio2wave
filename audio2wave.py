@@ -74,10 +74,24 @@ def resolve_theme(args: argparse.Namespace) -> dict:
     return base
 
 
-def gradient_source(theme: dict, width: int, height: int, fps: int) -> str:
+def gradient_source(theme: dict, width: int, height: int, fps: int,
+                    seed: int | None = None) -> str:
+    """`seed` (optionnel) fixe la ligne/l'orientation de depart du degrade ffmpeg
+    (options `x0`/`y0`/`x1`/`y1`/`seed` du filtre `gradients`, toutes `-1` =
+    aleatoire par defaut si `seed` est omis). Sans lui, CHAQUE nouveau process
+    ffmpeg tire une orientation totalement nouvelle -- confirme par mesure
+    directe (deux `ffmpeg -f lavfi gradients=...` IDENTIQUES lances separement
+    produisent des premieres images differentes ; avec `seed=` fixe, elles sont
+    strictement identiques). Sans consequence pour un rendu fichier (un seul
+    process ffmpeg, pas de restart) : `audio2wave_live.py` est seul a passer un
+    `seed` explicite, pour que le fond ne "saute" pas a une orientation
+    aleatoire different a chaque redemarrage "doux" (voir CLAUDE.md/build_filter
+    la-bas).
+    """
     colors = "".join(f":c{i}={c}" for i, c in enumerate(theme["colors"]))
+    seed_part = f":seed={seed}" if seed is not None else ""
     return (f"gradients=s={width}x{height}:r={fps}:n={len(theme['colors'])}{colors}"
-            f":type={theme['type']}:speed={theme['speed']}")
+            f":type={theme['type']}:speed={theme['speed']}{seed_part}")
 
 
 def compose_scene(trace: str, background: str | None, glow: float,

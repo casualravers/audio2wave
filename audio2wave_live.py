@@ -196,10 +196,10 @@ def parse_args() -> argparse.Namespace:
                     help="Ouvre une petite fenetre de reglages (tkinter) pour le style, la "
                          "forme, les couleurs, les barres, le gain, le lissage, le stereo et "
                          "l'ambiance. Contrairement a audio2wave_snap.py/audio2wave_ridge.py, "
-                         "chaque application de reglage RELANCE le pipeline ffmpeg/ffplay "
-                         "(ce script n'a pas de boucle Python a modifier en direct : "
-                         "producteur et afficheur sont relies par un tube direct pour la "
-                         "latence, voir CLAUDE.md)")
+                         "chaque reglage change RELANCE le flux audio (ce script n'a pas de "
+                         "boucle Python par image a modifier en direct) -- la fenetre video "
+                         "elle-meme ne bouge pas, sauf changement de taille/plein ecran, voir "
+                         "CLAUDE.md")
     p.add_argument("--dry-run", action="store_true",
                     help="Affiche les commandes ffmpeg/ffplay sans les executer")
 
@@ -217,6 +217,19 @@ def parse_args() -> argparse.Namespace:
         p.set_defaults(**preset_store.all()[args.preset])
         args = p.parse_args()
 
+    # Fixe UNE FOIS pour toute la session (jamais regenere par un redemarrage
+    # "doux" ou "dur" -- voir build_filter()/gradient_source() dans
+    # audio2wave.py) : sans ca, `gradients` (le fond anime d'un --theme, sauf
+    # "flat") tire une TOUTE NOUVELLE orientation aleatoire a chaque nouveau
+    # process ffmpeg (confirme par mesure directe : deux lancements ffmpeg
+    # identiques produisent des premieres images differentes sans seed fixe),
+    # ce qui se voyait comme un "saut" du fond a chaque reglage change --
+    # signale par l'utilisateur en usage reel ("quand je bouge des params, "
+    # "cela peut faire se decaler verticalement le pattern"). N'est PAS un
+    # argument CLI : un nombre different a chaque lancement de audio2wave_live.py
+    # garde une variete d'un lancement a l'autre, seuls les redemarrages internes
+    # (memes `args`, meme session) doivent rester stables.
+    args.gradient_seed = random.randint(0, 2**31 - 1)
     return args
 
 
@@ -354,7 +367,11 @@ def build_filter(args: argparse.Namespace) -> str:
     trace += ",format=rgba,colorkey=0x000000:0.03:0.15"
 
     if args.theme != "flat":
-        background = gradient_source(theme, width, height, args.fps)
+        # `args.gradient_seed` (fixe une fois pour toute la session, voir
+        # parse_args()) maintient l'orientation du degrade STABLE a travers
+        # les redemarrages internes -- voir la docstring de gradient_source()
+        # dans audio2wave.py pour la mesure qui confirme le bug sans ca.
+        background = gradient_source(theme, width, height, args.fps, seed=args.gradient_seed)
     else:
         background = f"color=s={width}x{height}:c={args.bg_color}:r={args.fps}"
 
@@ -781,7 +798,7 @@ def read_reactive_level(level_state: dict, stop_event: threading.Event) -> None:
 def reactive_watcher(args: argparse.Namespace, level_state: dict,
                      restart_event: threading.Event, stop_event: threading.Event) -> None:
     """Fait "respirer" args.glow avec le niveau mesure par read_reactive_level, en
-    declenchant le meme redemarrage seamless que le bouton Appliquer du --gui (voir
+    declenchant le meme redemarrage "doux" qu'un reglage change dans le --gui (voir
     run()). Pas de modulation continue: le seul canal vraiment live que ffmpeg
     expose pour piloter un filtre en cours de route (le filtre zmq) demande un
     client ZeroMQ absent de la stdlib Python — voir add_reactive_metering et
@@ -866,7 +883,8 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
     `current_size != size or args.fullscreen != last_fullscreen`, sauf que
     maintenant elle controle QUEL type de redemarrage se produit plutot que
     SI un redemarrage se produit (tout le reste de la fenetre redemarre de
-    toute facon le producteur a chaque Appliquer, voir build_gui()).
+    toute facon le producteur a chaque reglage change, voir schedule_apply()
+    dans build_gui()).
 
     Si une nouvelle tentative echoue a demarrer (mauvais reglage, peripherique
     perdu), l'ancienne paire/le producteur precedent restent actifs et le
@@ -875,7 +893,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
 
     --reactive ajoute deux fils de fond (voir read_reactive_level/
     reactive_watcher) qui appellent restart_event.set() de la meme facon que
-    le bouton Appliquer du --gui: ce sont deux sources possibles du meme
+    schedule_apply()/apply() dans le --gui: ce sont deux sources possibles du meme
     signal, run() ne fait pas la difference entre les deux -- et comme
     --reactive ne touche jamais a la taille/au plein ecran, ses redemarrages
     sont TOUJOURS "doux" desormais (l'ancienne version devait deja les
@@ -908,8 +926,8 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
             # spawn, pas apres: sinon une nouvelle demande arrivee pendant le
             # spawn/le delai de grace (un redemarrage --reactive automatique,
             # en particulier: rien ne protege son declenchement comme le
-            # ferait le temps de reaction d'un humain sur le bouton Appliquer)
-            # tombe dans la fenetre entre le succes du spawn et ce clear() et
+            # ferait le debounce de schedule_apply() sur un reglage change a
+            # la main) tombe dans la fenetre entre le succes du spawn et ce clear() et
             # se retrouve effacee avant meme que la boucle interne ne l'ait
             # vue passer a True -- perdue en silence, aucun redemarrage n'a
             # lieu alors qu'un changement l'exigeait. Efface ici, en tete de
@@ -1448,12 +1466,14 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
 
     A la difference de audio2wave_snap.py/audio2wave_ridge.py, un changement ici ne
     prend pas effet tout seul: ce script n'a pas de boucle Python par image a relire.
-    Chaque reglage n'est donc applique qu'au clic sur "Appliquer", qui relance le
-    PRODUCTEUR (ffmpeg) avec les nouvelles valeurs -- mais, depuis le relais Python
-    de run()/relay_loop() (voir sa docstring), la fenetre video elle-meme ne se
-    ferme/rouvre plus pour un tel changement, seulement quand la Taille fenetre ou
-    le Plein ecran changent (ffplay ne peut pas changer ca sans se redemarrer
-    lui-meme). Les curseurs ne redemarrent pas a chaque cran deplace, seulement au clic.
+    Chaque reglage est donc rejoue via `apply()`, qui relance le PRODUCTEUR (ffmpeg)
+    avec les nouvelles valeurs -- mais, depuis le relais Python de run()/relay_loop()
+    (voir sa docstring), la fenetre video elle-meme ne se ferme/rouvre plus pour un
+    tel changement, seulement quand la Taille fenetre ou le Plein ecran changent
+    (ffplay ne peut pas changer ca sans se redemarrer lui-meme). Pas de bouton
+    "Appliquer" a cliquer : `schedule_apply()` (voir sa docstring, definie juste
+    apres `controls`/`automation`) declenche `apply()` automatiquement, debounce
+    apres la derniere modification, sur CHAQUE variable Tk exposee ici.
 
     `root` : la fenetre Tk a peupler, PARTAGEE entre les trois modes (voir
     "Bascule de mode EN PLACE, MEME FENETRE" dans CLAUDE.md, et la docstring de
@@ -1483,11 +1503,53 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     # Presets + automation de courbes (voir PresetStore/AutomationManager plus
     # haut dans ce fichier) : `controls` associe chaque attribut expose ici a
     # un setter qui met a jour le WIDGET (pas `args` directement -- tout ici
-    # n'est de toute facon rejoue qu'au clic sur "Appliquer", voir sa
-    # docstring), rempli au fil des add_entry/add_slider/add_dropdown
-    # ci-dessous. `automation` gere le sous-ensemble de curseurs "automatables".
+    # est de toute facon rejoue automatiquement, voir schedule_apply() plus
+    # bas), rempli au fil des add_entry/add_slider/add_dropdown ci-dessous.
+    # `automation` gere le sous-ensemble de curseurs "automatables".
     controls: dict[str, Callable[[object], None]] = {}
     automation = AutomationManager(root, Tooltip, GUI_PANEL_BG, GUI_MUTED_FG, GUI_ACCENT)
+
+    # Applique automatiquement les reglages, sans bouton "Appliquer" a
+    # cliquer -- demande explicite ("enleve le bouton appliquer et applique
+    # les params automatiquement a la place"). `apply()` (definie plus bas)
+    # reste la MEME fonction qu'avant (elle relit tous les widgets d'un coup
+    # et positionne restart_event) : seul ce qui la DECLENCHE change.
+    # `schedule_apply` est cablee sur CHAQUE variable Tk exposee ici (via
+    # `.trace_add("write", ...)`, qui fire sur toute modification -- glisser
+    # un curseur, taper dans un champ, choisir une entree de menu, cocher une
+    # case -- quelle que soit la source du changement) plutot que sur un
+    # `command=`/bind par widget: une seule ligne dans add_slider/add_entry/
+    # add_dropdown couvre tout ce qui passe par ces trois fabriques, le reste
+    # (device/style/shape/stereo/theme/taille/plein ecran, construits a la
+    # main) est cable explicitement a sa creation.
+    #
+    # DEBOUNCE plutot qu'un redemarrage a chaque evenement : glisser un
+    # curseur declenche des dizaines d'ecritures de variable par seconde, et
+    # CHAQUE redemarrage rouvre le peripherique DirectShow (voir
+    # spawn_producer()/capture_input_args) -- l'enchainer a ce rythme
+    # risquerait de vrais soucis cote pilote audio, pas seulement un exces de
+    # process ffmpeg. `schedule_apply` reprogramme donc `apply()` a
+    # APPLY_DEBOUNCE_MS dans le futur, en annulant le `after()` precedent a
+    # chaque nouvel appel : `apply()` ne part reellement qu'une fois l'utilisateur
+    # immobile sur le reglage pendant ce delai. Un curseur "automatable" (voir
+    # AutomationManager) le repousse en continu tant qu'il tourne (`tick()`
+    # ecrit sa variable toutes les AUTOMATE_TICK_MS=50 ms) : `schedule_apply`
+    # ne se declenche donc JAMAIS de lui-meme pour un reglage automatise --
+    # c'est deliberement `automation_restart_tick()` (plus bas, rythme fixe de
+    # AUTO_RESTART_INTERVAL_S) qui reste seule responsable de rejouer ces
+    # reglages-la, exactement comme avant ce changement.
+    APPLY_DEBOUNCE_MS = 400
+    apply_after_id: dict[str, str | None] = {"id": None}
+
+    def schedule_apply(*_args: object) -> None:
+        if apply_after_id["id"] is not None:
+            root.after_cancel(apply_after_id["id"])
+
+        def run_apply() -> None:
+            apply_after_id["id"] = None
+            apply()
+
+        apply_after_id["id"] = root.after(APPLY_DEBOUNCE_MS, run_apply)
 
     # Memes constantes de marge et memes helpers (add_label/add_section_title/
     # add_separator) qu'audio2wave_snap.py/audio2wave_ridge.py --gui, a la
@@ -1577,6 +1639,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     # `apply()` comme la Taille fenetre/le Plein ecran plus bas, pas d'une
     # mecanique de redemarrage dediee.
     device_var = tk.StringVar(value=args.device or "")
+    device_var.trace_add("write", schedule_apply)
 
     def on_device_change(value: object = None) -> None:
         if value is not None:
@@ -1620,6 +1683,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     style_frame.grid(row=r, column=LEFT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     for value in ("analyzer", "radio"):
         tk.Radiobutton(style_frame, text=value, variable=style_var, value=value).pack(side="left")
+    style_var.trace_add("write", schedule_apply)
     controls["style"] = style_var.set
 
     shape_var = tk.StringVar(value=args.shape)
@@ -1630,6 +1694,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     shape_frame.grid(row=r, column=LEFT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     for value in ("bar", "line"):
         tk.Radiobutton(shape_frame, text=value, variable=shape_var, value=value).pack(side="left")
+    shape_var.trace_add("write", schedule_apply)
     controls["shape"] = shape_var.set
 
     add_separator("left", "Couleurs")
@@ -1641,6 +1706,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         add_label(label, r, label_col, tooltip=tooltip)
         var = tk.StringVar(value=initial)
         tk.Entry(root, textvariable=var, width=20).grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        var.trace_add("write", schedule_apply)
 
         def set_value(value: object) -> None:
             var.set(value if value is not None else "")
@@ -1670,6 +1736,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
             holder.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
         scale = tk.Scale(holder, from_=lo, to=hi, resolution=step, orient="horizontal",
                          variable=var, length=170, showvalue=True)
+        var.trace_add("write", schedule_apply)
         if automatable:
             scale.pack(side="top", anchor="w")
         else:
@@ -1694,6 +1761,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         menu = tk.OptionMenu(root, var, *choices)
         style_option_menu(menu)
         menu.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        var.trace_add("write", schedule_apply)
         controls[attr] = var.set
         return var
 
@@ -1705,6 +1773,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     theme_menu = tk.OptionMenu(root, theme_var, "flat", *sorted(THEMES))
     style_option_menu(theme_menu)
     theme_menu.grid(row=r, column=LEFT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    theme_var.trace_add("write", schedule_apply)
     controls["theme"] = theme_var.set
 
     # --glow/--hue-cycle valent None par defaut (c'est alors le theme choisi qui
@@ -1742,18 +1811,19 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     tk.Checkbutton(root, text="Stereo", variable=stereo_var,
                   ).grid(row=next_row("right"), column=RIGHT_LABEL_COL, columnspan=2, sticky="w",
                          padx=ROW_PADX, pady=ROW_PADY)
+    stereo_var.trace_add("write", schedule_apply)
     controls["stereo"] = stereo_var.set
 
     add_separator("right", "Sortie")
 
     # --size/--fullscreen: contrairement au reste de cette fenetre, deja rejoues
-    # a chaque Appliquer (spawn() redemarre tout le pipeline, voir la docstring
-    # de run() plus haut) -- juste deux champs de plus captures par apply(),
-    # pas de mecanique de redemarrage dediee comme dans audio2wave_snap.py/
+    # a chaque redemarrage automatique (voir schedule_apply()/spawn_display()
+    # plus haut) -- juste deux champs de plus captures par apply(), pas de
+    # mecanique de redemarrage dediee comme dans audio2wave_snap.py/
     # audio2wave_ridge.py (rien n'est jamais relu "en direct" ici).
     r = next_row("right")
     add_label("Taille fenetre", r, RIGHT_LABEL_COL, tooltip="Largeur x hauteur de la fenetre, en pixels. "
-                                                            "Prend effet au prochain Appliquer.")
+                                                            "Appliquee automatiquement.")
     size_frame = tk.Frame(root)
     size_frame.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     # Prerempli avec la taille REELLE deja resolue au lancement (comme
@@ -1775,12 +1845,14 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     untouched_size = (str(width), str(height))
     for var in (width_var, height_var):
         tk.Entry(size_frame, textvariable=var, width=6).pack(side="left", padx=(0, 6))
+        var.trace_add("write", schedule_apply)
 
     fullscreen_var = tk.BooleanVar(value=args.fullscreen)
     fullscreen_check = tk.Checkbutton(size_frame, text="Plein ecran", variable=fullscreen_var)
     fullscreen_check.pack(side="left", padx=(4, 0))
-    Tooltip(fullscreen_check, "Prend effet au prochain Appliquer. Decoche pour sortir d'un "
-                             "plein ecran ouvert sur le mauvais moniteur.")
+    Tooltip(fullscreen_check, "Appliquee automatiquement. Decoche pour sortir d'un plein ecran "
+                             "ouvert sur le mauvais moniteur.")
+    fullscreen_var.trace_add("write", schedule_apply)
     controls["fullscreen"] = fullscreen_var.set
 
     def apply(_evt=None) -> None:
@@ -1871,10 +1943,11 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         if skipped:
             text += f" (ignore: {', '.join(skipped)})"
         status["text"] = text
-        # Contrairement a audio2wave_snap.py (relu en direct par run(), aucun
-        # clic requis), rien ici ne prend effet sans "Appliquer" (voir sa
-        # docstring) -- charger un preset le declenche donc tout de suite,
-        # pour un effet immediat coherent avec la selection dans le menu.
+        # Contrairement a audio2wave_snap.py (relu en direct par run()), rien
+        # ici ne prend effet sans passer par apply() (voir la docstring de
+        # build_gui) -- charger un preset l'appelle donc directement plutot
+        # que d'attendre schedule_apply()/son debounce, pour un effet
+        # immediat coherent avec la selection dans le menu.
         apply()
 
     def select_preset(name: str) -> None:
@@ -1946,12 +2019,16 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="ew",
         padx=ROW_PADX, pady=(SECTION_GAP, 0))
 
-    r = next_shared_row()
-    tk.Button(root, text="Appliquer (redemarre)", command=apply).grid(
-        row=r, column=0, columnspan=TOTAL_COLUMNS, pady=(10, 4))
-    tk.Label(root, text="Les curseurs ne redemarrent pas seuls : clique Appliquer.",
+    # Plus de bouton "Appliquer" : chaque reglage se propage tout seul via
+    # schedule_apply() (voir sa docstring plus haut), demande explicite
+    # ("enleve le bouton appliquer et applique les params automatiquement a
+    # la place"). Ce label rappelle juste le delai (les redemarrages ne sont
+    # pas instantanes, un utilisateur qui bouge vite un curseur ne doit pas
+    # croire que rien ne se passe).
+    tk.Label(root, text=f"Chaque reglage s'applique tout seul "
+            f"(~{APPLY_DEBOUNCE_MS / 1000:.1f} s apres la derniere modification).",
             fg=GUI_MUTED_FG).grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS,
-                                  sticky="w", padx=ROW_PADX)
+                                  sticky="w", padx=ROW_PADX, pady=(10, 4))
 
     status_label = tk.Label(root, text="", justify="left", anchor="w", fg=GUI_ACCENT,
                             font=GUI_FONT_MONO)
@@ -2054,9 +2131,9 @@ def run_app(args: argparse.Namespace, width: int, height: int,
           flush=True)
     report_latency(args)
     if args.gui:
-        print("Fenetre de reglages ouverte: ferme-la ou Ctrl+C pour arreter. Chaque clic sur "
-              "Appliquer relance le flux audio (la fenetre video ne bouge pas, sauf "
-              "changement de taille/plein ecran).",
+        print("Fenetre de reglages ouverte: ferme-la ou Ctrl+C pour arreter. Chaque reglage "
+              "s'applique tout seul, quelques centaines de ms apres la derniere modification "
+              "(la fenetre video ne bouge pas, sauf changement de taille/plein ecran).",
               flush=True)
     else:
         print("Ferme la fenetre ou Ctrl+C pour arreter.", flush=True)
