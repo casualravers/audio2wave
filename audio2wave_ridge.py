@@ -687,9 +687,11 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # (resolve_points) plutot que None, mais des qu'on touche le curseur la valeur
     # devient explicite, comme --columns en ligne de commande.
     add_slider("Points par ligne", "columns", 0, 400, 4,
-              initial=resolve_points(args, size[0]), tooltip="0 = un point par pixel (plein detail).")
+              initial=resolve_points(args, size[0]), tooltip="0 = un point par pixel (plein detail).",
+              automatable=True)
     add_slider("Images/s du trace", "draw_fps", 0, 60, 1,
-              tooltip="Cadence du trace progressif d'une nouvelle ligne. 0 = affichage direct.")
+              tooltip="Cadence du trace progressif d'une nouvelle ligne. 0 = affichage direct.",
+              automatable=True)
 
     # ============================= PANNEAU DROIT ==============================
     add_section_title("right", "Couleurs")
@@ -752,12 +754,23 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                             "les forts au lieu de tous toucher le plafond.")
     r = next_row("right")
     add_label("Gain manuel (dB)", r, RIGHT_LABEL_COL)
-    tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
+    # Meme holder-Frame que add_slider(automatable=True) pour la case '~'/le
+    # bouton "courbe" SOUS le curseur (voir sa docstring) -- registre sous la
+    # cle "gain" DEJA utilisee par controls["gain"] = set_gain (voir plus
+    # haut) plutot qu'une cle dediee : set_gain accepte deja un flottant nu
+    # (bascule auto -> manuel, comme un preset qui chargerait un gain
+    # explicite), la courbe d'automation n'a donc rien de plus a faire que
+    # rejouer exactement ce chemin existant.
+    gain_holder = tk.Frame(root)
+    gain_holder.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    tk.Scale(gain_holder, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
             length=170, showvalue=True, command=lambda _v: on_gain_change(),
-            ).grid(row=r, column=RIGHT_CTRL_COL, padx=ROW_PADX, pady=ROW_PADY)
+            ).pack(side="top", anchor="w")
+    automation.register(gain_holder, "gain", "Gain manuel (dB)", -40, 40)
     add_slider("Lissage (lignes)", "gain_window", 1, 60, 1, panel="right",
               tooltip="Nombre de lignes recentes sur lesquelles le gain automatique lisse "
-                      "sa reference. 1 = instantane, comme une photo isolee.")
+                      "sa reference. 1 = instantane, comme une photo isolee.",
+              automatable=True)
 
     add_separator("right", "Sortie")
 

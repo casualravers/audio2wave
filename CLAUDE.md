@@ -1851,9 +1851,24 @@ d'automation dans un preset, exactement comme `audio2wave_snap.py` le fait deja.
 
 **`audio2wave_ridge.py`** : integration directe, sans surprise -- `run()` relit
 deja `args` a chaque ligne (voir sa docstring), donc `.tick()` n'est qu'une
-mutation d'attribut de plus parmi celles deja relues en direct. Curseurs
-automatables : Espacement, Deformation, Epaisseur (meme choix de nombre que
-`audio2wave_snap.py`, memes reglages visuellement decoratifs).
+mutation d'attribut de plus parmi celles deja relues en direct. **Curseurs
+automatables : tous les reglages numeriques de cette fenetre** -- demande
+explicite ("ajoute des automations pour tous les parametres des modes live
+et ridge"), apres un premier jet plus restreint (Espacement, Deformation,
+Epaisseur seulement, "purement decoratifs"). S'ajoutent desormais Points par
+ligne (`columns`), Images/s du trace (`draw_fps`), Lissage/`gain_window`, et
+le **Gain manuel (dB)** -- ce dernier construit a la main (pas via
+`add_slider`, a cause du bouton "Gain automatique" cote a cote) : la case
+'~'/le bouton "courbe" sont ajoutes dans un `Frame` de plus, meme motif
+d'alignement que `add_slider(automatable=True)`, et `automation.register(...,
+"gain", ...)` reutilise directement la cle `"gain"` DEJA presente dans
+`controls` (`set_gain`, qui accepte deja un flottant nu en plus de `"auto"`
+— basculer l'automation revient donc a rejouer exactement le meme chemin
+qu'un preset qui chargerait un gain explicite, rien de plus a ecrire).
+Restent HORS automation les controles non numeriques (couleurs, style/forme
+de trait, case Gain automatique elle-meme, taille/plein ecran, dossier de
+sortie) : une courbe interpole une plage `[lo, hi]` continue, ce qui n'a pas
+de sens pour une chaine ou un booleen.
 
 **`audio2wave_live.py`** : integration plus delicate, a cause de son
 architecture (voir sa docstring de `build_gui()`/`run()`) -- RIEN n'y prend
@@ -1872,9 +1887,19 @@ continue de deplacer le CURSEUR affiche (retour visuel immediat, cadence
 normale de 50 ms) sans que ca ne change quoi que ce soit au rendu tant que
 le prochain redemarrage n'a pas eu lieu -- assume comme une derive
 perceptible plutot qu'un temps reel, coherent avec la nature deja
-"purement decorative" de cette fonctionnalite. Curseurs automatables : Halo,
-Derive de teinte (les deux memes reglages decoratifs mis en avant par
-`audio2wave_snap.py`, pour la meme raison). **`on_load_preset()` declenche
+"purement decorative" de cette fonctionnalite. **Curseurs automatables :
+tous les reglages numeriques de cette fenetre** (meme extension, meme
+demande explicite, que `audio2wave_ridge.py` ci-dessus) -- Halo/Derive de
+teinte du premier jet, plus desormais Barres/points (`bars`), Gain (dB),
+Lissage (`averaging`), Espace entre barres (`bar_gap`). Ce dernier lot
+profite directement du relais Python introduit depuis (voir la docstring de
+`run()`/`relay_loop()` plus haut) : `automation_restart_tick()` continue
+d'appeler `apply()` toutes les `AUTO_RESTART_INTERVAL_S` (2 s), mais AUCUN de
+ces quatre reglages ne touche `--size`/`--fullscreen`, donc chacun de ces
+redemarrages periodiques est desormais "doux" -- la fenetre ffplay ne
+clignote plus du tout pendant qu'une automation tourne, la ou l'ancienne
+architecture (tube direct) l'aurait fait clignoter toutes les 2 secondes.
+**`on_load_preset()` declenche
 `apply()` immediatement** (contrairement a `audio2wave_snap.py`, ou charger un
 preset prend effet sans action supplementaire) : sans ce redemarrage explicite,
 un preset charge resterait invisible tant que l'utilisateur ne clique pas

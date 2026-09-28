@@ -1605,12 +1605,16 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     # ============================= PANNEAU DROIT ==============================
     add_section_title("right", "Spectre")
 
-    bars_var = add_slider("Barres/points", "bars", 8, 400, 4, resolve_bars(args, width), panel="right")
-    gain_var = add_slider("Gain (dB)", "gain", -60, 60, 1, resolve_gain(args), panel="right")
+    bars_var = add_slider("Barres/points", "bars", 8, 400, 4, resolve_bars(args, width), panel="right",
+                          automatable=True)
+    gain_var = add_slider("Gain (dB)", "gain", -60, 60, 1, resolve_gain(args), panel="right",
+                          automatable=True)
     averaging_var = add_slider("Lissage", "averaging", 1, 30, 1, args.averaging, panel="right",
                               tooltip="Uniquement pour le style analyzer: nombre de trames "
-                                      "moyennees, poste de latence principal en live.")
-    bar_gap_var = add_slider("Espace entre barres", "bar_gap", 0, 1.5, 0.05, args.bar_gap, panel="right")
+                                      "moyennees, poste de latence principal en live.",
+                              automatable=True)
+    bar_gap_var = add_slider("Espace entre barres", "bar_gap", 0, 1.5, 0.05, args.bar_gap, panel="right",
+                             automatable=True)
     freq_scale_var = add_dropdown("Echelle frequences", "freq_scale", args.freq_scale,
                                   ("lin", "log", "rlog"), panel="right",
                                   tooltip="Uniquement pour le style analyzer.")
