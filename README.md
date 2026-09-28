@@ -36,7 +36,7 @@ d'installer ffmpeg ni de toucher au `PATH` :
 2. Extrais `ffmpeg.exe`, `ffprobe.exe` et `ffplay.exe` (dans le sous-dossier
    `bin/` du zip telecharge) dans un dossier `bin/` cree a la racine de ce
    depot, a cote de `audio2wave_snap.py`.
-3. Double-clique un des fichiers `Demarrer - ....bat` a la racine.
+3. Double-clique `Demarrer - Snap.bat` a la racine.
 
 Les scripts detectent automatiquement `bin/` s'il existe et l'utilisent en
 priorite, sans rien configurer d'autre — voir `common.py` si l'un des deux
@@ -44,21 +44,43 @@ chemins d'installation te surprend.
 
 ## Lancement sans terminal (`.bat`)
 
-Trois fichiers `.bat` a la racine, un par script avec fenetre de reglages :
+Un seul fichier `.bat` a la racine, point d'entree unique :
 
 | fichier | lance |
 |---|---|
-| `Demarrer - Photo waveform.bat` | `audio2wave_snap.py --gui` (entree audio choisie dans la fenetre) |
-| `Demarrer - Onde en direct.bat` | `audio2wave_live.py --gui` (demande le nom de l'entree audio au demarrage) |
-| `Demarrer - Vagues empilees.bat` | `audio2wave_ridge.py --gui` (demande le nom de l'entree audio au demarrage) |
+| `Demarrer - Snap.bat` | `audio2wave_snap.py --gui` (entree audio choisie dans la fenetre) |
 
 Double-clic, pas de ligne de commande a taper. Nécessite [Python](https://www.python.org/downloads/)
 installe (coche "Add python.exe to PATH" pendant l'installation) — le `.bat`
 previent clairement si ce n'est pas le cas plutot que d'echouer en silence.
+`live`/`ridge` se lancent DEPUIS cette meme fenetre (boutons de bascule, voir
+plus bas) — jamais directement, plus de `.bat` dedie pour eux.
+
+## Jongler entre les trois modes, sans jamais ouvrir de nouvelle fenetre
+
+La fenetre de reglages (`snap`/`live`/`ridge`) a des boutons vers les deux
+autres modes : **Live**/**Ridge** dans celle de `snap` (a cote du menu
+"Entree audio"), **Snap**/**Ridge** dans celle de `live`, **Snap**/**Live**
+dans celle de `ridge`. Cliquer l'un d'eux ferme proprement la session en
+cours (capture audio, fenetre video) puis charge les reglages du mode
+suivant DANS CETTE MEME FENETRE, AVEC LA MEME ENTREE AUDIO — jamais de
+nouvelle fenetre qui s'ouvre, jamais besoin de choisir l'entree une deuxieme
+fois. `snap` refuse de basculer si aucune entree n'est encore choisie
+(`live`/`ridge`, qui l'exigent des le demarrage, en ont forcement deja une).
+
+Ce n'est pas une fusion des moteurs de rendu : chaque mode garde son propre
+fonctionnement (l'entree `Fenetre de reglages` de chaque section plus bas
+reste valable), seule la navigation entre eux est unifiee.
+
+```bash
+python audio2wave_snap.py --gui
+# fenetre: menu "Entree audio" -> boutons "Live"/"Ridge" a cote d'Actualiser
+# depuis n'importe quel mode, les boutons "Autres modes" ramenent aux deux autres
+```
 
 ---
 
-# Rendu fichier — `audio2wave.py`
+# File render — `audio2wave.py`
 
 ## Usage
 
@@ -135,7 +157,7 @@ python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-col
 
 ---
 
-# Temps reel — `audio2wave_live.py`
+# Live — `audio2wave_live.py`
 
 Capture une entree audio et affiche l'analyseur dans une fenetre. Le son n'est pas
 reproduit : seul le visuel est affiche.
@@ -319,7 +341,7 @@ agrandi (et flouté) par ffplay.
 
 ---
 
-# Photo de waveform — `audio2wave_snap.py`
+# Snap — `audio2wave_snap.py`
 
 Meme entree live que `audio2wave_live.py`, mais **rien ne defile** : la fenetre
 montre le contour du dernier temps joue, **trace de gauche a droite** en accelere
@@ -428,7 +450,13 @@ Chaque photo est annoncee dans le terminal avec sa crete et le gain applique :
 ## Presets (`--preset`)
 
 Un preset regroupe plusieurs options sous un nom court, pour ne pas avoir a recopier
-la meme ligne de commande a chaque lancement. `--list-presets` en detaille le contenu :
+la meme ligne de commande a chaque lancement. `--list-presets` en detaille le contenu.
+Les trois modes ont chacun leurs presets (fichiers separes, jamais partages) : le
+detail ci-dessous porte sur `audio2wave_snap.py`, mais `audio2wave_live.py`
+(`club`/`calme`) et `audio2wave_ridge.py` (`large`/`dense`) fonctionnent a
+l'identique (`--preset`/`--list-presets` en CLI, bloc **Presets** dans leur
+fenetre `--gui` avec Charger/Mettre a jour/Sauvegarder sous) — juste sans le
+Mode VJ, propre a `audio2wave_snap.py` (voir plus bas).
 
 ```bash
 python audio2wave_snap.py --list-presets
@@ -833,8 +861,20 @@ propre vitesse, independantes des autres : rien n'empeche de faire
 respirer lentement l'epaisseur en triangle pendant que le rayon du halo saute en
 carre rapide. Purement decoratif, aucun lien avec la detection de kicks
 ci-dessus ; decocher `~` fige le curseur a sa position courante et repart du
-debut de la courbe a la prochaine activation ; ni la case ni la courbe ne font
-partie des presets (une preference de session, pas un reglage de rendu).
+debut de la courbe a la prochaine activation ; la case, la courbe et la
+vitesse de chaque curseur automatable font partie des presets (voir plus
+haut), pas juste une preference de session.
+
+**`audio2wave_live.py`/`audio2wave_ridge.py` ont la meme "Variation
+automatique"**, sur un choix de curseurs plus restreint (Halo/Derive de
+teinte cote `live`, Espacement/Deformation/Epaisseur cote `ridge`) mais avec
+exactement le meme editeur de courbe. Seule difference notable :
+`audio2wave_live.py` ne relit rien "en direct" (voir la section Gain/reglages
+plus haut sur son bouton Appliquer) — un curseur coche continue d'avancer sur
+sa courbe a l'ecran, mais le rendu affiche ne se met a jour que toutes les 2
+secondes environ (redemarrage seamless automatique, meme mecanique que le
+bouton Appliquer), pas image par image comme `audio2wave_snap.py`/
+`audio2wave_ridge.py`.
 
 ```bash
 python audio2wave_snap.py -d "<entree>" --gui   # coche ~ sur "Epaisseur du trait", bouton courbe pour l'editer
@@ -965,7 +1005,7 @@ le PNG.
 
 ---
 
-# Vagues empilees — `audio2wave_ridge.py`
+# Ridge — `audio2wave_ridge.py`
 
 Meme principe que `audio2wave_snap.py` (une ligne d'amplitude tracee a chaque
 rafraichissement), mais **rien n'est efface** : chaque nouvelle ligne s'empile devant

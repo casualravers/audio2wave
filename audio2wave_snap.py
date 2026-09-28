@@ -42,7 +42,8 @@ from audio2wave import (
     GUI_MUTED_FG, GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
 from audio2wave_live import (
-    find_window_position, list_audio_devices, primary_screen_size, require_tools,
+    Tooltip, find_window_position, list_audio_devices, primary_screen_size, require_tools,
+    secondary_monitor_rect, target_monitor_rect,
 )
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
@@ -423,7 +424,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--size", default=None,
                     help="Resolution WIDTHxHEIGHT (defaut: la largeur de l'ecran, sur un tiers "
                          "de sa hauteur; l'ecran entier avec --fullscreen)")
-    p.add_argument("--fullscreen", action="store_true", help="Ouvre la fenetre en plein ecran")
+    p.add_argument("--fullscreen", action=argparse.BooleanOptionalAction, default=True,
+                    help="Ouvre la fenetre en plein ecran (defaut: active -- "
+                         "--no-fullscreen pour une fenetre normale)")
 
     p.add_argument("--style", choices=["pencil", "rekordbox", "simple"], default="pencil",
                     help="pencil = un seul trait blanc qui suit grossierement le contour de "
@@ -615,6 +618,14 @@ def resolve_size(args: argparse.Namespace) -> tuple[int, int]:
     """
     if args.size:
         return parse_size(args.size)
+    # Le deuxieme moniteur (voir "Ouverture par defaut sur le deuxieme ecran"
+    # dans CLAUDE.md) prime sur le principal des qu'il existe : le plein ecran
+    # y atterrit par defaut, sa resolution doit donc correspondre, pas celle
+    # du moniteur principal (qui peut differer).
+    if args.fullscreen:
+        secondary = secondary_monitor_rect()
+        if secondary:
+            return secondary[2], secondary[3]
     screen = primary_screen_size()
     if not screen:
         return DEFAULT_SIZE
@@ -858,11 +869,12 @@ def window_title(args: argparse.Namespace) -> str:
     il faut retrouver la fenetre DEJA OUVERTE par son titre exact avant de la
     fermer, donc calculer ce titre a partir des memes args, separement de la
     construction de la commande."""
-    return f"audio2wave photo [{args.style}, {describe_window(args)}] - {args.device}"
+    return f"audio2wave snap [{args.style}, {describe_window(args)}] - {args.device}"
 
 
 def viewer_command(args: argparse.Namespace, size: tuple[int, int],
-                   position: tuple[int, int] | None = None) -> list[str]:
+                   position: tuple[int, int] | None = None,
+                   monitor: tuple[int, int, int, int] | None = None) -> list[str]:
     """Fenetre d'affichage, alimentee image par image.
 
     Une image par photo suffit: privee de donnees, ffplay laisse la derniere a l'ecran,
@@ -876,9 +888,16 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int],
     `position` (left, top de l'ancienne fenetre, voir find_window_position) ne sert
     qu'en mode fenetre : passe a `-left`/`-top` pour qu'un redemarrage --size se voie
     comme une mise a jour sur place plutot qu'une fenetre qui se ferme et se rouvre
-    ailleurs sur l'ecran (meme motif qu'audio2wave_live.py). Sans effet ici en
-    --fullscreen -- ffplay ignore -left/-top des qu'il recoit -fs ; voir
-    viewer_env() pour la tentative de ciblage du bon moniteur dans ce cas-la.
+    ailleurs sur l'ecran (meme motif qu'audio2wave_live.py).
+
+    `monitor` (left, top, width, height ; voir target_monitor_rect() dans common.py)
+    remplace `-fs` par une fenetre BORDERLESS calee exactement sur ce moniteur, des
+    que `args.fullscreen` et qu'un moniteur cible est connu -- remplace une tentative
+    precedente via la variable SDL_VIDEO_WINDOW_POS, jamais confirmee fonctionner
+    (signale par l'utilisateur en usage reel : "quand je clique sur le bouton plein
+    ecran la fenetre se reouvre sur l'ecran numero 1"), par les MEMES options
+    -left/-top deja fiables pour le mode fenetre normal. `-fs` natif reste le repli
+    si `monitor` est `None` (poste mono-ecran : pas besoin de cibler quoi que ce soit).
     """
     width, height = size
     if args.draw_fps > 0:
@@ -895,31 +914,15 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int],
         "-window_title", window_title(args),
     ]
     if args.fullscreen:
-        cmd.append("-fs")
+        if monitor:
+            left, top, mon_width, mon_height = monitor
+            cmd += ["-noborder", "-left", str(left), "-top", str(top),
+                   "-x", str(mon_width), "-y", str(mon_height)]
+        else:
+            cmd.append("-fs")
     elif position:
         cmd += ["-left", str(position[0]), "-top", str(position[1])]
     return cmd
-
-
-def viewer_env(args: argparse.Namespace, position: tuple[int, int] | None) -> dict[str, str]:
-    """Environnement du sous-processus ffplay : tentative de cibler le bon moniteur
-    en plein ecran, via la variable SDL_VIDEO_WINDOW_POS (lue par SDL2 -- la
-    bibliotheque sous-jacente de ffplay -- a la creation de sa fenetre, AVANT que
-    -fs ne la fasse passer en plein ecran).
-
-    Distinct de `-left`/`-top` (voir viewer_command) : ces options d'ffplay lui-meme
-    sont documentees ignorees en `-fs` (voir find_window_position dans common.py),
-    mais SDL_VIDEO_WINDOW_POS agit un cran plus bas, avant meme que le choix
-    fenetre/plein ecran d'ffplay ne s'applique -- une piste plausible pour un
-    multi-ecran, mais NON VERIFIEE sur un vrai poste multi-moniteur (cette session
-    tourne dans un environnement distant sans acces aux moniteurs physiques de
-    l'utilisateur). A confirmer en usage reel avant de la considerer fiable ;
-    sans effet mesurable si SDL l'ignore, pas de degradation en tout cas.
-    """
-    env = dict(os.environ)
-    if args.fullscreen and position:
-        env["SDL_VIDEO_WINDOW_POS"] = f"{position[0]},{position[1]}"
-    return env
 
 
 class LiveCapture:
@@ -1712,46 +1715,26 @@ def draw_pencil_video_progressively(viewer: subprocess.Popen, previous: bytes,
     return True
 
 
-class Tooltip:
-    """Info-bulle affichee au survol d'un widget: tkinter n'en fournit pas
-    nativement. Une Toplevel sans decoration (`overrideredirect`), creee a
-    l'entree de la souris et detruite a la sortie plutot que cachee/reaffichee --
-    le cout d'une Toplevel de plus est negligeable face a la frequence des
-    survols, et ca evite de gerer un etat "deja creee mais cachee" en plus.
-    Les callbacks lient l'instance a `widget` via `bind`, ce qui la garde en vie
-    (Tk retient le callback tant que le widget existe) sans avoir a la stocker
-    explicitement ailleurs.
-    """
-
-    def __init__(self, widget: object, text: str) -> None:
-        self.widget = widget
-        self.text = text
-        self.tip: object | None = None
-        widget.bind("<Enter>", self._show)
-        widget.bind("<Leave>", self._hide)
-
-    def _show(self, _evt: object = None) -> None:
-        if self.tip is not None:
-            return
-        x = self.widget.winfo_rootx() + 4
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        self.tip = tk.Toplevel(self.widget)
-        self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(self.tip, text=self.text, justify="left", bg=GUI_PANEL_BG, fg=GUI_FG,
-                font=GUI_FONT, relief="solid", borderwidth=1, padx=6, pady=4, wraplength=260,
-                ).pack()
-
-    def _hide(self, _evt: object = None) -> None:
-        if self.tip is not None:
-            self.tip.destroy()
-            self.tip = None
-
-
 def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
              capture_state: dict, stop_event: threading.Event,
-             finished_event: threading.Event) -> None:
+             finished_event: threading.Event,
+             root: "tk.Tk | None" = None,
+             on_switch_mode: Callable[[str], None] | None = None) -> None:
     """Petite fenetre de reglages en direct.
+
+    `root` (voir run_app() plus bas) : la fenetre Tk a peupler. Fournie et
+    PARTAGEE entre les trois modes des qu'un switch a deja eu lieu (voir
+    "Bascule de mode EN PLACE, MEME FENETRE" dans CLAUDE.md) -- cette fonction
+    n'en cree une nouvelle QUE si `root` vaut `None` (premier appel direct hors
+    de run_app(), ex. un test). Dans tous les cas, elle commence par VIDER
+    `root` de ses widgets existants (`winfo_children()`, y compris d'anciennes
+    Toplevel comme un editeur de courbe/VJ laisse ouvert) avant de reconstruire
+    -- jamais de mainloop()/destroy() ici, voir la fin de cette fonction.
+
+    `on_switch_mode(mode_name)` (voir run_app()/enter_gui() plus bas) est ce
+    que les boutons "Live"/"Ridge" appellent pour basculer de mode SANS ouvrir
+    de nouvelle fenetre -- `None` (defaut, ex. appel direct dans un test) leur
+    fait juste afficher un message plutot que planter.
 
     L'essentiel de ce qui est expose ici ne touche qu'aux attributs de `args`: le fil
     de rendu (run(), dans un thread separe) les relit a chaque photo, donc un
@@ -1790,10 +1773,25 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     perimee des le premier changement de peripherique.
     """
     width = size[0]
-    root = tk.Tk()
+    if root is None:
+        root = tk.Tk()
+    else:
+        # Reutilisation d'une fenetre existante (bascule de mode) : repart d'une
+        # fenetre vide, exactement comme le ferait un tk.Tk() flambant neuf --
+        # sinon les widgets du mode precedent resteraient superposes aux
+        # nouveaux. winfo_children() inclut aussi les Toplevel (editeur de
+        # courbe, popup Mode VJ...) laissees ouvertes par le mode precedent.
+        for child in list(root.winfo_children()):
+            child.destroy()
     root.title("audio2wave snap - reglages")
     root.resizable(False, False)
     style_gui(root)
+
+    # Reprogramme apres chaque refresh() (voir la fin de cette fonction) ; une
+    # bascule de mode l'annule AVANT d'arreter le fil de rendu (voir
+    # request_switch plus bas), pour que ce refresh() ne se redeclenche
+    # jamais sur des widgets deja detruits par le mode suivant.
+    refresh_after_id: dict[str, str | None] = {"id": None}
 
     # Marges generales de la fenetre : plus genereuses que le strict minimum
     # Tk (8/4 dans un premier jet) pour un rendu plus aere, moins "tableur" --
@@ -1815,7 +1813,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     SPACER_COL = 2
     RIGHT_LABEL_COL, RIGHT_CTRL_COL = 3, 4
     TOTAL_COLUMNS = 5
-    row_left = 1  # ligne 0 = titre "Reglages photo", commun aux deux panneaux
+    row_left = 1  # ligne 0 = titre "Reglages Snap", commun aux deux panneaux
     row_right = 1
 
     def next_row(panel: str) -> int:
@@ -1862,7 +1860,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         if title:
             add_section_title(panel, title)
 
-    tk.Label(root, text="Reglages photo", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
+    tk.Label(root, text="Reglages Snap", font=GUI_FONT_HEADING, fg=GUI_ACCENT,
             ).grid(row=0, column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                    padx=ROW_PADX, pady=(10, SECTION_GAP))
 
@@ -1927,6 +1925,58 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     tk.Button(device_frame, text="Actualiser", command=refresh_devices,
              ).pack(side="left", padx=(8, 0))
+
+    # Bascule vers un autre mode SANS ouvrir de nouvelle fenetre, a la demande
+    # explicite ("La Gui doit s'adapter au mode ouvert et ne pas ouvrir une
+    # nouvelle fenetre") : premier jet (lanceur separe, puis boutons ici mais
+    # en sous-processus) juxtaposait plusieurs fenetres -- celle-ci s'ajoute a
+    # celle deja ouverte plutot que de la remplacer. `on_switch_mode` (fourni
+    # par run_app(), voir plus bas) arme stop_event de CETTE session et
+    # enregistre le mode demande ; c'est run_app() qui, une fois cette fenetre
+    # refermee et son fil de rendu termine proprement, appelle enter_gui() du
+    # mode suivant DANS LE MEME PROCESSUS -- une fenetre remplace l'autre, il
+    # n'y en a jamais deux a la fois. Toujours PAS une fusion des MOTEURS de
+    # rendu (ecartee des la discussion initiale, confirmee ici) :
+    # audio2wave_live.py n'a pas de boucle Python par image, architecture trop
+    # differente de snap/ridge pour tourner dans le meme fil -- chaque mode
+    # garde sa propre fenetre et son propre run(), seul le PROCESSUS est
+    # partage desormais (plus le fait d'ouvrir/fermer des fenetres en plus).
+    def request_switch(mode_name: str) -> None:
+        device = device_var.get()
+        if not device:
+            status["text"] = f"Choisis d'abord une entree audio pour passer en mode {mode_name}"
+            return
+        if on_switch_mode is None:
+            status["text"] = "Bascule de mode indisponible dans ce contexte"
+            return
+        # Annule le prochain refresh() de CETTE session AVANT de ceder la main:
+        # sans ca, son tour suivant (programme via root.after) s'executerait
+        # apres que le mode suivant ait deja reconstruit `root` -- il tenterait
+        # de mettre a jour status_label, deja detruit, et plantera avec un
+        # TclError. Consequence : le statut n'est plus rafraichi par refresh()
+        # pendant la bascule (asynchrone, voir handle_switch dans run_app()) --
+        # on fige donc un dernier message ICI, directement sur le widget, pour
+        # que l'utilisateur voie que quelque chose se passe pendant les
+        # quelques centaines de ms d'attente.
+        if refresh_after_id["id"] is not None:
+            root.after_cancel(refresh_after_id["id"])
+            refresh_after_id["id"] = None
+        status_label.config(text=f"Bascule vers {mode_name}...")
+        on_switch_mode(mode_name)
+
+    live_btn = tk.Button(device_frame, text="Live", command=lambda: request_switch("live"))
+    live_btn.pack(side="left", padx=(8, 0))
+    Tooltip(live_btn, "Bascule vers audio2wave_live.py (analyseur de spectre temps "
+                      "reel) avec l'entree audio choisie ci-dessus -- ferme cette "
+                      "fenetre et ouvre celle de Live a la place, jamais les deux "
+                      "en meme temps.")
+    ridge_btn = tk.Button(device_frame, text="Ridge", command=lambda: request_switch("ridge"))
+    ridge_btn.pack(side="left", padx=(4, 0))
+    Tooltip(ridge_btn, "Bascule vers audio2wave_ridge.py (vagues empilees) avec "
+                       "l'entree audio choisie ci-dessus -- ferme cette fenetre et "
+                       "ouvre celle de Ridge a la place, jamais les deux en meme "
+                       "temps.")
+
     refresh_devices()
 
     # --bpm/--beats: comme l'entree audio, une exception qui ne se contente pas de
@@ -3247,14 +3297,21 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         if finished_event.is_set():
             root.destroy()
             return
-        root.after(200, refresh)
+        refresh_after_id["id"] = root.after(200, refresh)
 
     root.protocol("WM_DELETE_WINDOW", stop_event.set)
     refresh()
-    root.mainloop()
-    # La fenetre peut se fermer avant la fin du rendu (Ctrl+C au clavier, peripherique
-    # perdu...): on demande l'arret et on laisse main() attendre la fin propre du fil.
-    stop_event.set()
+    # PAS de root.mainloop()/root.destroy() ici: `root` est desormais PARTAGE
+    # entre les trois modes (bascule EN PLACE dans la MEME fenetre reelle, pas
+    # seulement le meme processus -- voir "Bascule de mode EN PLACE, MEME
+    # FENETRE" dans CLAUDE.md), donc mainloop() n'est demarre QU'UNE FOIS, par
+    # le tout premier run_app() (voir owns_root la-bas), jamais rappele a
+    # chaque bascule -- root.mainloop() est reentrant sur certaines
+    # plateformes mais ca ajouterait une pile qui grandit a chaque bascule
+    # sans jamais se depiler avant la fermeture finale, pour aucun benefice.
+    # root.destroy() (juste au-dessus) n'est appele que sur une VRAIE
+    # fermeture (finished_event set sans qu'un switch n'ait annule ce
+    # refresh() avant, voir request_switch plus haut).
 
 
 def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink: bytes,
@@ -3394,15 +3451,17 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                 # Position de la fenetre ENCORE OUVERTE, retrouvee par son titre
                 # avant de la fermer (meme technique qu'audio2wave_live.py) :
                 # reutilisee en -left/-top si la nouvelle fenetre est en mode
-                # fenetre, ou passee en tentative via SDL_VIDEO_WINDOW_POS si elle
-                # doit s'ouvrir en plein ecran (voir viewer_env, non verifie sur un
-                # vrai multi-ecran).
-                position = find_window_position(window_title(args))
+                # fenetre. `monitor` (voir target_monitor_rect()) determine, lui,
+                # le moniteur a remplir en plein ecran borderless -- celui qui
+                # heberge deja cette position si elle est connue.
+                old_title = window_title(args)
+                position = find_window_position(old_title)
+                monitor = target_monitor_rect(old_title)
                 size = current_size
                 last_fullscreen = args.fullscreen
                 stop_viewer(viewer)
-                viewer = subprocess.Popen(viewer_command(args, size, position),
-                                          stdin=subprocess.PIPE, env=viewer_env(args, position))
+                viewer = subprocess.Popen(viewer_command(args, size, position, monitor),
+                                          stdin=subprocess.PIPE)
                 previous_frame = background * (size[0] * size[1])
                 if video is not None:
                     video.stop()
@@ -3642,6 +3701,33 @@ def main() -> None:
         print(" ".join(f'"{c}"' if " " in c else c for c in viewer_command(args, size)))
         return
 
+    run_app(args, size)
+
+
+def run_app(args: argparse.Namespace, size: tuple[int, int],
+           root: "tk.Tk | None" = None) -> None:
+    """Coeur d'execution, factorise hors de main() pour etre rappele quand un
+    AUTRE mode (live/ridge) bascule vers celui-ci depuis sa propre fenetre --
+    voir enter_gui() plus bas et request_switch()/on_switch_mode dans
+    build_gui(). Suppose que la validation/l'aide de main() (presets,
+    --list-devices, --dry-run, arguments invalides) a deja ete faite : un
+    switch de mode part toujours directement d'ici, jamais de main().
+
+    `root` : la fenetre Tk PARTAGEE entre les trois modes -- voir "Bascule de
+    mode EN PLACE, MEME FENETRE" dans CLAUDE.md. `None` (premier lancement,
+    depuis main()) veut dire que CET appel est celui qui possede le cycle de
+    vie complet de la fenetre : il en cree une (`owns_root`), demarre
+    `root.mainloop()` une fois tous les widgets du premier mode construits, et
+    c'est lui qui, au tout final (mainloop() revenu, vraie fermeture de
+    fenetre), attend la fin propre du fil de rendu ALORS ACTIF -- pas
+    forcement le sien: si des bascules ont eu lieu entre temps, c'est celui du
+    DERNIER mode affiche (voir `root._a2w_active`, mis a jour a chaque
+    bascule). Un appel avec `root` deja fourni (bascule depuis un autre mode)
+    ne fait que reconstruire les widgets dans cette meme fenetre et repartir
+    -- jamais de mainloop()/join() ici, `root.mainloop()` (de l'appel
+    proprietaire) est deja en train de tourner plus bas dans la pile d'appels
+    Python et continue de le faire des que ce switch a fini de reconstruire.
+    """
     if args.save_dir:
         args.save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3707,7 +3793,18 @@ def main() -> None:
     else:
         capture_proc = NoDeviceProcess()
         capture = NoDeviceCapture()
-    viewer = subprocess.Popen(viewer_command(args, size), stdin=subprocess.PIPE)
+    # Ouvre par defaut sur un DEUXIEME ecran s'il y en a un (demande explicite),
+    # pas seulement lors d'un redemarrage --size/--gui (voir la position/le
+    # moniteur retrouves plus bas dans run(), qui ne font que PRESERVER un
+    # choix deja fait -- ici il n'y a encore aucune fenetre ouverte a
+    # retrouver, donc target_monitor_rect(None) retombe directement sur
+    # secondary_monitor_rect()). None (poste mono-ecran, ou l'API echoue)
+    # laisse ffplay choisir comme avant ce changement.
+    initial_position = secondary_monitor_rect()
+    initial_position = initial_position[:2] if initial_position else None
+    initial_monitor = target_monitor_rect(None)
+    viewer = subprocess.Popen(
+        viewer_command(args, size, initial_position, initial_monitor), stdin=subprocess.PIPE)
 
     status: dict = {}
     # Pont vers le bouton "Mesurer" de --gui: la LiveCapture courante, remplacee par
@@ -3725,13 +3822,107 @@ def main() -> None:
         # principal (obligatoire sur certaines plateformes, prudent partout).
         thread = threading.Thread(target=run, args=run_args, daemon=True)
         thread.start()
-        try:
-            build_gui(args, size, status, capture_state, stop_event, finished_event)
-        except KeyboardInterrupt:
+        owns_root = root is None
+        if owns_root:
+            root = tk.Tk()
+        # Suivi du fil/evenement ACTUELLEMENT affiches, sur `root` lui-meme
+        # (le seul objet qui survit a toutes les bascules) : c'est ce que lit
+        # l'appel PROPRIETAIRE (owns_root) une fois root.mainloop() revenu,
+        # pour attendre la fin propre du DERNIER mode affiche -- pas
+        # necessairement celui-ci, si des bascules ont eu lieu entre temps.
+        root._a2w_active = {"stop_event": stop_event, "thread": thread}
+
+        # request_switch() dans build_gui() appelle CE callback -- depuis un
+        # clic de bouton, donc DEJA dans la boucle d'evenements Tk. Il arme
+        # stop_event (arret propre de CETTE session, meme mecanique qu'une
+        # fermeture normale de fenetre) puis ATTEND la fin du fil de rendu
+        # de facon ASYNCHRONE (voir poll_switch plus bas) avant de
+        # reconstruire DANS LA MEME `root` en enchainant sur enter_gui() du
+        # mode suivant. **Ne JAMAIS bloquer ici avec thread.join() direct** :
+        # un premier jet le faisait (appel synchrone, dans le callback de
+        # clic lui-meme) -- geler ainsi la boucle d'evenements Tk pendant
+        # les quelques centaines de ms que prend l'arret propre de ffmpeg/
+        # ffplay suffit a Windows pour marquer la fenetre "ne repond pas" et
+        # lui appliquer son effet de fenetre fantome/gel, PUIS l'image se
+        # met a jour d'un coup une fois le callback termine -- percu par
+        # l'utilisateur comme "la fenetre se ferme et une autre se rouvre"
+        # alors que c'est techniquement la MEME fenetre, jamais fermee.
+        # Signale par l'utilisateur en usage reel (mes tests automatises, qui
+        # ne font jamais tourner un vrai gestionnaire de fenetres Windows, ne
+        # l'avaient pas detecte). En attendant sur un fil separe et en
+        # sondant via root.after() (meme mecanique que refresh() plus bas, ou
+        # que restart_event dans audio2wave_live.py), la boucle Tk continue
+        # de tourner et de repondre normalement pendant toute l'attente --
+        # aucune raison pour Windows de la geler.
+        def handle_switch(mode_name: str) -> None:
             stop_event.set()
-        thread.join()
+            switch_done = threading.Event()
+
+            def wait_for_stop() -> None:
+                thread.join()
+                switch_done.set()
+
+            threading.Thread(target=wait_for_stop, daemon=True).start()
+
+            def poll_switch() -> None:
+                if not switch_done.is_set():
+                    root.after(50, poll_switch)
+                    return
+                if mode_name == "live":
+                    import audio2wave_live
+                    audio2wave_live.enter_gui(args.device, root=root)
+                elif mode_name == "ridge":
+                    import audio2wave_ridge
+                    audio2wave_ridge.enter_gui(args.device, root=root)
+                # "snap" ne peut pas arriver ici (pas de bouton "Snap" dans
+                # cette fenetre).
+
+            root.after(50, poll_switch)
+
+        build_gui(args, size, status, capture_state, stop_event, finished_event,
+                 root=root, on_switch_mode=handle_switch)
+        if owns_root:
+            # Cet appel POSSEDE le cycle de vie de la fenetre: lui seul
+            # demarre mainloop(), une fois pour toute la session -- voir la
+            # docstring de cette fonction et celle de build_gui() (fin) pour
+            # le detail de pourquoi les bascules ulterieures n'en redemarrent
+            # jamais un second.
+            try:
+                root.mainloop()
+            except KeyboardInterrupt:
+                pass
+            # mainloop() est revenu: vraie fermeture de fenetre. Le mode
+            # ACTIF au moment de la fermeture n'est pas forcement celui de
+            # cet appel si des bascules ont eu lieu entre-temps -- root._a2w_active
+            # a ete mis a jour a chacune, on y lit donc le DERNIER couple.
+            active = getattr(root, "_a2w_active", None)
+            if active is not None:
+                active["stop_event"].set()
+                active["thread"].join()
     else:
         run(*run_args)
+
+
+def enter_gui(device: str | None, root: "tk.Tk | None" = None) -> None:
+    """Ouvre --gui directement sur ce mode avec `device` deja connu (bascule
+    depuis live/ridge, voir leur propre enter_gui() et request_switch() dans
+    leur build_gui()) : le fil de rendu du mode precedent est DEJA arrete
+    avant cet appel (voir handle_switch() plus haut), et `root` (la MEME
+    fenetre Tk, jamais une nouvelle) est reconstruite en place -- jamais une
+    deuxieme fenetre en plus. Saute tout ce qui ne concerne QUE le premier
+    lancement en ligne de commande (presets, --dry-run, --list-devices) : un
+    switch de mode part toujours directement sur --gui, jamais besoin de
+    revalider ces cas-la.
+    """
+    saved_argv = sys.argv
+    try:
+        sys.argv = ["audio2wave_snap.py", "--gui"] + (["-d", device] if device else [])
+        args = parse_args()
+    finally:
+        sys.argv = saved_argv
+    require_tools()
+    size = resolve_size(args)
+    run_app(args, size, root=root)
 
 
 if __name__ == "__main__":
