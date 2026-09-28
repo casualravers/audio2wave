@@ -999,7 +999,7 @@ EN PLACE, MEME FENETRE" (voir plus bas) -- `live`/`ridge` sont desormais
 TOUJOURS atteignables depuis la fenetre de `snap` (boutons de bascule, meme
 `root` Tk partagee), les avoir en plus comme point de depart direct n'etait
 plus qu'une redondance historique de l'epoque ou chaque mode avait sa propre
-fenetre. `Demarrer - Snap.bat` reste seul (voir "Installation sans
+fenetre. `audio2wave.bat` reste seul (voir "Installation sans
 configuration" juste apres) : c'est le seul mode ou `-d`/`--device` est
 optionnel en `--gui` (voir sa propre section plus haut), donc le seul qui
 peut demarrer sans rien demander avant l'ouverture de la fenetre -- un
@@ -1008,6 +1008,15 @@ exigent encore `-d` au lancement direct) ne remplissaient pas. `README.md`
 (tableau `.bat` reduit a une seule ligne, section "Jongler entre les trois
 modes" precisant desormais que `live`/`ridge` se lancent DEPUIS cette meme
 fenetre plutot que directement) et ce fichier mis a jour en consequence.
+
+### Renommage du lanceur en nom de produit seul
+
+Demande explicite : "Renomme le nom demarrer.bat en quelque chose de plus
+sexy et en anglais." Le `.bat` precedemment `Demarrer - Snap.bat` est
+desormais simplement `audio2wave.bat` — plus court, plus elegant, et le nom
+du produit seul parle de lui-meme comme point d'entree unique. Le contenu
+reste inchange (lance `audio2wave_snap.py --gui`). `README.md` et ce fichier
+mis a jour en consequence.
 
 ### Installation sans configuration (ffmpeg embarque, `.bat` de lancement)
 
@@ -1036,8 +1045,9 @@ tiers (~100 Mo, licence LGPL/GPL propre a ffmpeg), jamais du code source —
 chacun les recupere separement (lien dans le README), jamais commites dans
 ce depot.
 
-**Un seul `.bat` a la racine desormais, `Demarrer - Snap.bat`** (voir
-"Suppression des lanceurs Live/Ridge" plus bas pour l'historique) :
+**Un seul `.bat` a la racine desormais, `audio2wave.bat`** (voir
+"Suppression des lanceurs Live/Ridge" et "Renommage du lanceur" plus bas pour
+l'historique) :
 `cd /d "%~dp0"` (fonctionne quel que soit le dossier de lancement, un
 double-clic Explorateur part toujours du dossier du fichier, mais une
 execution depuis un raccourci pointant ailleurs pourrait ne pas l'assumer),

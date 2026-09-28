@@ -36,7 +36,7 @@ d'installer ffmpeg ni de toucher au `PATH` :
 2. Extrais `ffmpeg.exe`, `ffprobe.exe` et `ffplay.exe` (dans le sous-dossier
    `bin/` du zip telecharge) dans un dossier `bin/` cree a la racine de ce
    depot, a cote de `audio2wave_snap.py`.
-3. Double-clique `Demarrer - Snap.bat` a la racine.
+3. Double-clique `audio2wave.bat` a la racine.
 
 Les scripts detectent automatiquement `bin/` s'il existe et l'utilisent en
 priorite, sans rien configurer d'autre — voir `common.py` si l'un des deux
@@ -48,7 +48,7 @@ Un seul fichier `.bat` a la racine, point d'entree unique :
 
 | fichier | lance |
 |---|---|
-| `Demarrer - Snap.bat` | `audio2wave_snap.py --gui` (entree audio choisie dans la fenetre) |
+| `audio2wave.bat` | `audio2wave_snap.py --gui` (entree audio choisie dans la fenetre) |
 
 Double-clic, pas de ligne de commande a taper. Nécessite [Python](https://www.python.org/downloads/)
 installe (coche "Add python.exe to PATH" pendant l'installation) — le `.bat`
