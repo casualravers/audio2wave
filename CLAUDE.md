@@ -1476,6 +1476,59 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   est desactive) ; calcules une fois par photo dans `run()` comme `columns`, pas
   recalcules pendant le balayage — un kick ne bouge pas plus que le contour
   pendant que sa photo est affichee.
+  **Trois optimisations mesurees, demande explicite ("vois-tu des optimisations
+  possibles ?" -> "augmente RELAY_CHUNK_SIZE, et elargis a tous les fichiers"),
+  toutes verifiees BYTE-IDENTIQUES a l'ancien comportement (meme image, memes
+  kicks) avant/apres :**
+  - `compose_pencil` appelait `paint_pencil_columns(..., full=True)` (le
+    defaut) alors que son `canvas` vient JUSTE d'etre entierement rempli du
+    fond (`bytearray(background * (width*height))`, la ligne juste au-dessus) —
+    `full=True` refait ce remplissage colonne par colonne, un second passage
+    `O(width*height)` integralement redondant. Corrige en passant `full=False`
+    explicitement depuis `compose_pencil` (le fond y est deja correct) ;
+    `full=True` reste le defaut pour les autres appelants de
+    `paint_pencil_columns` (le balayage progressif dans `run()`, qui DOIT
+    repeindre le fond d'une colonne fraichement revelee par-dessus les restes
+    de la photo PRECEDENTE).
+  - Dans `paint_pencil_columns`, `bytes([background[c]]) * height` (le
+    remplissage de fond d'UNE colonne) etait recalcule a neuf pour chacun des
+    3 canaux a CHAQUE colonne, alors que `height` est invariant sur tout
+    l'appel — la meme valeur, reconstruite `width` fois par photo (et de
+    nouveau a chaque colonne fraichement revelee du balayage progressif).
+    `bg_col = [bytes([background[c]]) * height for c in range(3)]` precalcule
+    desormais ces 3 tranches UNE SEULE FOIS avant la boucle par colonne.
+  - `render_pencil` appelait `pencil_heights()`/`amplitude_envelope()` ET (si
+    `--kick-glow`) `detect_kicks()`/`energy_envelope()` sur le MEME `pcm` --
+    chacune reparsant independamment `array.array("h")` + `frombytes()`, un
+    second parse `O(len(pcm))` integralement redondant. `amplitude_envelope`/
+    `energy_envelope`/`detect_kicks`/`pencil_heights` acceptent desormais un
+    parametre optionnel `samples` (le PCM DEJA converti) -- `None` par defaut
+    (reparsent comme avant, aucun changement pour `audio2wave_ridge.py`, qui
+    appelle `amplitude_envelope` sans kicks et n'a donc rien a partager) ;
+    `render_pencil` parse `pcm` une seule fois et le transmet aux deux quand
+    `--kick-glow` est actif.
+  Mesure (`render_pencil` avec `--kick-glow`, 1920x360, PCM synthetique
+  1,875 s) : 45,7 ms -> 29,6 ms par photo, ~35 % plus rapide. Verifie par
+  comparaison BYTE-IDENTIQUE (pas juste "l'image parait pareille") : l'ancien
+  chemin (`full=True` sur canevas fraichement cree) et le nouveau
+  (`full=False`) produisent une image strictement identique octet pour octet ;
+  `amplitude_envelope`/`energy_envelope`/`detect_kicks` avec `samples` partage
+  donnent un resultat strictement identique a l'appel sans partage.
+  Meme demande appliquee a `audio2wave_live.py` : `RELAY_CHUNK_SIZE` (voir sa
+  section plus haut) monte de 64 Ko a 512 Ko — une frame 1080p rgb24 fait
+  ~6 Mo, donc 64 Ko forcait ~96 appels `read()`/`write()` par frame relayee
+  (chacun avec un cout de syscall) ; 512 Ko ramene ca a ~12, sans rien perdre
+  en reactivite (`relay_loop()` n'a besoin d'etre granulaire qu'entre deux
+  redemarrages, espaces de secondes, pas entre deux frames).
+  `audio2wave_ridge.py` (`paint_ridge_line`) a le MEME motif que le deuxieme
+  point ci-dessus (`bytes([...]) * n` recalcule par colonne), mais `n` y varie
+  a CHAQUE colonne (hauteur de remplissage dependante de la crete courante/
+  precedente) au lieu d'etre fixe comme `height` en pencil -- pas de valeur
+  unique a hoister hors de la boucle sans memoisation par longueur, un cout de
+  complexite juge disproportionne face au gain incertain. Laisse tel quel.
+  `common.py` (utilitaires ctypes un-shot, pas de chemin par-frame) et
+  `audio2wave.py` (construction de chaine de filtres, aucun pixel touche par
+  Python) n'avaient rien a optimiser.
 - **`--glow-live` anime le MEME halo par le niveau audio COURANT plutot que par
   des kicks detectes sur la photo entiere** — demande explicite ("j'aimerais
   que le halo puisse avoir une animation en temps reel et non avec 4 temps de

@@ -547,11 +547,14 @@ def spawn_display(args: argparse.Namespace, width: int, height: int,
         viewer_command(args, width, height, position, monitor), stdin=subprocess.PIPE)
 
 
-# 64 Ko : assez gros pour un debit eleve (une frame 1080p rgb24 fait ~6 Mo a 30
-# fps, soit ~180 Mo/s a relayer), assez petit pour que relay_loop() revienne
-# verifier stop_event/un changement de producteur plusieurs fois par frame
-# plutot que de rester bloquee sur un seul read() disproportionne.
-RELAY_CHUNK_SIZE = 1 << 16
+# 512 Ko : une frame 1080p rgb24 fait ~6 Mo a 30 fps (~180 Mo/s a relayer) --
+# a 64 Ko (essai initial), ca fait ~96 appels read()/write() par frame, chacun
+# avec un cout de syscall ; 512 Ko ramene ca a ~12, sans rien perdre en
+# reactivite (relay_loop() n'a besoin d'etre granulaire qu'entre deux
+# redemarrages, espaces de secondes, pas entre deux frames) tout en restant
+# largement sous une frame entiere, pour que relay_loop() revienne quand meme
+# verifier stop_event/un changement de producteur plusieurs fois par frame.
+RELAY_CHUNK_SIZE = 1 << 19
 
 
 def relay_loop(relay_state: dict, stop_event: threading.Event) -> None:

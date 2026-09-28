@@ -1128,15 +1128,23 @@ def resolve_gain(args: argparse.Namespace, pcm: bytes) -> tuple[float, float | N
     return -peak + AUTO_GAIN_MARGIN_DB, peak
 
 
-def amplitude_envelope(pcm: bytes, points: int, channels: int) -> list[float]:
+def amplitude_envelope(pcm: bytes, points: int, channels: int,
+                       samples: "array.array | None" = None) -> list[float]:
     """Contour de l'amplitude: la crete de chaque tranche, ramenee entre 0 et 1.
 
     C'est volontairement grossier: quelques dizaines de tranches sur toute la fenetre,
     la ou une waveform classique en dessine une par pixel. On cherche la silhouette,
     pas la forme d'onde.
+
+    `samples` (optionnel) : le PCM DEJA converti en `array.array("h")` -- evite de
+    reparser `pcm` si l'appelant l'a deja fait pour un autre usage (voir
+    render_pencil, qui partage le meme parse avec energy_envelope/detect_kicks
+    quand --kick-glow est actif). `None` (defaut) : parse `pcm` normalement, comme
+    avant.
     """
-    samples = array.array("h")
-    samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    if samples is None:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
     frames = len(samples) // channels
     if frames < 1:
         return [0.0] * points
@@ -1166,16 +1174,20 @@ def blend_color(a: bytes, b: bytes, t: float) -> bytes:
     return bytes(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
-def energy_envelope(pcm: bytes, slices: int, channels: int) -> list[float]:
+def energy_envelope(pcm: bytes, slices: int, channels: int,
+                    samples: "array.array | None" = None) -> list[float]:
     """RMS par tranche, normalise 0..1 -- pas la crete (voir amplitude_envelope,
     destinee au contour visuel). Sert a detect_kicks: sur un mix deja limite pres
     du plafond numerique (loudness war, courant en club/DJ), la CRETE d'un kick ne
     bouge presque plus (le plafond est deja atteint en permanence) alors que
     l'energie RMS, elle, continue de monter nettement -- verifie en pratique, voir
     detect_kicks.
+
+    `samples` (optionnel) : voir amplitude_envelope, meme mecanique de partage.
     """
-    samples = array.array("h")
-    samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    if samples is None:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
     frames = len(samples) // channels
     if frames < 1:
         return [0.0] * slices
@@ -1189,9 +1201,13 @@ def energy_envelope(pcm: bytes, slices: int, channels: int) -> list[float]:
     return out
 
 
-def detect_kicks(pcm: bytes, channels: int, rate: int, width: int) -> list[int]:
+def detect_kicks(pcm: bytes, channels: int, rate: int, width: int,
+                 samples: "array.array | None" = None) -> list[int]:
     """Colonnes (position en pixels, 0..width-1) ou une attaque franche a ete
     detectee, pour le halo de --kick-glow.
+
+    `samples` (optionnel) : voir amplitude_envelope, meme mecanique de partage
+    (transmis tel quel a energy_envelope()).
 
     Detecteur simple et volontairement approximatif -- pas une isolation des
     basses par un filtre passe-bas, que ce projet stdlib-seulement n'a de toute
@@ -1217,7 +1233,7 @@ def detect_kicks(pcm: bytes, channels: int, rate: int, width: int) -> list[int]:
     frames = len(pcm) // (SAMPLE_BYTES * channels)
     duration_s = frames / rate if rate else 0.0
     slices = max(8, round(duration_s * 1000 / KICK_ANALYSIS_MS)) if duration_s > 0 else 8
-    energy = energy_envelope(pcm, slices, channels)
+    energy = energy_envelope(pcm, slices, channels, samples=samples)
     n = len(energy)
     if n < 3:
         return []
@@ -1264,7 +1280,8 @@ class LiveGlowMeter:
         return self.value
 
 
-def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int]
+def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
+                   samples: "array.array | None" = None
                    ) -> list[tuple[int, int, tuple[int, ...]]]:
     """Pour chaque colonne: (haut de l'enveloppe, bas de l'enveloppe, hauteurs a encrer).
 
@@ -1274,9 +1291,11 @@ def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tupl
     ses deux bornes — la video occupe alors toute la bande, la ligne ondule dedans.
     Calcule a part du dessin parce qu'avec --video il faut repeindre les memes colonnes
     a chaque pas du trace progressif, sans refaire l'enveloppe.
+
+    `samples` (optionnel) : voir amplitude_envelope, meme mecanique de partage.
     """
     width, height = size
-    env = amplitude_envelope(pcm, resolve_points(args, width), channel_count(args))
+    env = amplitude_envelope(pcm, resolve_points(args, width), channel_count(args), samples=samples)
     factor = 10 ** (gain / 20)
     thickness = max(1, args.line_width)
     center = (height - thickness) / 2
@@ -1370,6 +1389,13 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
     """
     width, height = size
     stride = width * 3
+    # Precalcule une seule fois (hors boucle par colonne) les 3 tranches
+    # "fond sur toute la hauteur" : `height` est invariant sur tout l'appel,
+    # recalculer bytes([background[c]]) * height a chaque colonne (potentiellement
+    # `width` fois par photo, et de nouveau a chaque colonne fraichement revelee
+    # du balayage progressif) n'etait qu'une allocation redondante -- la meme
+    # valeur, juste reconstruite en boucle.
+    bg_col = [bytes([background[c]]) * height for c in range(3)] if full else None
     for x in range(start, end):
         env_top, env_bottom, heights = columns[x]
         prev_top, prev_bottom, previous = columns[x - 1] if x > 0 else columns[x]
@@ -1379,8 +1405,7 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
         if full:
             col0 = x * 3
             for c in range(3):
-                canvas[col0 + c:col0 + c + height * stride:stride] = \
-                    bytes([background[c]]) * height
+                canvas[col0 + c:col0 + c + height * stride:stride] = bg_col[c]
 
         if video is not None:
             rows = bottom - top + 1
@@ -1456,8 +1481,14 @@ def compose_pencil(size: tuple[int, int], columns: list[tuple[int, ...]], backgr
     """
     width, height = size
     canvas = bytearray(background * (width * height))
+    # full=False : le canevas est DEJA rempli du fond juste au-dessus (une seule
+    # allocation `background * (width*height)`), repeindre chaque colonne sur
+    # toute sa hauteur serait un second passage O(width*height) integralement
+    # redondant -- utile seulement pour re-reveler une colonne par-dessus les
+    # restes d'une photo PRECEDENTE (voir draw_progressively/le balayage
+    # progressif dans run()), pas ici ou canvas vient d'etre cree tout neuf.
     paint_pencil_columns(canvas, size, columns, background, ink, thickness, video, video_out,
-                         0, width, draw_ink=draw_ink, kicks=kicks,
+                         0, width, full=False, draw_ink=draw_ink, kicks=kicks,
                          kick_glow_radius=kick_glow_radius, live_glow=live_glow)
     return bytes(canvas)
 
@@ -1471,8 +1502,20 @@ def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple
     silhouette, showwaves trace la forme d'onde elle-meme. Le trait est donc rasterise
     ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
     """
-    columns = pencil_heights(args, pcm, gain, size)
-    kicks = (detect_kicks(pcm, channel_count(args), capture_rate(args), size[0])
+    # Analyse le PCM en echantillons signes UNE SEULE FOIS quand --kick-glow
+    # est actif : pencil_heights()/amplitude_envelope() ET detect_kicks()/
+    # energy_envelope() en ont chacun besoin, independamment -- sans ce
+    # partage, deux array.array("h")+frombytes() separes reparsent le MEME
+    # buffer PCM (un O(len(pcm)) integralement redondant a chaque photo).
+    # `None` si --kick-glow est desactive : seul pencil_heights() en a alors
+    # besoin, rien a partager.
+    channels = channel_count(args)
+    samples = None
+    if args.kick_glow:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    columns = pencil_heights(args, pcm, gain, size, samples=samples)
+    kicks = (detect_kicks(pcm, channels, capture_rate(args), size[0], samples=samples)
              if args.kick_glow else None)
     return compose_pencil(size, columns, background, ink, max(1, args.line_width), video,
                           video_out, kicks=kicks, kick_glow_radius=args.kick_glow_size)
