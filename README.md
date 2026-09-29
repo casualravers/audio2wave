@@ -447,15 +447,18 @@ statut.
 Un bouton **Mode VJ -- Ouvrir...** dans la fenetre `--gui` ouvre un petit popup
 pour planifier un enchainement de presets sur toute la duree d'un set :
 
-1. **Ajouter** une entree : choisis un preset et une duree en minutes, puis
-   **Ajouter** — elle rejoint la fin de la liste. La liste couvre **tous les
-   modes**, pas seulement snap : les presets de `audio2wave_live.py`/
-   `audio2wave_ridge.py` apparaissent aussi, prefixes `live:`/`ridge:` pour
-   eviter toute ambiguite de nom (ex. `live:club`). Un preset etranger ne
-   change pas de mode (le Mode VJ reste dans snap) : seules les options qui
-   ont un sens ici (gain, couleurs, epaisseur...) s'appliquent, celles sans
-   equivalent (`style`/`shape` de live, dont les valeurs n'existent pas cote
-   snap) sont retirees avant meme d'atteindre `apply_preset()`.
+1. **Ajouter** une entree : choisis d'abord une **categorie** (snap/live/
+   ridge), puis un **preset** de cette categorie (le second menu se
+   repeuple avec ses noms des que la categorie change) et une duree en
+   minutes, puis **Ajouter** — elle rejoint la fin de la liste. La liste
+   couvre **tous les modes**, pas seulement snap : les presets de
+   `audio2wave_live.py`/`audio2wave_ridge.py` sont selectionnables aussi,
+   sans avoir a retenir un prefixe (la categorie choisie suffit a lever
+   l'ambiguite de nom). Un preset etranger ne change pas de mode (le Mode VJ
+   reste dans snap) : seules les options qui ont un sens ici (gain, couleurs,
+   epaisseur...) s'appliquent, celles sans equivalent (`style`/`shape` de
+   live, dont les valeurs n'existent pas cote snap) sont retirees avant meme
+   d'atteindre `apply_preset()`.
 2. Reordonne avec **Monter**/**Descendre**, retire une entree avec
    **Supprimer**. Les durees sont relatives : deplacer une entree decale
    automatiquement l'horaire de toutes celles qui suivent, pas besoin de

@@ -394,6 +394,30 @@ def all_presets_all_modes() -> dict[str, dict]:
     return merged
 
 
+VJ_CATEGORIES = ("snap", "live", "ridge")
+
+
+def presets_for_category(category: str) -> dict[str, dict]:
+    """Presets d'UN SEUL mode, noms NUS (jamais prefixes) -- sert au Mode VJ
+    une fois la selection en deux temps (categorie puis preset, voir
+    open_vj_editor) : contrairement a `all_presets_all_modes()`, qui aplati
+    les trois modes dans un seul espace de noms prefixe `live:`/`ridge:` pour
+    un menu deroulant PLAT, ici chaque categorie garde ses noms tels quels --
+    c'est la selection de categorie elle-meme qui leve l'ambiguite, plus
+    besoin de prefixe. `style`/`shape`/`_automation` restent filtres pour
+    live/ridge (memes raisons que `all_presets_all_modes`, un preset la-bas
+    peut encore etre choisi et applique cote snap via le Mode VJ)."""
+    import audio2wave_live
+    import audio2wave_ridge
+
+    if category == "snap":
+        return dict(all_presets())
+    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
+    store = audio2wave_live.preset_store if category == "live" else audio2wave_ridge.preset_store
+    return {name: {k: v for k, v in overrides.items() if k not in UNSAFE_CROSS_MODE_KEYS}
+            for name, overrides in store.all().items()}
+
+
 # Enchainements du "Mode VJ" (voir build_gui) sauvegardes depuis --gui : meme
 # mecanique que USER_PRESETS_PATH/load_user_presets/save_user_preset ci-dessus
 # (fichier JSON dans le profil utilisateur, absent/illisible = liste vide,
@@ -3103,6 +3127,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     vj_state: dict = {
         "entries": [], "running": False, "start": 0.0, "current": -1,
         "editor": None, "listbox": None, "next_label": None, "toggle_btn": None,
+        "category_var": None, "category_menu": None,
         "preset_var": None, "duration_var": None, "menu": None,
         "setlist_var": None, "setlist_menu": None, "save_setlist_name_var": None,
     }
@@ -3172,17 +3197,43 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         status["text"] = f"VJ: enchainement '{name}' mis a jour ({VJ_SETLISTS_PATH})"
 
     def refresh_vj_preset_menu() -> None:
+        # Presets de la CATEGORIE actuellement selectionnee (menu "Ajouter"),
+        # noms nus -- demande explicite ("un premier select permet de choisir
+        # la categorie snap, live ou ridge, ... un deuxieme select des
+        # presets correspondants s'ouvre... les prefixes live:/ridge:
+        # deviennent donc inutiles"), remplace l'ancien menu PLAT
+        # (all_presets_all_modes(), noms prefixes). Reappelee aussi bien apres
+        # un changement de categorie qu'apres une sauvegarde/suppression de
+        # preset snap (les deux seuls appelants existants, voir plus bas),
+        # donc doit toujours relire la categorie courante plutot que de la
+        # recevoir en parametre.
         menu_widget = vj_state["menu"]
         preset_var = vj_state["preset_var"]
-        if menu_widget is None or preset_var is None:
+        category_var = vj_state["category_var"]
+        if menu_widget is None or preset_var is None or category_var is None:
             return
-        names = sorted(all_presets_all_modes())
+        names = sorted(presets_for_category(category_var.get()))
         menu = menu_widget["menu"]
         menu.delete(0, "end")
         for name in names:
             menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
         if names and preset_var.get() not in names:
             preset_var.set(names[0])
+        elif not names:
+            preset_var.set("")
+
+    def refresh_vj_category_menu() -> None:
+        menu_widget = vj_state["category_menu"]
+        category_var = vj_state["category_var"]
+        if menu_widget is None or category_var is None:
+            return
+        menu = menu_widget["menu"]
+        menu.delete(0, "end")
+        for name in VJ_CATEGORIES:
+            def on_pick(n: str = name) -> None:
+                category_var.set(n)
+                refresh_vj_preset_menu()
+            menu.add_command(label=name, command=on_pick)
 
     def refresh_vj_listbox() -> None:
         listbox = vj_state["listbox"]
@@ -3207,12 +3258,20 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     def vj_add_entry() -> None:
         preset_var = vj_state["preset_var"]
         duration_var = vj_state["duration_var"]
-        if preset_var is None or duration_var is None:
+        category_var = vj_state["category_var"]
+        if preset_var is None or duration_var is None or category_var is None:
             return
-        name = preset_var.get()
-        if not name:
+        bare_name = preset_var.get()
+        if not bare_name:
             status["text"] = "VJ: aucun preset a ajouter (sauvegarde/charge au moins un preset)"
             return
+        category = category_var.get()
+        # Stockage interne inchange (nom prefixe "live:"/"ridge:", nu pour
+        # "snap") : c'est ce que vj_tick()/all_presets_all_modes() savent deja
+        # lire, et ce que les enchainements deja sauvegardes contiennent --
+        # seule la SELECTION dans l'editeur devient categorie+preset,
+        # composer le prefixe ici evite de toucher au reste du mecanisme.
+        name = bare_name if category == "snap" else f"{category}:{bare_name}"
         try:
             minutes = float(duration_var.get().strip().replace(",", "."))
         except ValueError:
@@ -3321,6 +3380,14 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         add_frame = tk.Frame(win, bg=GUI_PANEL_BG)
         add_frame.pack(fill="x", padx=14, pady=(14, 8))
         tk.Label(add_frame, text="Ajouter :", bg=GUI_PANEL_BG).pack(side="left")
+        # Selection en DEUX temps -- categorie (snap/live/ridge) puis preset
+        # de cette categorie, noms nus -- demande explicite, remplace l'ancien
+        # menu plat a noms prefixes "live:"/"ridge:" (voir refresh_vj_preset_
+        # menu/refresh_vj_category_menu plus haut pour le detail).
+        category_var = tk.StringVar(value="snap")
+        category_menu = tk.OptionMenu(add_frame, category_var, "")
+        style_option_menu(category_menu)
+        category_menu.pack(side="left", padx=(8, 0))
         preset_var = tk.StringVar(value="")
         menu = tk.OptionMenu(add_frame, preset_var, "")
         style_option_menu(menu)
@@ -3328,10 +3395,13 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         duration_var = tk.StringVar(value=str(VJ_DEFAULT_DURATION_MIN))
         tk.Entry(add_frame, textvariable=duration_var, width=5).pack(side="left", padx=(8, 0))
         tk.Label(add_frame, text="min", bg=GUI_PANEL_BG).pack(side="left", padx=(4, 0))
+        vj_state["category_var"] = category_var
+        vj_state["category_menu"] = category_menu
         vj_state["preset_var"] = preset_var
         vj_state["duration_var"] = duration_var
         vj_state["menu"] = menu
         tk.Button(add_frame, text="Ajouter", command=vj_add_entry).pack(side="left", padx=(8, 0))
+        refresh_vj_category_menu()
         refresh_vj_preset_menu()
 
         list_frame = tk.Frame(win, bg=GUI_PANEL_BG)
@@ -3369,6 +3439,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             vj_state["listbox"] = None
             vj_state["next_label"] = None
             vj_state["toggle_btn"] = None
+            vj_state["category_var"] = None
+            vj_state["category_menu"] = None
             vj_state["preset_var"] = None
             vj_state["duration_var"] = None
             vj_state["menu"] = None
