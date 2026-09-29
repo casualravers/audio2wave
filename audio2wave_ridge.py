@@ -37,9 +37,9 @@ from audio2wave import (
     gain_value, parse_size, style_gui, style_option_menu,
 )
 from audio2wave_live import (
-    AUTOMATE_TICK_MS, AutomationManager, PresetStore, Tooltip, find_window_position,
-    list_audio_devices, primary_screen_size, require_tools, secondary_monitor_rect,
-    target_monitor_rect,
+    AUTOMATE_TICK_MS, AutomationManager, PresetStore, Tooltip, confirm_dialog,
+    find_window_position, list_audio_devices, primary_screen_size, require_tools,
+    secondary_monitor_rect, target_monitor_rect,
 )
 # Reutilise la plomberie generique d'audio2wave_snap.py (capture, fil de lecture,
 # enveloppe d'amplitude, sonde de couleur) plutot que de la dupliquer: c'est le meme
@@ -110,6 +110,9 @@ RIDGE_GAIN_WINDOW = 8
 # demande porte sur la CAPACITE d'avoir des presets, "Sauvegarder sous" (voir
 # build_gui) permet d'en ajouter en quelques secondes depuis la fenetre.
 PRESETS: dict[str, dict[str, object]] = {
+    # Aucune surcharge, non modifiable, charge par defaut a l'ouverture -- voir
+    # la meme entree dans audio2wave_live.py.
+    "default": {},
     "large": dict(ridge_spacing=10, ridge_noise=0.2, line_width=3),
     "dense": dict(ridge_spacing=3, ridge_noise=0.05, line_width=1),
 }
@@ -687,9 +690,11 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # (resolve_points) plutot que None, mais des qu'on touche le curseur la valeur
     # devient explicite, comme --columns en ligne de commande.
     add_slider("Points par ligne", "columns", 0, 400, 4,
-              initial=resolve_points(args, size[0]), tooltip="0 = un point par pixel (plein detail).")
+              initial=resolve_points(args, size[0]), tooltip="0 = un point par pixel (plein detail).",
+              automatable=True)
     add_slider("Images/s du trace", "draw_fps", 0, 60, 1,
-              tooltip="Cadence du trace progressif d'une nouvelle ligne. 0 = affichage direct.")
+              tooltip="Cadence du trace progressif d'une nouvelle ligne. 0 = affichage direct.",
+              automatable=True)
 
     # ============================= PANNEAU DROIT ==============================
     add_section_title("right", "Couleurs")
@@ -752,12 +757,23 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                             "les forts au lieu de tous toucher le plafond.")
     r = next_row("right")
     add_label("Gain manuel (dB)", r, RIGHT_LABEL_COL)
-    tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
+    # Meme holder-Frame que add_slider(automatable=True) pour la case '~'/le
+    # bouton "courbe" SOUS le curseur (voir sa docstring) -- registre sous la
+    # cle "gain" DEJA utilisee par controls["gain"] = set_gain (voir plus
+    # haut) plutot qu'une cle dediee : set_gain accepte deja un flottant nu
+    # (bascule auto -> manuel, comme un preset qui chargerait un gain
+    # explicite), la courbe d'automation n'a donc rien de plus a faire que
+    # rejouer exactement ce chemin existant.
+    gain_holder = tk.Frame(root)
+    gain_holder.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    tk.Scale(gain_holder, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
             length=170, showvalue=True, command=lambda _v: on_gain_change(),
-            ).grid(row=r, column=RIGHT_CTRL_COL, padx=ROW_PADX, pady=ROW_PADY)
+            ).pack(side="top", anchor="w")
+    automation.register(gain_holder, "gain", "Gain manuel (dB)", -40, 40)
     add_slider("Lissage (lignes)", "gain_window", 1, 60, 1, panel="right",
               tooltip="Nombre de lignes recentes sur lesquelles le gain automatique lisse "
-                      "sa reference. 1 = instantane, comme une photo isolee.")
+                      "sa reference. 1 = instantane, comme une photo isolee.",
+              automatable=True)
 
     add_separator("right", "Sortie")
 
@@ -908,7 +924,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         elif names and preset_var.get() not in names:
             preset_var.set(names[0])
 
-    preset_var = tk.StringVar(value="")
+    # "default" par defaut a l'ouverture, sauf --preset explicite -- demande
+    # explicite, voir la meme entree dans audio2wave_live.py.
+    preset_var = tk.StringVar(value=args.preset or "default")
     r = next_shared_row()
     tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     preset_frame = tk.Frame(root)
@@ -922,6 +940,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         if not name:
             status["text"] = "aucun preset selectionne"
             return
+        if name == "default":
+            status["text"] = "'default' n'est pas modifiable"
+            return
         preset_store.save_user(name, capture_overrides())
         text = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
         if name in PRESETS:
@@ -929,6 +950,27 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         status["text"] = text
 
     tk.Button(preset_frame, text="Mettre a jour", command=on_update_preset,
+             ).pack(side="left", padx=(8, 0))
+
+    def on_delete_preset() -> None:
+        name = preset_var.get()
+        if not name:
+            status["text"] = "aucun preset selectionne"
+            return
+        if name not in preset_store.load_user():
+            status["text"] = f"'{name}' est un preset integre, impossible a supprimer"
+            return
+
+        def do_delete() -> None:
+            preset_store.delete_user(name)
+            refresh_preset_menu()
+            status["text"] = f"preset '{name}' supprime"
+
+        confirm_dialog(root, "Supprimer le preset",
+                       f"Supprimer definitivement le preset '{name}' ?\n"
+                       "Cette action est irreversible.", do_delete)
+
+    tk.Button(preset_frame, text="Supprimer", command=on_delete_preset,
              ).pack(side="left", padx=(8, 0))
 
     refresh_preset_menu()

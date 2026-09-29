@@ -66,107 +66,214 @@ resolution de chemins.
 - [audio2wave.py](audio2wave.py) — rendu fichier : un WAV en entree, une video en sortie,
   fond transparent pour overlay. Un seul `subprocess.run(["ffmpeg", ...])`.
 - [audio2wave_live.py](audio2wave_live.py) — temps reel : `ffmpeg` (capture dshow ->
-  rawvideo sur stdout) relie par un pipe Python a `ffplay`. Le pipe est cable via
-  `Popen(stdin=source.stdout)` et **pas** via un pipe shell, qui corromprait le flux
-  binaire sous PowerShell ; le parent doit fermer `source.stdout` pour que ffmpeg voie
-  la fermeture de la fenetre.
+  rawvideo sur stdout) relie a `ffplay` par un **relais Python** (`relay_loop()`),
+  pas par un tube direct.
   **`--gui`** ne peut pas muter des attributs relus en direct comme les deux autres
-  scripts : il n'y a pas de boucle Python par image ici, le tube `source.stdout ->
-  display.stdin` est direct (voir ci-dessus, deliberement pour la latence). `run()`
-  supervise donc un cycle spawn/attente/nettoyage (`spawn()`, factoree de l'ancien
-  `main()`) et le rejoue quand `restart_event` est positionne (clic sur "Appliquer"
-  dans `build_gui()`).
-  **Le redemarrage est masque, pas seulement declenche** : la nouvelle paire est
-  lancee *avant* que l'ancienne ne soit fermee (`RESTART_GRACE_S = 0.3` s de
-  coexistence), et `find_window_position()` (ctypes/`user32.FindWindowW` +
-  `GetWindowRect`, meme famille que `primary_screen_size()`) retrouve la position de
-  la fenetre en cours pour la passer en `-left`/`-top` a la nouvelle instance
-  ffplay : le changement se voit comme une mise a jour sur place, pas une fenetre qui
-  se ferme puis se rouvre ailleurs. Si la nouvelle paire echoue dans la fenetre de
-  grace (`poll()` non `None` sur l'un des deux process), elle est nettoyee et
-  l'ancienne paire, `source`/`display`, **n'est pas touchee** : `run()` retombe dans
-  la boucle d'attente sur la paire encore active au lieu de retenter un `spawn()`
-  immediatement — un premier brouillon retentait en boucle et finissait par tuer la
-  paire fonctionnelle, attrape par un test avec un `spawn()` qui echoue une fois puis
-  reussit. `stop_event` sort de la boucle definitivement ; il est aussi positionne
-  automatiquement des que `display.poll()` n'est plus `None` (fenetre fermee par
-  l'utilisateur), pour que ce cas arrete tout au lieu de relancer. Verifie sans
-  peripherique reel en substituant `spawn()` par une paire `ffmpeg -f lavfi testsrc
-  -> ffplay` : chevauchement bref des deux paires confirme (ancienne encore vivante
-  pendant que la nouvelle tourne deja), position reprise confirmee via
-  `find_window_position`, paire precedente preservee sur un echec simule, fermeture
-  de fenetre confirmee par `stop_event` sans nouvelle paire.
-  **Tout parametre est exposable dans `build_gui()`**, a la difference de
+  scripts : il n'y a pas de boucle Python par image ici pour le RENDU (deliberement,
+  pour la latence). `run()` supervise donc un cycle spawn/attente/nettoyage et le
+  rejoue quand `restart_event` est positionne (un reglage change dans
+  `build_gui()`, via `schedule_apply()`, ou l'automation de courbes, voir plus bas).
+  **Deux natures de redemarrage, pas une seule** — c'est le point le plus important
+  de ce script, ajoute apres coup suite a une question explicite de l'utilisateur
+  ("n'est-il vraiment pas possible d'empecher la fermeture/reouverture de la fenetre
+  ffplay lors des modifications de parametres du mode live ?") :
+  - **"Doux"** (le cas courant — couleurs, gain, style, peripherique...) :
+    seul le PRODUCTEUR (`spawn_producer()`, ffmpeg
+    seul, stdout relie a un pipe Python) est remplace. L'AFFICHEUR (`spawn_display()`,
+    ffplay seul, stdin relie a un pipe Python) n'est JAMAIS touche pour ce cas — sa
+    fenetre ne clignote plus du tout.
+  - **"Dur"** (uniquement `--size`/`--fullscreen`) : ffplay ne sait pas changer sa
+    resolution ni son mode plein ecran sans se redemarrer lui-meme
+    (`-video_size`/`-fs`/`-noborder` fixes a l'ouverture) — la fenetre EST recreee,
+    avec le meme mecanisme "seamless" qu'avant (nouvelle paire lancee *avant* que
+    l'ancienne ne ferme, `RESTART_GRACE_S = 0.3` s de coexistence,
+    `find_window_position()`/`target_monitor_rect()` pour rester au meme
+    endroit/moniteur — voir "Ouverture par defaut sur le deuxieme ecran" plus bas).
+  `run()` choisit entre les deux en comparant `resolve_size(args)`/`args.fullscreen`
+  a la derniere paire (taille, plein ecran) effectivement affichee.
+  **`relay_loop()`** (un seul fil, demarre une fois pour toute la duree de `run()`)
+  pompe en continu les octets du producteur ACTIF vers l'afficheur ACTIF, tous deux
+  relus depuis `relay_state` (un dict, mis a jour par `run()` a chaque redemarrage)
+  plutot que figes en parametres — remplacer le producteur ne consiste donc qu'a
+  swapper `relay_state["producer"]` PUIS terminer l'ancien (cet ordre precis: le
+  relais reprend sur le nouveau des le swap, sans attendre la fin de
+  `terminate()`/`wait()` de l'ancien, pas de gap audio/video).
+  **Accumule chaque frame ENTIERE avant de la transmettre** (`relay_state["frame_size"]`
+  = largeur x hauteur x 3, pose par `run()` a chaque redemarrage "dur", voir
+  `spawn_display()`), plutot que de relayer des blocs de taille arbitraire --
+  corrige un residu signale en usage reel APRES le "chauffage" (voir
+  `wait_for_producer()`) : "il y a encore un petit saut d'image lors de la
+  variation des parametres". Cause reelle, plus grave que ce que documentait
+  une version anterieure de ce paragraphe ("au pire une frame de transition
+  legerement decalee, invisible en pratique") : rien ne garantissait que le
+  nombre d'octets deja transmis depuis l'ANCIEN producteur au moment du
+  basculement soit un multiple exact d'une frame -- ffplay (`-f rawvideo`,
+  aucun marqueur de frame dans le flux) achevait alors une frame a moitie
+  remplie par l'ancien flux avec les PREMIERS octets du nouveau, introduisant
+  un DECALAGE qui persiste ensuite sur TOUTES les frames suivantes jusqu'au
+  prochain redemarrage -- une dechirure fixe de l'image, pas seulement un
+  sursaut ponctuel. `buf` (bytearray, un seul par appel a `relay_loop()`)
+  accumule les octets du producteur courant jusqu'a `frame_size`, puis la
+  frame complete est ecrite d'un coup et `buf` repart a zero ; `last_producer`
+  detecte un changement de producteur d'une iteration a l'autre et JETTE toute
+  frame partiellement accumulee dans ce cas (elle appartenait a l'ancien flux,
+  generalement coupe hors frontiere de frame) plutot que de la completer avec
+  le nouveau. Cout : au plus une frame quasi terminee perdue par redemarrage
+  (invisible, elle allait de toute facon etre remplacee), contre un alignement
+  EXACT garanti pour toutes les frames affichees, y compris juste apres le
+  basculement. Verifie sans vrai ffmpeg/ffplay, en forcant un faux producteur
+  a livrer son flux par TRES petits blocs (4 Ko, pour garantir qu'un
+  basculement tombe bien au milieu d'une frame) puis en inspectant chaque
+  frame ENTIERE recue par l'afficheur : aucune frame ne melange les octets de
+  deux producteurs differents, et le total recu reste un multiple exact de
+  `frame_size`.
+  Exploration menee avant d'ecrire ce mecanisme : remplacer le tube DIRECT
+  `Popen(stdin=source.stdout)` (utilise partout ailleurs dans ce depot, voir
+  `common.pipe_to_ffplay`) par un relais Python semblait a priori couteux en latence
+  — mesure : une frame 1080p rgb24 fait ~6 Mo, soit ~180 Mo/s a copier a 30 fps, tres
+  en dessous de ce qu'un `read()`/`write()` de pipe Python encaisse (quelques ms tout
+  au plus, negligeable face au poste de latence principal, `--averaging`).
+  **Le titre de la fenetre** (mode + peripherique, voir `window_title()`) ne peut pas
+  etre repasse a un ffplay deja lance : un redemarrage "doux" qui change le mode/le
+  peripherique le laisserait perime jusqu'au prochain redemarrage "dur". Corrige par
+  `set_window_title()` (dans `common.py`, `ctypes`/`FindWindowW`+`SetWindowTextW`,
+  meme famille que `find_window_position()`) : renomme la fenetre EN PLACE, sans la
+  fermer/rouvrir.
+  Si la nouvelle tentative (producteur seul, ou paire complete) echoue dans la
+  fenetre de grace (`wait_for_producer()`, voir juste apres), elle est nettoyee
+  et l'ancien producteur/l'ancienne paire, **ne sont pas touches** : `run()`
+  retombe dans la boucle d'attente sur ce qui tourne encore au lieu de retenter
+  immediatement — un premier brouillon (avant meme l'introduction du relais)
+  retentait en boucle et finissait par tuer la paire fonctionnelle, attrape par
+  un test avec un spawn qui echoue une fois puis reussit. `stop_event` sort de
+  la boucle definitivement ; il est aussi positionne automatiquement des que
+  `display.poll()` n'est plus `None` (fenetre fermee par l'utilisateur), pour
+  que ce cas arrete tout au lieu de relancer.
+  **`wait_for_producer()` "chauffe" le nouveau producteur avant de le montrer**,
+  ajoute apres coup suite a un retour utilisateur en usage reel ("il y a un
+  effet d'a-coup un peu violent" au changement de parametre, malgre la fenetre
+  desormais stable). Cause : l'ancien `time.sleep(RESTART_GRACE_S)` attendait
+  sans jamais LIRE `new_producer.stdout` (`relay_loop()` ne bascule dessus
+  qu'APRES ce succes) — ffmpeg, dont personne ne draine le tube, sature tres
+  vite un pipe anonyme Windows (une seule frame rgb24 fait plusieurs Mo) et
+  BLOQUE, donc sa fenetre `--averaging` ne progresse plus du tout pendant
+  l'attente. Au basculement, le relais lisait donc d'abord une trame ancienne
+  "a froid" (quasi silence, la moyenne n'avait jamais eu la chance de
+  converger), PUIS rattrapait tout le retard accumule d'un coup — un
+  rattrapage brutal, pas une remontee progressive, precisement l'"a-coup"
+  signale. `wait_for_producer()` remplace ce sleep aveugle par une boucle qui
+  LIT ET JETTE `producer.stdout` (memes lectures que `relay_loop()`, juste
+  sans les repasser a l'afficheur) pendant `producer_warmup_seconds(args)`
+  (capture + fenetre FFT + une PLEINE fenetre `--averaging`, pas la moitie
+  comme `report_latency()` qui donne un delai MOYEN pour le regime permanent —
+  ici il faut que la moyenne ait fini de converger avant de montrer quoi que
+  ce soit), borne entre `RESTART_GRACE_S` (plancher, detecte toujours un
+  plantage immediat) et `PRODUCER_WARMUP_CAP_S = 2.0` (plafond : un
+  `--averaging` genereux a bas `--fps` ne doit pas rendre un simple
+  changement de couleur perceptible comme fige plusieurs secondes). Drainer
+  activement (plutot que juste attendre plus longtemps) est le point
+  important : ca laisse ffmpeg tourner en temps reel jusqu'a convergence
+  pendant l'attente, donc le PREMIER octet vraiment relaye apres le
+  basculement est deja un flux stabilise. `watched` (l'afficheur, uniquement
+  pour un redemarrage "dur") generalise l'ancienne verification `poll()` des
+  deux process a la fois. Verifie sans peripherique/ffmpeg/ffplay reels, en
+  substituant `spawn_producer()`/`spawn_display()` par de faux `Popen`
+  (stdout/stdin factices suffisants pour exercer `relay_loop()`) : un
+  changement de couleur/gain/style provoque bien un nouveau producteur SANS
+  nouvel afficheur (fenetre stable), un changement de taille provoque bien
+  les deux, aucun octet d'un ancien producteur n'apparait dans ce qu'un
+  afficheur courant a recu apres son ouverture, un producteur qui echoue
+  immediatement laisse l'ancien (producteur ou paire) intact et actif, ET
+  (nouveau) `wait_for_producer()` lit bien plusieurs fois `producer.stdout`
+  pendant l'attente (pas un simple sleep), detecte une mort survenant EN
+  COURS d'attente (pas seulement au tout debut), et s'interrompt
+  immediatement si `stop_event` est deja positionne.
+  **Ambiances (`--theme`/`--glow`/`--hue-cycle`) et `--reactive` retires
+  entierement**, demande explicite ("supprime les ambiances, ca donne une
+  vibe windows media player tres tres demodee"). Ce systeme (fond anime via
+  le filtre `gradients`, halo `gblur`, rotation `hue`, plus `--reactive` qui
+  faisait "respirer" le halo au niveau audio par redemarrages espaces) a ete
+  retire d'`audio2wave.py` ET `audio2wave_live.py` (seuls scripts a l'avoir
+  jamais eu -- `audio2wave_snap.py`/`audio2wave_ridge.py` ne l'ont jamais
+  importe). `THEMES`/`resolve_theme`/`gradient_source`/`compose_scene`
+  disparaissent ; `build_filter()` retombe sur le chemin "fond uni
+  `--bg-color`" deja existant (glow/hue valaient deja 0 par defaut, c'est
+  desormais le SEUL chemin). Emporte avec lui `add_reactive_metering`/
+  `read_reactive_level`/`reactive_watcher`/`discard_level_file` et le
+  parametre `level_path` de `spawn_producer()`/`producer_command()` (plus de
+  fichier de mesure RMS a ecrire/lire/nettoyer). Les deux curseurs
+  automatables "Halo"/"Derive de teinte" disparaissent de `--gui` ; les
+  quatre restants (Barres/points, Gain, Lissage, Espace entre barres, voir
+  plus bas "Presets + automation") suffisent desormais a couvrir "tous les
+  reglages numeriques de cette fenetre".
+  **A l'occasion, corrige aussi un leger decentrage vertical du rendu
+  `--style radio`** signale separement dans le meme message ("le mode live
+  avec l'option radio est legerement decentre verticalement") : mesure
+  directe (`ffmpeg -f lavfi` + une sinusoide de test, hors de ce depot) que
+  `showwaves` seul centre deja correctement son trace (a 0.5 px pres, pure
+  rondeur), mais l'ancien graphe passait TOUJOURS par la composition
+  glow/gradient meme a `--theme flat` par defaut des que `--bg-color` n'etait
+  pas noir -- ce chemin de composition disparaissant avec les ambiances, le
+  rendu retombe desormais sur le simple `overlay` deja utilise et verifie
+  centre.
+  **Tout parametre reste exposable dans `build_gui()`**, a la difference de
   `audio2wave_snap.py`/`audio2wave_ridge.py` : comme `apply()` redemarre tout le
   pipeline (rien n'est relu en direct par un `run()` par-image, voir ci-dessus), il
   n'y a pas de commande de capture ou de fenetre deja figee a proteger — la seule
-  limite est de ne pas surcharger la fenetre. `--glow`/`--hue-cycle` (halo et derive
-  de teinte de `--theme`), `--bar-gap` et `--freq-scale`/`--amp-scale` (forme du
-  spectre) sont ainsi exposes en plus du strict minimum initial. `--glow`/
-  `--hue-cycle` valent `None` par defaut (c'est alors `--theme` qui les fixe, voir
-  `resolve_theme`) : leurs curseurs affichent la valeur deja resolue pour le theme
-  courant a l'ouverture, mais comme `--bars` (valeur par defaut selon le style),
-  les toucher fige une valeur explicite dans `args` pour tous les "Appliquer"
-  suivants, y compris apres un changement de `--theme`.
-  **`--reactive`** fait "respirer" `--glow` avec le niveau audio mesure, par
-  redemarrages seamless automatiques (meme mecanisme que le bouton Appliquer,
-  voir plus haut) plutot que par une modulation continue. Exploration menee avant
-  d'ecrire le moindre code : ffmpeg n'expose qu'un seul canal pour piloter un
-  filtre (`gblur`) en cours de route sans redemarrer, le filtre `zmq` — confirme
-  fonctionnel (`sendcmd` scripte sur `gblur@nom`/`hue@nom`, la valeur moyenne des
-  pixels change exactement a l'image programmee) mais **le client ne peut venir
-  que de `pyzmq`, absent de la stdlib** (aucun `zmqsend` fourni avec ce build
-  ffmpeg Windows), ce qui violerait "stdlib seulement" en tete de ce document —
-  d'ou le choix du redemarrage plutot qu'un client ZMTP ecrit a la main.
-  Le niveau est mesure via `add_reactive_metering` : scinde `[0:a]` (`asplit`)
-  avant que `build_filter()` ne s'en empare, une derivation traverse
-  `astats=metadata=1,ametadata=print:...:direct=1` puis `anullsink`. Deux ecueils
-  mesures avant de se fixer sur cette forme : `file=-` (stdout) semblait ecrire
-  sur stderr dans un test isole (`-af` + `-f null -`), mais dans le vrai graphe a
-  plusieurs branches il ecrit sur le MEME stdout que le muxer rawvideo — confirme
-  en observant le texte entrelace dans les octets de trame, flux video corrompu ;
-  un fichier est donc la seule sortie sure. Et sans `direct=1`, l'ecriture reste
-  bufferisee par la libc et n'apparait qu'a la fermeture du processus (mesure via
-  `-re`, cadence temps reel : aucune ligne visible avant la toute fin sans
-  `direct=1`, incrementales avec). Chemin de fichier RELATIF uniquement (`cwd` du
-  sous-processus fixe a son dossier parent dans `spawn()`) : un chemin absolu
-  Windows (`C:\...`) casse le parseur d'options de filtre a cause du `:` du
-  lecteur — `\:` echappe et guillemets simples autour de la valeur testes,
-  echouent aussi.
-  **Chaque `spawn()` utilise un nom de fichier NEUF**, jamais reutilise : sur
-  Windows, effacer/recreer un meme fichier alors que l'ancien producteur (encore
-  actif pendant le court chevauchement du redemarrage seamless) le tient encore
-  ouvert leve `WinError 32` — contrairement a POSIX ou `unlink()` sur un fichier
-  ouvert reste silencieux. `read_reactive_level` (un seul fil pour toute la
-  session) suit donc le chemin COURANT via `level_state["path"]`, mis a jour par
-  `run()` apres chaque redemarrage reussi ; l'ancien fichier n'est efface qu'une
-  fois l'ancien producteur confirme termine (`wait()` deja passe). Meme ce
-  `wait()` ne garantit pas toujours que Windows a deja relache le fichier
-  (`PermissionError` constate malgre tout, vraisemblablement un antivirus/filtre
-  systeme qui garde la main un instant de plus) : `discard_level_file` avale
-  `OSError` plutot que de laisser une suppression best-effort planter tout le fil
-  de supervision pour un fichier temporaire sans consequence.
-  **Bug corrige, distinct de --reactive mais qui l'a rendu visible** : la
-  demande de redemarrage (`restart_event.set()`) etait effacee par un
+  limite est de ne pas surcharger la fenetre.
+  **`--reactive` a existe** (faisait "respirer" `--glow` avec le niveau audio
+  mesure, par redemarrages espaces) **avant d'etre retire avec le reste des
+  ambiances** (voir plus haut) : son exploration avait confirme que ffmpeg
+  n'expose qu'un seul canal pour piloter un filtre en cours de route sans
+  redemarrer (le filtre `zmq`), mais qu'un client ne peut venir que de
+  `pyzmq`, absent de la stdlib -- d'ou deja, a l'epoque, le choix d'un
+  redemarrage plutot qu'un client ZMTP ecrit a la main. Sans objet une fois
+  `--glow` lui-meme parti.
+  **Bug corrige (avant le retrait de --reactive, mais qui touchait
+  n'importe quelle source de redemarrage automatique)** : la demande de
+  redemarrage (`restart_event.set()`) etait effacee par un
   `restart_event.clear()` qui tournait juste APRES un spawn reussi. Un `set()`
   arrivant dans cette fenetre (le bouton Appliquer d'un humain n'y tombe presque
-  jamais, un fil automatique qui sonde toutes les REACTIVE_POLL_S si) etait perdu
-  en silence : aucun redemarrage n'avait lieu alors qu'un changement l'exigeait.
-  Deplace en tete de boucle, avant `spawn()` : rien n'efface plus la demande
-  jusqu'au prochain passage, un `set()` pendant le spawn/le delai de grace ou
-  pendant la boucle de service reste donc vu.
-  **`REACTIVE_SMOOTH` doit couvrir plusieurs secondes, pas juste quelques
-  lectures** : a 5 lectures (1,5 s a `REACTIVE_POLL_S=0.3`), un seul coup fort
-  isole (un kick, une attaque breve) suffisait a deplacer la moyenne glissante
-  au-dela de `REACTIVE_GLOW_DELTA` — observe en usage reel, la fenetre "se
-  rouvre" (le redemarrage reste visible, meme "seamless") au moindre changement
-  soudain, pas seulement sur un vrai changement d'ambiance. Passe a 20 lectures
-  (6 s) : un coup bref pese alors trop peu dans la moyenne pour a lui seul
-  franchir le seuil, il faut un changement de niveau SOUTENU (un couplet qui
-  monte, une transition) pour declencher un redemarrage. Verifie en isolant
-  l'algorithme de `reactive_watcher` d'un vrai ffmpeg (level_state pilote a la
-  main) : un pic d'une seule lecture ne redemarre rien, un changement plus long
-  que la fenetre de lissage si.
+  jamais, un fil automatique -- --reactive alors, schedule_apply()/l'automation
+  de courbes aujourd'hui -- si) etait perdu en silence : aucun redemarrage
+  n'avait lieu alors qu'un changement l'exigeait. Deplace en tete de boucle,
+  avant `spawn()` : rien n'efface plus la demande jusqu'au prochain passage,
+  un `set()` pendant le spawn/le delai de grace ou pendant la boucle de
+  service reste donc vu -- toujours vrai aujourd'hui, voir la docstring de
+  `run()`.
+  **Plus de bouton "Appliquer"** — demande explicite ("enleve le bouton
+  appliquer et applique les params automatiquement a la place"), une fois le
+  relais/l'alignement de frame en place ayant rendu les redemarrages assez
+  discrets pour ca. `apply()` (inchangee : relit tous les widgets d'un coup,
+  positionne `restart_event`) est desormais declenchee par `schedule_apply()`,
+  cablee via `.trace_add("write", schedule_apply)` sur CHAQUE `tk.Variable`
+  exposee ici (`add_slider`/`add_entry`/`add_dropdown` la posent
+  automatiquement ; les controles construits a la main --
+  device/style/shape/stereo/theme/taille/plein ecran -- la posent
+  explicitement a leur creation) : un `trace_add("write", ...)` fire sur TOUTE
+  ecriture de la variable, quelle qu'en soit la source (glisser un curseur,
+  taper dans un champ, choisir un menu, cocher une case), une seule ligne par
+  fabrique suffit donc a couvrir tout ce qui passe par elles.
+  **DEBOUNCE plutot qu'un redemarrage par evenement** : glisser un curseur
+  ecrit sa variable des dizaines de fois par seconde, et CHAQUE redemarrage
+  rouvre le peripherique DirectShow (`capture_input_args`) -- les enchainer a
+  ce rythme risquerait de vrais soucis pilote, pas seulement un exces de
+  process ffmpeg. `schedule_apply()` reprogramme `apply()` a
+  `APPLY_DEBOUNCE_MS` (400 ms) dans le futur via `root.after(...)`, en
+  annulant le `after()` precedent a chaque nouvel appel -- `apply()` ne part
+  reellement qu'une fois l'utilisateur immobile sur ce delai. Un curseur
+  "automatable" coche (voir `AutomationManager`) repousse ce debounce EN
+  CONTINU tant qu'il tourne (`tick()` ecrit sa variable toutes les
+  `AUTOMATE_TICK_MS`=50 ms) : `schedule_apply()` ne se declenche donc jamais
+  de lui-meme pour un reglage automatise, exactement le comportement d'avant
+  ce changement -- `automation_restart_tick()` (rythme fixe
+  `AUTO_RESTART_INTERVAL_S`) reste seule responsable de les rejouer, sans
+  modification.
+  Verifie sans vrai ffmpeg/ffplay : aucun bouton "Appliquer" ne subsiste dans
+  la fenetre ; deplacer un curseur (Gain) declenche bien un redemarrage tout
+  seul, sans invoquer quoi que ce soit d'autre ; une rafale de 6 changements
+  espaces de 50 ms (bien sous le debounce) ne produit bien qu'UN SEUL
+  redemarrage, avec la DERNIERE valeur de la rafale.
 - [audio2wave_snap.py](audio2wave_snap.py) — photo fixe, rafraichie au meme rythme que sa
   duree, tracee progressivement. Duree en temps plutot qu'en secondes (`--bpm`/`--beats`,
   defaut 4 temps soit une mesure a 4/4). Deux familles de rendu: `--style pencil` (defaut)
@@ -375,6 +482,15 @@ resolution de chemins.
   stricte. Un `Tooltip` sur le label "Vitesse" precise desormais le sens
   ("droite = plus rapide, gauche = plus lent") : cette fenetre popup n'avait
   jusque-la aucune info-bulle, a la difference de la fenetre principale.
+  **`AUTOMATE_PERIOD_MAX_S` releve ensuite de 40 s a 400 s** (10x plus lent),
+  demande explicite ("permet aux courbes d'automation d'avoir une vitesse de
+  variation 10 fois plus lente encore") -- meme constante dans les deux
+  fichiers qui la definissent (`audio2wave_snap.py`, `audio2wave_live.py` ;
+  `audio2wave_ridge.py` reutilise celle de `audio2wave_live.py` via
+  `AutomationManager`). Le curseur garde `resolution=1` (secondes) sur cette
+  plage elargie, et `speed_value_label` continue d'afficher la valeur telle
+  quelle (`f"{periode:.0f} s/cycle"`), donc jusqu'a "400 s/cycle" sans
+  changement de format.
   **Bug corrige, distinct du precedent : le chiffre affiche par le `Scale`
   restait un nombre brut de secondes** (`showvalue=True`), lu comme incoherent
   malgre la direction desormais correcte et la tooltip juste au-dessus —
@@ -825,8 +941,7 @@ verification des outils (`require_tools`, `add_bundled_ffmpeg_to_path` — voir
 juste apres), et le socle des reglages `--gui`
 (`parse_size`, `auto_win_size`, `gain_value`, palette `GUI_*`, `style_gui`,
 `style_option_menu`). Extrait pour etre importable **sans** tirer la logique de
-rendu d'`audio2wave.py` (THEMES/compose_scene/gradient_source/resolve_theme
-restent la, propres au style visuel) — c'est ce point d'entree qu'importe
+rendu d'`audio2wave.py` — c'est ce point d'entree qu'importe
 `audioreactive-warp` (depot separe), qui a besoin de la capture et du tube mais
 pas du rendu de waveform.
 
@@ -999,7 +1114,7 @@ EN PLACE, MEME FENETRE" (voir plus bas) -- `live`/`ridge` sont desormais
 TOUJOURS atteignables depuis la fenetre de `snap` (boutons de bascule, meme
 `root` Tk partagee), les avoir en plus comme point de depart direct n'etait
 plus qu'une redondance historique de l'epoque ou chaque mode avait sa propre
-fenetre. `Demarrer - Snap.bat` reste seul (voir "Installation sans
+fenetre. `audio2wave.bat` reste seul (voir "Installation sans
 configuration" juste apres) : c'est le seul mode ou `-d`/`--device` est
 optionnel en `--gui` (voir sa propre section plus haut), donc le seul qui
 peut demarrer sans rien demander avant l'ouverture de la fenetre -- un
@@ -1008,6 +1123,15 @@ exigent encore `-d` au lancement direct) ne remplissaient pas. `README.md`
 (tableau `.bat` reduit a une seule ligne, section "Jongler entre les trois
 modes" precisant desormais que `live`/`ridge` se lancent DEPUIS cette meme
 fenetre plutot que directement) et ce fichier mis a jour en consequence.
+
+### Renommage du lanceur en nom de produit seul
+
+Demande explicite : "Renomme le nom demarrer.bat en quelque chose de plus
+sexy et en anglais." Le `.bat` precedemment `Demarrer - Snap.bat` est
+desormais simplement `audio2wave.bat` — plus court, plus elegant, et le nom
+du produit seul parle de lui-meme comme point d'entree unique. Le contenu
+reste inchange (lance `audio2wave_snap.py --gui`). `README.md` et ce fichier
+mis a jour en consequence.
 
 ### Installation sans configuration (ffmpeg embarque, `.bat` de lancement)
 
@@ -1036,8 +1160,9 @@ tiers (~100 Mo, licence LGPL/GPL propre a ffmpeg), jamais du code source —
 chacun les recupere separement (lien dans le README), jamais commites dans
 ce depot.
 
-**Un seul `.bat` a la racine desormais, `Demarrer - Snap.bat`** (voir
-"Suppression des lanceurs Live/Ridge" plus bas pour l'historique) :
+**Un seul `.bat` a la racine desormais, `audio2wave.bat`** (voir
+"Suppression des lanceurs Live/Ridge" et "Renommage du lanceur" plus bas pour
+l'historique) :
 `cd /d "%~dp0"` (fonctionne quel que soit le dossier de lancement, un
 double-clic Explorateur part toujours du dossier du fichier, mais une
 execution depuis un raccourci pointant ailleurs pourrait ne pas l'assumer),
@@ -1400,6 +1525,59 @@ Les commentaires du code expliquent le pourquoi ; ne pas les "nettoyer" sans mes
   est desactive) ; calcules une fois par photo dans `run()` comme `columns`, pas
   recalcules pendant le balayage — un kick ne bouge pas plus que le contour
   pendant que sa photo est affichee.
+  **Trois optimisations mesurees, demande explicite ("vois-tu des optimisations
+  possibles ?" -> "augmente RELAY_CHUNK_SIZE, et elargis a tous les fichiers"),
+  toutes verifiees BYTE-IDENTIQUES a l'ancien comportement (meme image, memes
+  kicks) avant/apres :**
+  - `compose_pencil` appelait `paint_pencil_columns(..., full=True)` (le
+    defaut) alors que son `canvas` vient JUSTE d'etre entierement rempli du
+    fond (`bytearray(background * (width*height))`, la ligne juste au-dessus) —
+    `full=True` refait ce remplissage colonne par colonne, un second passage
+    `O(width*height)` integralement redondant. Corrige en passant `full=False`
+    explicitement depuis `compose_pencil` (le fond y est deja correct) ;
+    `full=True` reste le defaut pour les autres appelants de
+    `paint_pencil_columns` (le balayage progressif dans `run()`, qui DOIT
+    repeindre le fond d'une colonne fraichement revelee par-dessus les restes
+    de la photo PRECEDENTE).
+  - Dans `paint_pencil_columns`, `bytes([background[c]]) * height` (le
+    remplissage de fond d'UNE colonne) etait recalcule a neuf pour chacun des
+    3 canaux a CHAQUE colonne, alors que `height` est invariant sur tout
+    l'appel — la meme valeur, reconstruite `width` fois par photo (et de
+    nouveau a chaque colonne fraichement revelee du balayage progressif).
+    `bg_col = [bytes([background[c]]) * height for c in range(3)]` precalcule
+    desormais ces 3 tranches UNE SEULE FOIS avant la boucle par colonne.
+  - `render_pencil` appelait `pencil_heights()`/`amplitude_envelope()` ET (si
+    `--kick-glow`) `detect_kicks()`/`energy_envelope()` sur le MEME `pcm` --
+    chacune reparsant independamment `array.array("h")` + `frombytes()`, un
+    second parse `O(len(pcm))` integralement redondant. `amplitude_envelope`/
+    `energy_envelope`/`detect_kicks`/`pencil_heights` acceptent desormais un
+    parametre optionnel `samples` (le PCM DEJA converti) -- `None` par defaut
+    (reparsent comme avant, aucun changement pour `audio2wave_ridge.py`, qui
+    appelle `amplitude_envelope` sans kicks et n'a donc rien a partager) ;
+    `render_pencil` parse `pcm` une seule fois et le transmet aux deux quand
+    `--kick-glow` est actif.
+  Mesure (`render_pencil` avec `--kick-glow`, 1920x360, PCM synthetique
+  1,875 s) : 45,7 ms -> 29,6 ms par photo, ~35 % plus rapide. Verifie par
+  comparaison BYTE-IDENTIQUE (pas juste "l'image parait pareille") : l'ancien
+  chemin (`full=True` sur canevas fraichement cree) et le nouveau
+  (`full=False`) produisent une image strictement identique octet pour octet ;
+  `amplitude_envelope`/`energy_envelope`/`detect_kicks` avec `samples` partage
+  donnent un resultat strictement identique a l'appel sans partage.
+  Meme demande appliquee a `audio2wave_live.py` : `RELAY_CHUNK_SIZE` (voir sa
+  section plus haut) monte de 64 Ko a 512 Ko — une frame 1080p rgb24 fait
+  ~6 Mo, donc 64 Ko forcait ~96 appels `read()`/`write()` par frame relayee
+  (chacun avec un cout de syscall) ; 512 Ko ramene ca a ~12, sans rien perdre
+  en reactivite (`relay_loop()` n'a besoin d'etre granulaire qu'entre deux
+  redemarrages, espaces de secondes, pas entre deux frames).
+  `audio2wave_ridge.py` (`paint_ridge_line`) a le MEME motif que le deuxieme
+  point ci-dessus (`bytes([...]) * n` recalcule par colonne), mais `n` y varie
+  a CHAQUE colonne (hauteur de remplissage dependante de la crete courante/
+  precedente) au lieu d'etre fixe comme `height` en pencil -- pas de valeur
+  unique a hoister hors de la boucle sans memoisation par longueur, un cout de
+  complexite juge disproportionne face au gain incertain. Laisse tel quel.
+  `common.py` (utilitaires ctypes un-shot, pas de chemin par-frame) et
+  `audio2wave.py` (construction de chaine de filtres, aucun pixel touche par
+  Python) n'avaient rien a optimiser.
 - **`--glow-live` anime le MEME halo par le niveau audio COURANT plutot que par
   des kicks detectes sur la photo entiere** — demande explicite ("j'aimerais
   que le halo puisse avoir une animation en temps reel et non avec 4 temps de
@@ -1751,6 +1929,119 @@ un vrai `--video` choisi via le bouton "Parcourir..." (mock d'`askopenfilename`,
 meme mecanisme que le test de ce bouton) puis une sauvegarde de preset : le JSON
 ecrit contient bien une chaine, pas un objet illisible.
 
+### Preset "default" non modifiable, suppression avec confirmation, VJ multi-mode
+
+Trois demandes explicites du meme message, appliquees IDENTIQUEMENT aux trois
+scripts (`all_presets()`/`PresetStore`, selon le mecanisme propre a chacun) :
+
+**"Par defaut, un mode doit s'ouvrir sur le preset 'default' qui est non
+modifiable"** : `"default": {}` (aucune surcharge -- les reglages argparse
+tels quels) ajoute a `PRESETS` dans les trois fichiers, EN PREMIER (ordre
+d'affichage dans `--list-presets`/le menu **Charger**). `preset_var` (le
+`tk.StringVar` du menu **Charger**) s'initialise desormais a `args.preset or
+"default"` plutot qu'une chaine vide : si `--preset <nom>` a deja ete
+demande en ligne de commande, la fenetre l'affiche des l'ouverture (bonus) ;
+sinon "default" est deja selectionne, coherent avec le fait que `args` est
+DEJA aux valeurs par defaut a ce stade (pas de rechargement declenche,
+juste l'AFFICHAGE qui reflete l'etat reel). Un dict VIDE traverse
+`apply_preset()` sans rien faire (`for key, value in overrides.items()`
+n'itere sur rien) — "non modifiable" vient de `on_update_preset()`, qui
+refuse desormais explicitement `name == "default"` AVANT d'ecrire quoi que
+ce soit dans le JSON (message "'default' n'est pas modifiable"), a la
+difference des AUTRES presets integres (`club`, `wave`...) qui, eux,
+peuvent toujours etre "mis a jour" (shadow local, voir plus haut). **Sauvegarder
+sous** refuse deja tout nom present dans `PRESETS` (donc "default" aussi,
+sans changement necessaire la).
+
+**"Rend possible la suppression d'un preset (avec modale de confirmation)"** :
+`delete_user_preset(name)` (`audio2wave_snap.py`, fonction module-level) /
+`PresetStore.delete_user(name)` (`audio2wave_live.py`, reutilisee par
+`audio2wave_ridge.py`) retirent une entree du JSON UTILISATEUR et renvoient
+`False` si elle n'y est pas (rien a faire, jamais une erreur) — ne touchent
+JAMAIS `PRESETS` (le code) : un preset integre "supprime" reapparait tel
+quel, exactement comme "Mettre a jour" le shadow deja sans y toucher (meme
+logique, sens inverse). Le bouton **Supprimer** (a cote de **Mettre a
+jour**) refuse un nom absent du JSON utilisateur AVANT meme d'ouvrir la
+modale -- couvre a la fois "default" (jamais modifiable donc jamais dans le
+JSON) et tout preset integre jamais "mis a jour" localement, pas de
+verification separee necessaire pour "default" ici.
+**`confirm_dialog(parent, title, message, on_confirm)`** (nouvelle fonction
+dans `audio2wave_live.py`, a cote de `Tooltip` — meme raison de s'y trouver
+et d'y etre importee par les deux autres scripts) est une petite `Toplevel`
+avec le theme sombre de `style_gui` plutot que la boite de dialogue OS de
+`tkinter.messagebox` (qui ignore cette palette) : `grab_set()` la rend
+bloquante (empeche toute interaction avec la fenetre principale tant qu'elle
+est ouverte), `transient(parent)` la garde au-dessus et la fait disparaitre
+avec elle. Suppression IRREVERSIBLE cote fichier, d'ou la confirmation --
+premiere action destructive sans un "annuler en rechargeant" possible dans
+ces trois fenetres.
+**Bug de test decouvert en ecrivant la verification, pas un bug de code** :
+un premier test supposait que charger "club" donnerait toujours le preset
+INTEGRE (`style="analyzer"`) ; sur la machine de developpement, un "club"
+UTILISATEUR reel (sauvegarde lors d'un usage anterieur, avant ce changement,
+avec `style="radio"` et d'anciennes cles `theme`/`glow`/`hue_cycle` du
+systeme d'ambiance depuis retire) le masquait deja — comportement CORRECT du
+mecanisme de shadow (voir plus haut), le test avait juste une hypothese
+fausse sur l'etat du profil utilisateur. Corrige en isolant
+`preset_store.path`/`USER_PRESETS_PATH` vers un fichier temporaire pour la
+duree du test, plutot que de toucher au vrai profil `~/.audio2wave/` —
+lecon a retenir pour tout futur test qui clique "Mettre a jour"/"Sauvegarder
+sous"/"Supprimer" dans ces fenetres.
+
+**"Le mode vj doit prendre en compte les presets de tous les modes, pas
+juste snap"** : `all_presets_all_modes()` (`audio2wave_snap.py`, a cote
+d'`all_presets()`) fusionne les presets de snap (noms nus, inchange) avec
+ceux de `audio2wave_live.py`/`audio2wave_ridge.py` (leurs `preset_store`
+MODULE-level respectifs, deja exposes), **prefixes `live:`/`ridge:`** pour
+eviter toute ambiguite de nom (les trois scripts ont chacun un preset
+"default", fusionne UNE SEULE FOIS sans prefixe puisque son contenu -- vide
+-- est identique partout). Import PARESSEUX (dans la fonction, pas en tete
+de fichier) : `audio2wave_ridge.py` importe deja `audio2wave_snap.py` en
+tete de fichier, un import en tete inverse ici creerait un cycle -- meme
+precaution que les imports lies a la bascule de mode.
+**Les cles `style`/`shape` d'un preset ETRANGER (live) sont retirees avant
+fusion** : leurs valeurs valides la-bas (`analyzer`/`radio`, `bar`/`line`)
+n'ont aucun sens pour les attributs DE MEME NOM cote snap (`pencil`/
+`rekordbox`/`simple`) — `apply_preset()` ne filtre que par PRESENCE de la
+cle dans `controls`, pas par la VALIDITE de la valeur pour ce style-ci ;
+sans ce filtrage, charger `live:club` depuis le Mode VJ aurait pousse
+`args.style = "analyzer"` dans snap, une valeur qu'aucun de ses trois styles
+ne reconnait, cassant silencieusement le rendu suivant. `ridge` n'a ni
+`--style` ni `--shape`, rien a filtrer de son cote. L'automation
+(`_automation`) d'un preset etranger est retiree aussi : sa structure
+(attributs automatables propres a CE mode) n'a pas de sens transposee dans
+le systeme d'automation, distinct, de snap.py. Le reste (gain, couleurs,
+`line_width`, `fullscreen`...) partage un sens compatible d'un mode a
+l'autre, ou est de toute facon absent de `controls` cote snap
+(`ridge_spacing`, `averaging`...) et deja ignore silencieusement par
+`apply_preset` (voir `skipped`, deja documente plus haut).
+`refresh_vj_preset_menu()`/`vj_tick()` utilisent `all_presets_all_modes()` a
+la place de `all_presets()` ; `vj_add_entry()` n'a rien a changer, il ne lit
+que le menu deja peuple. Verifie sans vrai ffmpeg/ffplay/GUI live-ridge :
+`all_presets_all_modes()` inclut bien les noms nus de snap ET les noms
+prefixes `live:`/`ridge:`, "default" n'apparait qu'une fois (pas
+`live:default`/`ridge:default`), et un preset `live:*` fusionne perd bien
+`style`/`shape` tout en gardant `gain`/`fullscreen`.
+
+### Selection automatique du premier peripherique (`audio2wave_snap.py`)
+
+Demande explicite : "par defaut selectionne le premier device dispo dans la
+liste." Avant ce changement, lancer `--gui` sans `-d` (deja possible, voir
+plus haut : `-d`/`--device` optionnel en `--gui`) peuplait bien le menu
+**Entree audio** via `refresh_devices()` (appelee une fois au demarrage),
+mais laissait `args.device`/`device_var` VIDES tant que l'utilisateur n'avait
+pas cliqu manuellement une entree -- la fenetre s'ouvrait donc sur
+`NoDeviceCapture` (rien affiche, voir sa section plus haut) meme quand des
+peripheriques etaient bel et bien detectes. `refresh_devices()` appelle
+desormais `on_device_change(names[0])` si `args.device` est encore vide ET
+que la liste n'est pas vide -- ne touche JAMAIS une entree deja choisie
+(par `-d` ou par l'utilisateur avant un `Actualiser` ulterieur), et ne fait
+rien sur une liste vide (rien a choisir). La comparaison `args.device !=
+last_device` DEJA en place pour changer de peripherique EN COURS DE ROUTE
+(voir plus haut) voit cette premiere selection comme un changement normal,
+aucun code special supplementaire necessaire pour que `run()` demarre
+vraiment la capture dessus.
+
 ### Presets + automation de courbes pour les trois modes
 
 `audio2wave_snap.py` avait deja les presets et la "variation automatique"
@@ -1807,9 +2098,24 @@ d'automation dans un preset, exactement comme `audio2wave_snap.py` le fait deja.
 
 **`audio2wave_ridge.py`** : integration directe, sans surprise -- `run()` relit
 deja `args` a chaque ligne (voir sa docstring), donc `.tick()` n'est qu'une
-mutation d'attribut de plus parmi celles deja relues en direct. Curseurs
-automatables : Espacement, Deformation, Epaisseur (meme choix de nombre que
-`audio2wave_snap.py`, memes reglages visuellement decoratifs).
+mutation d'attribut de plus parmi celles deja relues en direct. **Curseurs
+automatables : tous les reglages numeriques de cette fenetre** -- demande
+explicite ("ajoute des automations pour tous les parametres des modes live
+et ridge"), apres un premier jet plus restreint (Espacement, Deformation,
+Epaisseur seulement, "purement decoratifs"). S'ajoutent desormais Points par
+ligne (`columns`), Images/s du trace (`draw_fps`), Lissage/`gain_window`, et
+le **Gain manuel (dB)** -- ce dernier construit a la main (pas via
+`add_slider`, a cause du bouton "Gain automatique" cote a cote) : la case
+'~'/le bouton "courbe" sont ajoutes dans un `Frame` de plus, meme motif
+d'alignement que `add_slider(automatable=True)`, et `automation.register(...,
+"gain", ...)` reutilise directement la cle `"gain"` DEJA presente dans
+`controls` (`set_gain`, qui accepte deja un flottant nu en plus de `"auto"`
+— basculer l'automation revient donc a rejouer exactement le meme chemin
+qu'un preset qui chargerait un gain explicite, rien de plus a ecrire).
+Restent HORS automation les controles non numeriques (couleurs, style/forme
+de trait, case Gain automatique elle-meme, taille/plein ecran, dossier de
+sortie) : une courbe interpole une plage `[lo, hi]` continue, ce qui n'a pas
+de sens pour une chaine ou un booleen.
 
 **`audio2wave_live.py`** : integration plus delicate, a cause de son
 architecture (voir sa docstring de `build_gui()`/`run()`) -- RIEN n'y prend
@@ -1828,9 +2134,21 @@ continue de deplacer le CURSEUR affiche (retour visuel immediat, cadence
 normale de 50 ms) sans que ca ne change quoi que ce soit au rendu tant que
 le prochain redemarrage n'a pas eu lieu -- assume comme une derive
 perceptible plutot qu'un temps reel, coherent avec la nature deja
-"purement decorative" de cette fonctionnalite. Curseurs automatables : Halo,
-Derive de teinte (les deux memes reglages decoratifs mis en avant par
-`audio2wave_snap.py`, pour la meme raison). **`on_load_preset()` declenche
+"purement decorative" de cette fonctionnalite. **Curseurs automatables :
+tous les reglages numeriques de cette fenetre** (meme extension, meme
+demande explicite, que `audio2wave_ridge.py` ci-dessus) -- Barres/points
+(`bars`), Gain (dB), Lissage (`averaging`), Espace entre barres (`bar_gap`).
+Halo/Derive de teinte du premier jet ont depuis disparu avec le reste des
+"ambiances" (`--glow`/`--hue-cycle`, voir plus haut), qui etaient a l'origine
+du choix de ces deux-la comme "seuls reglages ou une derive automatique a un
+sens visuel direct". Ce lot profite directement du relais Python (voir la docstring de
+`run()`/`relay_loop()` plus haut) : `automation_restart_tick()` continue
+d'appeler `apply()` toutes les `AUTO_RESTART_INTERVAL_S` (2 s), mais AUCUN de
+ces quatre reglages ne touche `--size`/`--fullscreen`, donc chacun de ces
+redemarrages periodiques est desormais "doux" -- la fenetre ffplay ne
+clignote plus du tout pendant qu'une automation tourne, la ou l'ancienne
+architecture (tube direct) l'aurait fait clignoter toutes les 2 secondes.
+**`on_load_preset()` declenche
 `apply()` immediatement** (contrairement a `audio2wave_snap.py`, ou charger un
 preset prend effet sans action supplementaire) : sans ce redemarrage explicite,
 un preset charge resterait invisible tant que l'utilisateur ne clique pas
@@ -1859,8 +2177,8 @@ attributs attendus (`audio2wave_ridge.py` : mutation directe d'`args`, verifiee
 sans delai ; `audio2wave_live.py` : verifiee apres avoir attendu le spawn()
 declenche par l'`apply()` immediat) ; cocher '~' sous un curseur automatable
 fait bien avancer sa valeur tout seul (`args.ridge_spacing` cote
-`audio2wave_ridge.py`, la position du curseur Halo cote `audio2wave_live.py`,
-suivie jusqu'a ce qu'`automation_restart_tick()` declenche un nouveau spawn
+`audio2wave_ridge.py`, la position du curseur Barres/points cote
+`audio2wave_live.py`, suivie jusqu'a ce qu'`automation_restart_tick()` declenche un nouveau spawn
 avec le halo deplace).
 
 ### Frequence d'echantillonnage

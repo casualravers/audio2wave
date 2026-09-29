@@ -315,6 +315,31 @@ def find_window_position(title: str) -> tuple[int, int] | None:
         return None
 
 
+def set_window_title(current_title: str, new_title: str) -> bool:
+    """Renomme EN PLACE une fenetre deja ouverte (SetWindowTextW), identifiee par
+    son titre exact actuel -- sans la fermer/rouvrir.
+
+    Sert au relais de audio2wave_live.py (voir relay_loop()/run() la-bas) : un
+    redemarrage "doux" (producteur seul, fenetre ffplay jamais touchee, voir sa
+    docstring pour le detail) ne peut pas repasser `-window_title` a un ffplay
+    deja lance -- si le mode/peripherique affiche dans le titre a change entre
+    temps, ce titre serait sinon perime jusqu'au prochain redemarrage "dur"
+    (taille/plein ecran). Renvoie `False` si la fenetre n'est plus trouvee (deja
+    fermee, ou titre deja perime pour une autre raison) : au pire le titre reste
+    inchange, jamais bloquant.
+    """
+    if current_title == new_title:
+        return True
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.FindWindowW(None, current_title)
+        if not hwnd:
+            return False
+        return bool(ctypes.windll.user32.SetWindowTextW(hwnd, new_title))
+    except Exception:
+        return False
+
+
 def target_monitor_rect(existing_window_title: str | None) -> tuple[int, int, int, int] | None:
     """Rect (left, top, width, height) du moniteur a remplir pour un plein ecran
     "borderless" (voir plus bas) : celui qui heberge deja la fenetre ENCORE

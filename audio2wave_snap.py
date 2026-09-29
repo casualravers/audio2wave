@@ -42,8 +42,8 @@ from audio2wave import (
     GUI_MUTED_FG, GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
 from audio2wave_live import (
-    Tooltip, find_window_position, list_audio_devices, primary_screen_size, require_tools,
-    secondary_monitor_rect, target_monitor_rect,
+    Tooltip, confirm_dialog, find_window_position, list_audio_devices, primary_screen_size,
+    require_tools, secondary_monitor_rect, target_monitor_rect,
 )
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
@@ -186,7 +186,10 @@ AUTOMATE_DEFAULT_PERIOD_S = 10.0  # duree par defaut d'un cycle complet, avant r
 # erreur (justement a cause de l'inversion), une fois la direction corrigee la
 # valeur la plus rapide n'a plus besoin d'etre aussi extreme.
 AUTOMATE_PERIOD_MIN_S = 3.0
-AUTOMATE_PERIOD_MAX_S = 40.0
+# 400 s (~6,5 min), 10x plus lent que le plafond precedent (40 s) -- demande
+# explicite ("permet aux courbes d'automation d'avoir une vitesse de
+# variation 10 fois plus lente encore").
+AUTOMATE_PERIOD_MAX_S = 400.0
 AUTOMATE_CANVAS_W = 220          # taille du petit editeur de courbe (Canvas), en pixels
 AUTOMATE_CANVAS_H = 90
 
@@ -274,6 +277,9 @@ CLUB_COLOR = "0x39c9ff"
 # la ligne de commande garde la priorite, y compris sur un preset. Les cles sont les
 # noms longs des options (avec des _), tels qu'argparse les stocke.
 PRESETS: dict[str, dict[str, object]] = {
+    # Aucune surcharge, non modifiable, charge par defaut a l'ouverture -- voir
+    # la meme entree dans audio2wave_live.py/audio2wave_ridge.py.
+    "default": {},
     # Contour anime en sinusoide plutot qu'en silhouette figee.
     "wave": dict(style="pencil", wave=WAVE_CYCLES),
     # Plein ecran pour une projection: trait plus epais et couleur vive pour rester
@@ -324,12 +330,92 @@ def save_user_preset(name: str, overrides: dict) -> None:
         json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
+def delete_user_preset(name: str) -> bool:
+    """Retire un preset UTILISATEUR du JSON ; ne touche jamais PRESETS (le code)
+    -- un preset integre ne peut donc jamais etre "supprime", tout au plus une
+    version utilisateur qui le shadow (voir save_user_preset) peut l'etre, ce
+    qui fait simplement reapparaitre l'original. Renvoie `False` si `name`
+    n'est pas dans le JSON (rien a faire, pas une erreur)."""
+    presets = load_user_presets()
+    if name not in presets:
+        return False
+    del presets[name]
+    USER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_PRESETS_PATH.write_text(
+        json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    return True
+
+
 def all_presets() -> dict[str, dict]:
     """PRESETS integres + presets utilisateur, ces derniers prioritaires en cas de
     nom identique (l'utilisateur re-sauvegarde volontairement par-dessus)."""
     merged = dict(PRESETS)
     merged.update(load_user_presets())
     return merged
+
+
+def all_presets_all_modes() -> dict[str, dict]:
+    """Presets de snap (noms nus) + ceux de live/ridge (prefixes "live:"/"ridge:"
+    pour eviter toute ambiguite de nom) -- sert au Mode VJ, demande explicite
+    ("le mode vj doit prendre en compte les presets de tous les modes, pas
+    juste snap"). Import PARESSEUX (dans la fonction, pas en tete de fichier) :
+    audio2wave_ridge.py importe deja audio2wave_snap.py en tete de fichier, un
+    import en tete inverse ici creerait un cycle -- meme precaution que les
+    imports lies a la bascule de mode (voir handle_switch()/enter_gui()).
+
+    Les cles `style`/`shape` d'un preset ETRANGER (live) sont retirees avant
+    fusion : leurs valeurs valides la-bas (analyzer/radio, bar/line) n'ont
+    aucun sens pour les attributs DE MEME NOM cote snap (pencil/rekordbox/
+    simple) -- `apply_preset()` ne filtre que par PRESENCE de la cle dans
+    `controls`, pas par la VALIDITE de la valeur pour ce style-ci, donc les
+    laisser passer appliquerait une valeur incoherente a `args.style`/
+    `args.shape`. `ridge` n'a ni l'un ni l'autre (pas de --style/--shape la-bas),
+    rien a filtrer de son cote. Le reste (gain, colors, bg_color, fullscreen,
+    line_width...) partage un sens compatible d'un mode a l'autre, ou est de
+    toute facon absent de `controls` cote snap (`ridge_spacing`, `averaging`...)
+    et deja ignore silencieusement par `apply_preset` (voir sa docstring,
+    `skipped`). L'automation (`_automation`) d'un preset etranger est aussi
+    retiree : sa structure (attributs automatables propres a CE mode) n'a pas
+    de sens transposee telle quelle dans le systeme d'automation, distinct,
+    de snap.py.
+    """
+    import audio2wave_live
+    import audio2wave_ridge
+
+    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
+    merged = dict(all_presets())
+    for prefix, store in (("live", audio2wave_live.preset_store),
+                          ("ridge", audio2wave_ridge.preset_store)):
+        for name, overrides in store.all().items():
+            if name == "default":
+                continue  # deja present (vide) depuis snap, pas la peine de dupliquer
+            merged[f"{prefix}:{name}"] = {k: v for k, v in overrides.items()
+                                          if k not in UNSAFE_CROSS_MODE_KEYS}
+    return merged
+
+
+VJ_CATEGORIES = ("snap", "live", "ridge")
+
+
+def presets_for_category(category: str) -> dict[str, dict]:
+    """Presets d'UN SEUL mode, noms NUS (jamais prefixes) -- sert au Mode VJ
+    une fois la selection en deux temps (categorie puis preset, voir
+    open_vj_editor) : contrairement a `all_presets_all_modes()`, qui aplati
+    les trois modes dans un seul espace de noms prefixe `live:`/`ridge:` pour
+    un menu deroulant PLAT, ici chaque categorie garde ses noms tels quels --
+    c'est la selection de categorie elle-meme qui leve l'ambiguite, plus
+    besoin de prefixe. `style`/`shape`/`_automation` restent filtres pour
+    live/ridge (memes raisons que `all_presets_all_modes`, un preset la-bas
+    peut encore etre choisi et applique cote snap via le Mode VJ)."""
+    import audio2wave_live
+    import audio2wave_ridge
+
+    if category == "snap":
+        return dict(all_presets())
+    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
+    store = audio2wave_live.preset_store if category == "live" else audio2wave_ridge.preset_store
+    return {name: {k: v for k, v in overrides.items() if k not in UNSAFE_CROSS_MODE_KEYS}
+            for name, overrides in store.all().items()}
 
 
 # Enchainements du "Mode VJ" (voir build_gui) sauvegardes depuis --gui : meme
@@ -1128,15 +1214,23 @@ def resolve_gain(args: argparse.Namespace, pcm: bytes) -> tuple[float, float | N
     return -peak + AUTO_GAIN_MARGIN_DB, peak
 
 
-def amplitude_envelope(pcm: bytes, points: int, channels: int) -> list[float]:
+def amplitude_envelope(pcm: bytes, points: int, channels: int,
+                       samples: "array.array | None" = None) -> list[float]:
     """Contour de l'amplitude: la crete de chaque tranche, ramenee entre 0 et 1.
 
     C'est volontairement grossier: quelques dizaines de tranches sur toute la fenetre,
     la ou une waveform classique en dessine une par pixel. On cherche la silhouette,
     pas la forme d'onde.
+
+    `samples` (optionnel) : le PCM DEJA converti en `array.array("h")` -- evite de
+    reparser `pcm` si l'appelant l'a deja fait pour un autre usage (voir
+    render_pencil, qui partage le meme parse avec energy_envelope/detect_kicks
+    quand --kick-glow est actif). `None` (defaut) : parse `pcm` normalement, comme
+    avant.
     """
-    samples = array.array("h")
-    samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    if samples is None:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
     frames = len(samples) // channels
     if frames < 1:
         return [0.0] * points
@@ -1166,16 +1260,20 @@ def blend_color(a: bytes, b: bytes, t: float) -> bytes:
     return bytes(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
-def energy_envelope(pcm: bytes, slices: int, channels: int) -> list[float]:
+def energy_envelope(pcm: bytes, slices: int, channels: int,
+                    samples: "array.array | None" = None) -> list[float]:
     """RMS par tranche, normalise 0..1 -- pas la crete (voir amplitude_envelope,
     destinee au contour visuel). Sert a detect_kicks: sur un mix deja limite pres
     du plafond numerique (loudness war, courant en club/DJ), la CRETE d'un kick ne
     bouge presque plus (le plafond est deja atteint en permanence) alors que
     l'energie RMS, elle, continue de monter nettement -- verifie en pratique, voir
     detect_kicks.
+
+    `samples` (optionnel) : voir amplitude_envelope, meme mecanique de partage.
     """
-    samples = array.array("h")
-    samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    if samples is None:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
     frames = len(samples) // channels
     if frames < 1:
         return [0.0] * slices
@@ -1189,9 +1287,13 @@ def energy_envelope(pcm: bytes, slices: int, channels: int) -> list[float]:
     return out
 
 
-def detect_kicks(pcm: bytes, channels: int, rate: int, width: int) -> list[int]:
+def detect_kicks(pcm: bytes, channels: int, rate: int, width: int,
+                 samples: "array.array | None" = None) -> list[int]:
     """Colonnes (position en pixels, 0..width-1) ou une attaque franche a ete
     detectee, pour le halo de --kick-glow.
+
+    `samples` (optionnel) : voir amplitude_envelope, meme mecanique de partage
+    (transmis tel quel a energy_envelope()).
 
     Detecteur simple et volontairement approximatif -- pas une isolation des
     basses par un filtre passe-bas, que ce projet stdlib-seulement n'a de toute
@@ -1217,7 +1319,7 @@ def detect_kicks(pcm: bytes, channels: int, rate: int, width: int) -> list[int]:
     frames = len(pcm) // (SAMPLE_BYTES * channels)
     duration_s = frames / rate if rate else 0.0
     slices = max(8, round(duration_s * 1000 / KICK_ANALYSIS_MS)) if duration_s > 0 else 8
-    energy = energy_envelope(pcm, slices, channels)
+    energy = energy_envelope(pcm, slices, channels, samples=samples)
     n = len(energy)
     if n < 3:
         return []
@@ -1264,7 +1366,8 @@ class LiveGlowMeter:
         return self.value
 
 
-def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int]
+def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple[int, int],
+                   samples: "array.array | None" = None
                    ) -> list[tuple[int, int, tuple[int, ...]]]:
     """Pour chaque colonne: (haut de l'enveloppe, bas de l'enveloppe, hauteurs a encrer).
 
@@ -1274,9 +1377,11 @@ def pencil_heights(args: argparse.Namespace, pcm: bytes, gain: float, size: tupl
     ses deux bornes — la video occupe alors toute la bande, la ligne ondule dedans.
     Calcule a part du dessin parce qu'avec --video il faut repeindre les memes colonnes
     a chaque pas du trace progressif, sans refaire l'enveloppe.
+
+    `samples` (optionnel) : voir amplitude_envelope, meme mecanique de partage.
     """
     width, height = size
-    env = amplitude_envelope(pcm, resolve_points(args, width), channel_count(args))
+    env = amplitude_envelope(pcm, resolve_points(args, width), channel_count(args), samples=samples)
     factor = 10 ** (gain / 20)
     thickness = max(1, args.line_width)
     center = (height - thickness) / 2
@@ -1370,6 +1475,13 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
     """
     width, height = size
     stride = width * 3
+    # Precalcule une seule fois (hors boucle par colonne) les 3 tranches
+    # "fond sur toute la hauteur" : `height` est invariant sur tout l'appel,
+    # recalculer bytes([background[c]]) * height a chaque colonne (potentiellement
+    # `width` fois par photo, et de nouveau a chaque colonne fraichement revelee
+    # du balayage progressif) n'etait qu'une allocation redondante -- la meme
+    # valeur, juste reconstruite en boucle.
+    bg_col = [bytes([background[c]]) * height for c in range(3)] if full else None
     for x in range(start, end):
         env_top, env_bottom, heights = columns[x]
         prev_top, prev_bottom, previous = columns[x - 1] if x > 0 else columns[x]
@@ -1379,8 +1491,7 @@ def paint_pencil_columns(canvas: bytearray, size: tuple[int, int],
         if full:
             col0 = x * 3
             for c in range(3):
-                canvas[col0 + c:col0 + c + height * stride:stride] = \
-                    bytes([background[c]]) * height
+                canvas[col0 + c:col0 + c + height * stride:stride] = bg_col[c]
 
         if video is not None:
             rows = bottom - top + 1
@@ -1456,8 +1567,14 @@ def compose_pencil(size: tuple[int, int], columns: list[tuple[int, ...]], backgr
     """
     width, height = size
     canvas = bytearray(background * (width * height))
+    # full=False : le canevas est DEJA rempli du fond juste au-dessus (une seule
+    # allocation `background * (width*height)`), repeindre chaque colonne sur
+    # toute sa hauteur serait un second passage O(width*height) integralement
+    # redondant -- utile seulement pour re-reveler une colonne par-dessus les
+    # restes d'une photo PRECEDENTE (voir draw_progressively/le balayage
+    # progressif dans run()), pas ici ou canvas vient d'etre cree tout neuf.
     paint_pencil_columns(canvas, size, columns, background, ink, thickness, video, video_out,
-                         0, width, draw_ink=draw_ink, kicks=kicks,
+                         0, width, full=False, draw_ink=draw_ink, kicks=kicks,
                          kick_glow_radius=kick_glow_radius, live_glow=live_glow)
     return bytes(canvas)
 
@@ -1471,8 +1588,20 @@ def render_pencil(args: argparse.Namespace, pcm: bytes, gain: float, size: tuple
     silhouette, showwaves trace la forme d'onde elle-meme. Le trait est donc rasterise
     ici, ce qui coute d'ailleurs bien moins cher qu'un ffmpeg par photo.
     """
-    columns = pencil_heights(args, pcm, gain, size)
-    kicks = (detect_kicks(pcm, channel_count(args), capture_rate(args), size[0])
+    # Analyse le PCM en echantillons signes UNE SEULE FOIS quand --kick-glow
+    # est actif : pencil_heights()/amplitude_envelope() ET detect_kicks()/
+    # energy_envelope() en ont chacun besoin, independamment -- sans ce
+    # partage, deux array.array("h")+frombytes() separes reparsent le MEME
+    # buffer PCM (un O(len(pcm)) integralement redondant a chaque photo).
+    # `None` si --kick-glow est desactive : seul pencil_heights() en a alors
+    # besoin, rien a partager.
+    channels = channel_count(args)
+    samples = None
+    if args.kick_glow:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % (SAMPLE_BYTES * channels)])
+    columns = pencil_heights(args, pcm, gain, size, samples=samples)
+    kicks = (detect_kicks(pcm, channels, capture_rate(args), size[0], samples=samples)
              if args.kick_glow else None)
     return compose_pencil(size, columns, background, ink, max(1, args.line_width), video,
                           video_out, kicks=kicks, kick_glow_radius=args.kick_glow_size)
@@ -1922,6 +2051,15 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         for name in names:
             menu.add_command(label=name, command=lambda n=name: on_device_change(n))
         status["text"] = f"{len(names)} entree(s) audio detectee(s)"
+        # Selectionne le premier peripherique dispo par defaut si aucun n'est
+        # deja choisi -- demande explicite ("par defaut selectionne le premier
+        # device dispo dans la liste") : sans -d en ligne de commande, la
+        # fenetre s'ouvrait sur un menu deja peuple mais VIDE (NoDeviceCapture,
+        # voir plus bas), obligeant un premier clic manuel avant de voir quoi
+        # que ce soit. Ne touche jamais une entree DEJA choisie (par -d ou par
+        # l'utilisateur), et ne fait rien si la liste est vide (rien a choisir).
+        if not args.device and names:
+            on_device_change(names[0])
 
     tk.Button(device_frame, text="Actualiser", command=refresh_devices,
              ).pack(side="left", padx=(8, 0))
@@ -2806,7 +2944,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             apply_automation(automation_data)
         return skipped
 
-    preset_var = tk.StringVar(value="")
+    # "default" par defaut a l'ouverture, sauf --preset explicite -- demande
+    # explicite ("par defaut, un mode doit s'ouvrir sur le preset 'default'").
+    preset_var = tk.StringVar(value=args.preset or "default")
     r = next_shared_row()
     tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     preset_frame = tk.Frame(root)
@@ -2887,6 +3027,13 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         if not name:
             status["text"] = "aucun preset selectionne"
             return
+        if name == "default":
+            # "default" reste TOUJOURS les reglages argparse tels quels --
+            # demande explicite qu'il soit "non modifiable", a la difference
+            # des autres presets integres juste au-dessus (qui peuvent, eux,
+            # etre "mis a jour").
+            status["text"] = "'default' n'est pas modifiable"
+            return
         save_user_preset(name, capture_overrides())
         text = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
         if name in PRESETS:
@@ -2894,6 +3041,31 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         status["text"] = text
 
     tk.Button(preset_frame, text="Mettre a jour", command=on_update_preset,
+             ).pack(side="left", padx=(8, 0))
+
+    def on_delete_preset() -> None:
+        name = preset_var.get()
+        if not name:
+            status["text"] = "aucun preset selectionne"
+            return
+        if name not in load_user_presets():
+            # Couvre "default" et tout preset integre jamais "mis a jour"
+            # (donc jamais present dans le JSON utilisateur) -- rien a
+            # supprimer, PRESETS (le code) n'est jamais touche par ce bouton.
+            status["text"] = f"'{name}' est un preset integre, impossible a supprimer"
+            return
+
+        def do_delete() -> None:
+            delete_user_preset(name)
+            refresh_preset_menu()
+            refresh_vj_preset_menu()  # le preset supprime doit aussi disparaitre de la liste VJ
+            status["text"] = f"preset '{name}' supprime"
+
+        confirm_dialog(root, "Supprimer le preset",
+                       f"Supprimer definitivement le preset '{name}' ?\n"
+                       "Cette action est irreversible.", do_delete)
+
+    tk.Button(preset_frame, text="Supprimer", command=on_delete_preset,
              ).pack(side="left", padx=(8, 0))
 
     save_name_var = tk.StringVar(value="")
@@ -2955,6 +3127,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     vj_state: dict = {
         "entries": [], "running": False, "start": 0.0, "current": -1,
         "editor": None, "listbox": None, "next_label": None, "toggle_btn": None,
+        "category_var": None, "category_menu": None,
         "preset_var": None, "duration_var": None, "menu": None,
         "setlist_var": None, "setlist_menu": None, "save_setlist_name_var": None,
     }
@@ -3024,17 +3197,43 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         status["text"] = f"VJ: enchainement '{name}' mis a jour ({VJ_SETLISTS_PATH})"
 
     def refresh_vj_preset_menu() -> None:
+        # Presets de la CATEGORIE actuellement selectionnee (menu "Ajouter"),
+        # noms nus -- demande explicite ("un premier select permet de choisir
+        # la categorie snap, live ou ridge, ... un deuxieme select des
+        # presets correspondants s'ouvre... les prefixes live:/ridge:
+        # deviennent donc inutiles"), remplace l'ancien menu PLAT
+        # (all_presets_all_modes(), noms prefixes). Reappelee aussi bien apres
+        # un changement de categorie qu'apres une sauvegarde/suppression de
+        # preset snap (les deux seuls appelants existants, voir plus bas),
+        # donc doit toujours relire la categorie courante plutot que de la
+        # recevoir en parametre.
         menu_widget = vj_state["menu"]
         preset_var = vj_state["preset_var"]
-        if menu_widget is None or preset_var is None:
+        category_var = vj_state["category_var"]
+        if menu_widget is None or preset_var is None or category_var is None:
             return
-        names = sorted(all_presets())
+        names = sorted(presets_for_category(category_var.get()))
         menu = menu_widget["menu"]
         menu.delete(0, "end")
         for name in names:
             menu.add_command(label=name, command=lambda n=name: preset_var.set(n))
         if names and preset_var.get() not in names:
             preset_var.set(names[0])
+        elif not names:
+            preset_var.set("")
+
+    def refresh_vj_category_menu() -> None:
+        menu_widget = vj_state["category_menu"]
+        category_var = vj_state["category_var"]
+        if menu_widget is None or category_var is None:
+            return
+        menu = menu_widget["menu"]
+        menu.delete(0, "end")
+        for name in VJ_CATEGORIES:
+            def on_pick(n: str = name) -> None:
+                category_var.set(n)
+                refresh_vj_preset_menu()
+            menu.add_command(label=name, command=on_pick)
 
     def refresh_vj_listbox() -> None:
         listbox = vj_state["listbox"]
@@ -3059,12 +3258,20 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     def vj_add_entry() -> None:
         preset_var = vj_state["preset_var"]
         duration_var = vj_state["duration_var"]
-        if preset_var is None or duration_var is None:
+        category_var = vj_state["category_var"]
+        if preset_var is None or duration_var is None or category_var is None:
             return
-        name = preset_var.get()
-        if not name:
+        bare_name = preset_var.get()
+        if not bare_name:
             status["text"] = "VJ: aucun preset a ajouter (sauvegarde/charge au moins un preset)"
             return
+        category = category_var.get()
+        # Stockage interne inchange (nom prefixe "live:"/"ridge:", nu pour
+        # "snap") : c'est ce que vj_tick()/all_presets_all_modes() savent deja
+        # lire, et ce que les enchainements deja sauvegardes contiennent --
+        # seule la SELECTION dans l'editeur devient categorie+preset,
+        # composer le prefixe ici evite de toucher au reste du mecanisme.
+        name = bare_name if category == "snap" else f"{category}:{bare_name}"
         try:
             minutes = float(duration_var.get().strip().replace(",", "."))
         except ValueError:
@@ -3173,6 +3380,14 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         add_frame = tk.Frame(win, bg=GUI_PANEL_BG)
         add_frame.pack(fill="x", padx=14, pady=(14, 8))
         tk.Label(add_frame, text="Ajouter :", bg=GUI_PANEL_BG).pack(side="left")
+        # Selection en DEUX temps -- categorie (snap/live/ridge) puis preset
+        # de cette categorie, noms nus -- demande explicite, remplace l'ancien
+        # menu plat a noms prefixes "live:"/"ridge:" (voir refresh_vj_preset_
+        # menu/refresh_vj_category_menu plus haut pour le detail).
+        category_var = tk.StringVar(value="snap")
+        category_menu = tk.OptionMenu(add_frame, category_var, "")
+        style_option_menu(category_menu)
+        category_menu.pack(side="left", padx=(8, 0))
         preset_var = tk.StringVar(value="")
         menu = tk.OptionMenu(add_frame, preset_var, "")
         style_option_menu(menu)
@@ -3180,10 +3395,13 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         duration_var = tk.StringVar(value=str(VJ_DEFAULT_DURATION_MIN))
         tk.Entry(add_frame, textvariable=duration_var, width=5).pack(side="left", padx=(8, 0))
         tk.Label(add_frame, text="min", bg=GUI_PANEL_BG).pack(side="left", padx=(4, 0))
+        vj_state["category_var"] = category_var
+        vj_state["category_menu"] = category_menu
         vj_state["preset_var"] = preset_var
         vj_state["duration_var"] = duration_var
         vj_state["menu"] = menu
         tk.Button(add_frame, text="Ajouter", command=vj_add_entry).pack(side="left", padx=(8, 0))
+        refresh_vj_category_menu()
         refresh_vj_preset_menu()
 
         list_frame = tk.Frame(win, bg=GUI_PANEL_BG)
@@ -3221,6 +3439,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             vj_state["listbox"] = None
             vj_state["next_label"] = None
             vj_state["toggle_btn"] = None
+            vj_state["category_var"] = None
+            vj_state["category_menu"] = None
             vj_state["preset_var"] = None
             vj_state["duration_var"] = None
             vj_state["menu"] = None
@@ -3263,7 +3483,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                 if idx != vj_state["current"]:
                     vj_state["current"] = idx
                     entry = vj_state["entries"][idx]
-                    presets = all_presets()
+                    presets = all_presets_all_modes()
                     if entry["preset"] in presets:
                         skipped = apply_preset(presets[entry["preset"]])
                         text = (f"VJ: '{entry['preset']}' "
