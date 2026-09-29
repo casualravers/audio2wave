@@ -17,12 +17,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
-import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,8 +27,8 @@ from typing import Callable
 
 from audio2wave import (
     GUI_ACCENT, GUI_FG, GUI_FONT, GUI_FONT_HEADING, GUI_FONT_MONO, GUI_FONT_SMALL,
-    GUI_MUTED_FG, GUI_PANEL_BG, THEMES,
-    auto_win_size, compose_scene, gradient_source, parse_size, resolve_theme, style_gui,
+    GUI_MUTED_FG, GUI_PANEL_BG,
+    auto_win_size, parse_size, style_gui,
     style_option_menu,
 )
 from common import (
@@ -50,38 +47,6 @@ except ImportError:  # tkinter absent de certaines installations minimales de Py
 # Les deux styles sont a 40 dB d'ecart: une onde temporelle touche deja les bords
 # a crete normalisee, alors qu'une barre isolee reste loin du plafond.
 STYLE_BOOST_DB = {"analyzer": 18.0, "radio": -22.0}
-
-# --reactive: fait "respirer" --glow avec le niveau audio mesure, via des
-# redemarrages seamless espaces (voir run()/reactive_watcher) plutot qu'une
-# modulation continue -- le seul canal vraiment live que ffmpeg expose pour piloter
-# un filtre en cours de route (le filtre zmq) demande un client ZeroMQ, absent de
-# la stdlib Python (voir CLAUDE.md: pas de dependance ajoutee pour ce projet).
-REACTIVE_POLL_S = 0.3           # frequence de lecture du niveau mesure
-# REACTIVE_SMOOTH=5 (1.5 s de fenetre) laissait un seul coup fort (un kick, une
-# attaque isolee) suffire a deplacer la moyenne au-dela de REACTIVE_GLOW_DELTA et
-# declencher un redemarrage -- observe en usage reel: la fenetre "se rouvre" (le
-# redemarrage, meme "seamless", reste visible) au moindre changement soudain, pas
-# seulement sur un vrai changement d'ambiance sonore. 20 (6 s) fait qu'un coup bref
-# pese peu dans la moyenne glissante: il faut un changement de niveau SOUTENU
-# (un couplet qui monte, pas une seule caisse claire) pour deplacer assez la
-# moyenne et justifier un redemarrage.
-REACTIVE_SMOOTH = 20            # nombre de lectures moyennees avant de decider
-REACTIVE_MIN_INTERVAL_S = 4.0   # delai minimal entre deux redemarrages: chacun
-                                 # rouvre le peripherique audio (risque de conflit
-                                 # d'acces exclusif sur certains pilotes
-                                 # DirectShow si trop frequent) et reste visible
-                                 # (voir REACTIVE_SMOOTH) meme "seamless" -- mieux
-                                 # vaut un ajustement rare et delibere que frequent
-REACTIVE_FLOOR_DB = -50.0       # RMS mesure (avant --gain) mappee a glow minimal
-REACTIVE_CEIL_DB = -15.0        # RMS mesure mappee a glow maximal -- comme --gain,
-                                 # depend du peripherique: a ajuster a l'oreille/a
-                                 # l'oeil si le halo reste toujours au plancher ou
-                                 # au plafond
-REACTIVE_GLOW_MIN = 1.0
-REACTIVE_GLOW_MAX = 14.0
-REACTIVE_GLOW_DELTA = 2.0       # variation minimale de glow pour justifier un
-                                 # redemarrage (evite de redemarrer pour du bruit)
-RMS_RE = re.compile(r"lavfi\.astats\.Overall\.RMS_level=(-?\d+(?:\.\d+)?)")
 
 # Gain par defaut, faute de pouvoir mesurer un flux live a l'avance. Cale sur une
 # entree ligne classique (crete vers -12 dBFS); --tune donne la valeur exacte.
@@ -135,22 +100,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bg-color", default="black",
                     help="Couleur du fond, independante de --colors. Accepte un nom (white, navy) "
                          "ou un code 0xRRGGBB (defaut: black)")
-    p.add_argument("--theme", choices=["flat"] + sorted(THEMES), default="flat",
-                    help="Ambiance: fond en degrade anime, halo lumineux et teinte du trace qui "
-                         "derive lentement. flat = fond uni --bg-color (defaut: flat)")
-    p.add_argument("--glow", type=float, default=None,
-                    help="Rayon du halo lumineux autour du trace. 0 desactive. C'est l'effet le "
-                         "plus couteux: a baisser en premier si l'affichage saccade "
-                         "(defaut: selon le theme)")
-    p.add_argument("--hue-cycle", type=float, default=None,
-                    help="Derive de la teinte du trace, en degres par seconde. 0 desactive. Sans "
-                         "effet sur un trace blanc, qui n'a pas de teinte a tourner "
-                         "(defaut: selon le theme)")
-    p.add_argument("--reactive", action="store_true",
-                    help="Fait varier --glow avec le niveau audio mesure, par redemarrages "
-                         "seamless espaces de quelques secondes (pas une modulation continue: "
-                         "voir CLAUDE.md). Ecrase toute valeur de --glow donnee sur la ligne de "
-                         "commande des la premiere mesure")
     p.add_argument("--bars", type=int, default=None,
                     help="Nombre de barres/points. Moins = moins de calcul "
                          "(defaut: 128 en analyzer, 240 en radio)")
@@ -194,8 +143,8 @@ def parse_args() -> argparse.Namespace:
                          "--no-fullscreen pour une fenetre normale)")
     p.add_argument("--gui", action="store_true",
                     help="Ouvre une petite fenetre de reglages (tkinter) pour le style, la "
-                         "forme, les couleurs, les barres, le gain, le lissage, le stereo et "
-                         "l'ambiance. Contrairement a audio2wave_snap.py/audio2wave_ridge.py, "
+                         "forme, les couleurs, les barres, le gain, le lissage et le stereo. "
+                         "Contrairement a audio2wave_snap.py/audio2wave_ridge.py, "
                          "chaque reglage change RELANCE le flux audio (ce script n'a pas de "
                          "boucle Python par image a modifier en direct) -- la fenetre video "
                          "elle-meme ne bouge pas, sauf changement de taille/plein ecran, voir "
@@ -217,19 +166,6 @@ def parse_args() -> argparse.Namespace:
         p.set_defaults(**preset_store.all()[args.preset])
         args = p.parse_args()
 
-    # Fixe UNE FOIS pour toute la session (jamais regenere par un redemarrage
-    # "doux" ou "dur" -- voir build_filter()/gradient_source() dans
-    # audio2wave.py) : sans ca, `gradients` (le fond anime d'un --theme, sauf
-    # "flat") tire une TOUTE NOUVELLE orientation aleatoire a chaque nouveau
-    # process ffmpeg (confirme par mesure directe : deux lancements ffmpeg
-    # identiques produisent des premieres images differentes sans seed fixe),
-    # ce qui se voyait comme un "saut" du fond a chaque reglage change --
-    # signale par l'utilisateur en usage reel ("quand je bouge des params, "
-    # "cela peut faire se decaler verticalement le pattern"). N'est PAS un
-    # argument CLI : un nombre different a chaque lancement de audio2wave_live.py
-    # garde une variete d'un lancement a l'autre, seuls les redemarrages internes
-    # (memes `args`, meme session) doivent rester stables.
-    args.gradient_seed = random.randint(0, 2**31 - 1)
     return args
 
 
@@ -349,33 +285,19 @@ def build_filter(args: argparse.Namespace) -> str:
         thickness = max(1, round(width / bars * args.bar_gap))
         chain.append(f"drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black")
 
-    theme = resolve_theme(args)
     trace = "[0:a]" + ",".join(chain)
     plain_black = args.bg_color.lower() in ("black", "0x000000", "#000000")
 
-    if args.theme == "flat" and plain_black and not theme["glow"] and not theme["hue"]:
+    if plain_black:
         # Le noir est deja ce qu'on obtient sans rien faire: le fond des filtres est
         # transparent, et la conversion en rgb24 pour l'affichage le rend noir.
         return trace + "[v]"
 
-    if theme["hue"]:
-        # Le noir n'ayant pas de teinte, la rotation le laisse intact et le detourage
-        # qui suit continue de fonctionner.
-        trace += f",hue=h='t*{theme['hue']}'"
     # Detoure le noir (fond des filtres et separateurs entre barres) pour que le fond
     # apparaisse a la place. overlay respecte l'alpha, donc le trace garde sa couleur.
     trace += ",format=rgba,colorkey=0x000000:0.03:0.15"
-
-    if args.theme != "flat":
-        # `args.gradient_seed` (fixe une fois pour toute la session, voir
-        # parse_args()) maintient l'orientation du degrade STABLE a travers
-        # les redemarrages internes -- voir la docstring de gradient_source()
-        # dans audio2wave.py pour la mesure qui confirme le bug sans ca.
-        background = gradient_source(theme, width, height, args.fps, seed=args.gradient_seed)
-    else:
-        background = f"color=s={width}x{height}:c={args.bg_color}:r={args.fps}"
-
-    return compose_scene(trace, background, theme["glow"], width, height)
+    background = f"color=s={width}x{height}:c={args.bg_color}:r={args.fps}"
+    return f"{trace}[t];{background}[bg];[bg][t]overlay=shortest=1[v]"
 
 
 def describe_mode(args: argparse.Namespace) -> str:
@@ -426,51 +348,8 @@ def producer_warmup_seconds(args: argparse.Namespace) -> float:
     return args.buffer / 1000 + win_size / rate + args.averaging / max(args.fps, 1)
 
 
-def add_reactive_metering(filter_graph: str, level_filename: str) -> str:
-    """Ajoute une derivation de mesure de niveau au graphe de `build_filter()`, pour
-    --reactive.
-
-    `asplit` scinde `[0:a]` en deux avant que la chaine d'origine ne s'en empare :
-    une copie continue vers elle inchangee (`[a_main]`, en remplacement du `[0:a]`
-    d'origine), l'autre (`[a_reactive]`) traverse `astats`/`ametadata=print` puis se
-    termine sur `anullsink` (aucune sortie mappee n'en depend, elle ne sert qu'a son
-    effet de bord : ecrire le RMS courant dans un fichier). Scinder plutot
-    qu'inserer au milieu de la chaine d'origine evite de dependre de sa structure
-    interne (partagee avec audio2wave.py, qui n'a pas besoin de ca) — modifier
-    build_filter() sans casser ce point d'insertion.
-
-    `file=-` (stdout) a ete teste et REJETE : dans un `-filter_complex` a plusieurs
-    branches, il ecrit sur le MEME stdout que le muxer rawvideo (confirme : le texte
-    se retrouve entrelace dans les octets de trame, flux video corrompu). Un fichier
-    est le seul point de sortie sûr ici, puisque stdout est deja pris par le flux
-    video et qu'il n'y a pas d'astats->filtre-video generique dans ffmpeg (l'audio
-    et la video sont des graphes de types differents, une valeur mesuree sur l'un ne
-    s'injecte pas comme parametre d'un filtre sur l'autre sans repasser par un
-    controleur externe — zmq, voir plus haut).
-
-    `direct=1` est necessaire : sans lui, l'ecriture est bufferisee par la libc et
-    n'apparait dans le fichier qu'a la fermeture du process (mesure : sur un flux
-    ffmpeg cadence en temps reel via -re, aucune ligne visible avant la toute fin
-    sans `direct=1` ; avec, les lignes apparaissent au fur et a mesure). Chemin
-    RELATIF (juste le nom de fichier) : `spawn()` passe le dossier parent en `cwd`
-    du sous-processus plutot que d'ecrire un chemin absolu dans le graphe, pour
-    eviter le `:` du lecteur Windows (`C:\\...`) qui casse le parseur d'options de
-    filtre (un `:` y separe deux options) — teste, `\\:`/guillemets simples autour
-    de la valeur echouent aussi, un chemin relatif est la seule methode fiable.
-    """
-    return (
-        "[0:a]asplit=2[a_reactive][a_main];"
-        "[a_reactive]astats=metadata=1:reset=1,"
-        f"ametadata=print:key=lavfi.astats.Overall.RMS_level:file={level_filename}:direct=1,"
-        "anullsink;"
-        + filter_graph.replace("[0:a]", "[a_main]", 1)
-    )
-
-
-def producer_command(args: argparse.Namespace, level_path: Path | None = None) -> list[str]:
+def producer_command(args: argparse.Namespace) -> list[str]:
     filter_graph = build_filter(args)
-    if level_path is not None:
-        filter_graph = add_reactive_metering(filter_graph, level_path.name)
     return (
         ["ffmpeg", "-hide_banner", "-loglevel", "warning",
          "-fflags", "nobuffer", "-flags", "low_delay"]
@@ -525,30 +404,15 @@ def viewer_command(args: argparse.Namespace, width: int, height: int,
     return cmd
 
 
-def spawn_producer(args: argparse.Namespace, level_path: Path | None = None) -> subprocess.Popen:
+def spawn_producer(args: argparse.Namespace) -> subprocess.Popen:
     """Lance SEULEMENT le producteur (ffmpeg, rawvideo sur stdout), stdout relie a
     un pipe PYTHON plutot que directement a l'afficheur -- voir relay_loop()/run()
     pour le pourquoi : ca permet de remplacer le producteur (couleurs, gain,
     style, peripherique...) SANS jamais toucher a la fenetre ffplay deja
     ouverte, contrairement au tube direct `common.pipe_to_ffplay` utilise
     partout ailleurs dans ce depot.
-
-    `level_path`, fourni par run() quand --reactive est actif, est un nom de
-    fichier NEUF a chaque appel (voir run(): pas reutilise ni efface ici). Cote
-    appelant, effacer/recreer un meme chemin echouerait sur Windows tant que
-    l'ancien producteur (encore actif pendant le court chevauchement du
-    redemarrage) le tient encore ouvert en ecriture (WinError 32) —
-    contrairement a POSIX ou unlink() sur un fichier ouvert reste silencieux ;
-    c'est run() qui efface l'ancien fichier, une fois l'ancien producteur
-    confirme termine. `cwd` est fixe au dossier parent de `level_path` pour que
-    add_reactive_metering puisse s'en tenir a un nom de fichier relatif dans le
-    graphe de filtres (voir sa docstring : un chemin absolu Windows casse le
-    parseur d'options a cause du `:` du lecteur).
     """
-    return subprocess.Popen(
-        producer_command(args, level_path), stdout=subprocess.PIPE,
-        cwd=str(level_path.parent) if level_path is not None else None,
-    )
+    return subprocess.Popen(producer_command(args), stdout=subprocess.PIPE)
 
 
 def spawn_display(args: argparse.Namespace, width: int, height: int,
@@ -732,113 +596,6 @@ def wait_for_producer(producer: subprocess.Popen, args: argparse.Namespace,
     return producer.poll() is None and all(w.poll() is None for w in watched)
 
 
-def discard_level_file(level_path: Path) -> None:
-    """Efface un fichier de niveau --reactive au mieux, sans jamais lever.
-
-    Un `.wait()` deja passe sur le processus qui l'ecrivait ne suffit pas toujours
-    a garantir que Windows a deja relache le fichier au moment ou ce nettoyage
-    tourne (mesure : PermissionError/WinError 32 constate juste apres un
-    `source.wait()` confirme, vraisemblablement un antivirus ou un filtre systeme
-    qui garde la main un instant de plus). Ce sont des fichiers temporaires
-    seulement utiles pendant la session ; en laisser trainer un rarement n'est pas
-    grave, planter le fil de supervision pour ca le serait.
-    """
-    try:
-        level_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def read_reactive_level(level_state: dict, stop_event: threading.Event) -> None:
-    """Fil dedie a --reactive: relit `level_state["path"]` en continu (un "tail -f"
-    fait main), pour recuperer le RMS le plus recent ecrit par add_reactive_metering.
-
-    Chaque spawn() utilise un nom de fichier different (voir run()) plutot qu'un
-    seul reutilise: sur Windows, effacer/recreer un meme fichier alors que
-    l'ancien producteur (celui qu'on est en train de remplacer, encore actif
-    pendant le court chevauchement du redemarrage seamless) l'a encore ouvert en
-    ecriture leve WinError 32 ("fichier utilise par un autre processus") —
-    contrairement a POSIX ou unlink() sur un fichier ouvert reste silencieux. Un
-    fil unique pour toute la session (pas un par spawn) suit donc le chemin
-    COURANT via `level_state["path"]`, mis a jour par run() apres chaque
-    redemarrage reussi ; un changement de chemin remet la position de lecture a
-    zero (nouveau fichier, jamais lu).
-    """
-    current_path = None
-    pos = 0
-    while not stop_event.is_set():
-        time.sleep(REACTIVE_POLL_S)
-        path = level_state.get("path")
-        if path is None:
-            continue
-        if path != current_path:
-            current_path = path
-            pos = 0
-        if not current_path.exists():
-            continue
-        try:
-            with open(current_path, "r") as f:
-                size = f.seek(0, 2)
-                if size < pos:
-                    pos = 0
-                f.seek(pos)
-                text = f.read()
-                pos = f.tell()
-        except OSError:
-            continue
-        # La derniere valeur du lot suffit: read_reactive_level n'a besoin que du
-        # niveau "actuel", pas d'un historique complet.
-        for line in reversed(text.splitlines()):
-            m = RMS_RE.search(line)
-            if m:
-                level_state["rms"] = float(m.group(1))
-                break
-
-
-def reactive_watcher(args: argparse.Namespace, level_state: dict,
-                     restart_event: threading.Event, stop_event: threading.Event) -> None:
-    """Fait "respirer" args.glow avec le niveau mesure par read_reactive_level, en
-    declenchant le meme redemarrage "doux" qu'un reglage change dans le --gui (voir
-    run()). Pas de modulation continue: le seul canal vraiment live que ffmpeg
-    expose pour piloter un filtre en cours de route (le filtre zmq) demande un
-    client ZeroMQ absent de la stdlib Python — voir add_reactive_metering et
-    CLAUDE.md pour le detail de l'exploration.
-
-    `history`/REACTIVE_SMOOTH lissent le niveau mesure sur plusieurs secondes avant
-    de decider quoi que ce soit: sans une fenetre assez large, un seul pic isole
-    (une attaque breve, un kick) suffit a deplacer la moyenne et declenche un
-    redemarrage pour presque rien — observe en usage reel: la fenetre "se rouvre"
-    (le redemarrage reste visible, meme "seamless") au moindre changement soudain.
-    Avec REACTIVE_SMOOTH=20 (6 s a REACTIVE_POLL_S=0.3), un coup bref pese peu
-    dans la moyenne glissante: il faut un changement de niveau SOUTENU pour
-    justifier un redemarrage, pas une seule attaque. REACTIVE_MIN_INTERVAL_S
-    protege en plus contre des redemarrages trop frequents, chacun rouvrant le
-    peripherique audio ET restant visible.
-    """
-    history: list[float] = []
-    last_applied = REACTIVE_GLOW_MIN
-    last_restart = 0.0
-    while not stop_event.is_set():
-        time.sleep(REACTIVE_POLL_S)
-        rms = level_state.get("rms")
-        if rms is None:
-            continue
-        history.append(rms)
-        del history[:-REACTIVE_SMOOTH]
-        smoothed = sum(history) / len(history)
-        ratio = (smoothed - REACTIVE_FLOOR_DB) / (REACTIVE_CEIL_DB - REACTIVE_FLOOR_DB)
-        ratio = min(1.0, max(0.0, ratio))
-        target = round(REACTIVE_GLOW_MIN + ratio * (REACTIVE_GLOW_MAX - REACTIVE_GLOW_MIN), 1)
-
-        now = time.monotonic()
-        if (abs(target - last_applied) >= REACTIVE_GLOW_DELTA
-                and now - last_restart >= REACTIVE_MIN_INTERVAL_S):
-            args.glow = target
-            last_applied = target
-            last_restart = now
-            restart_event.set()
-
-
 def run(args: argparse.Namespace, width: int, height: int, status: dict,
        restart_event: threading.Event, stop_event: threading.Event,
        finished_event: threading.Event) -> None:
@@ -853,9 +610,9 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
     redemarrait TOUJOURS la paire complete producteur+afficheur, voir
     l'historique git) :
 
-    - **"Doux"** (le cas courant -- couleurs, gain, style, peripherique,
-      `--glow`/`--hue-cycle`, `--reactive`...) : seul le PRODUCTEUR (ffmpeg)
-      est remplace. L'AFFICHEUR (ffplay), deja ouvert, n'est jamais touche --
+    - **"Doux"** (le cas courant -- couleurs, gain, style, peripherique...) :
+      seul le PRODUCTEUR (ffmpeg) est remplace. L'AFFICHEUR (ffplay), deja
+      ouvert, n'est jamais touche --
       `relay_loop()` (fil dedie, demarre une fois pour toute la duree de
       run()) pompe en continu les octets du producteur ACTIF vers l'afficheur
       ACTIF, tous deux lus depuis `relay_state` ; remplacer le producteur ne
@@ -890,15 +647,6 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
     perdu), l'ancienne paire/le producteur precedent restent actifs et le
     probleme est signale, plutot que de tout perdre -- inchange par rapport a
     avant.
-
-    --reactive ajoute deux fils de fond (voir read_reactive_level/
-    reactive_watcher) qui appellent restart_event.set() de la meme facon que
-    schedule_apply()/apply() dans le --gui: ce sont deux sources possibles du meme
-    signal, run() ne fait pas la difference entre les deux -- et comme
-    --reactive ne touche jamais a la taille/au plein ecran, ses redemarrages
-    sont TOUJOURS "doux" desormais (l'ancienne version devait deja les
-    masquer de son mieux avec le mecanisme "dur" seamless ; ici la fenetre
-    n'est simplement plus concernee du tout).
     """
     relay_state: dict = {"producer": None, "display": None, "frame_size": None}
     threading.Thread(target=relay_loop, args=(relay_state, stop_event), daemon=True).start()
@@ -907,31 +655,16 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
     current_title = None
     current_size: tuple[int, int] | None = None
     current_fullscreen: bool | None = None
-    # Le fichier de niveau actuellement ecrit par le producteur ACTIF ; jamais
-    # celui d'un producteur pas encore confirme ou deja arrete (voir plus bas:
-    # efface uniquement une fois l'ancien producteur termine).
-    active_level_path = None
-    level_state = None
-    reactive_counter = 0
-    if args.reactive:
-        level_state = {"rms": None, "path": None}
-        threading.Thread(target=read_reactive_level, args=(level_state, stop_event),
-                         daemon=True).start()
-        threading.Thread(target=reactive_watcher,
-                         args=(args, level_state, restart_event, stop_event),
-                         daemon=True).start()
     try:
         while not stop_event.is_set():
             # Efface la demande qu'on s'appprete a traiter AVANT de lancer un
             # spawn, pas apres: sinon une nouvelle demande arrivee pendant le
-            # spawn/le delai de grace (un redemarrage --reactive automatique,
-            # en particulier: rien ne protege son declenchement comme le
-            # ferait le debounce de schedule_apply() sur un reglage change a
-            # la main) tombe dans la fenetre entre le succes du spawn et ce clear() et
-            # se retrouve effacee avant meme que la boucle interne ne l'ait
-            # vue passer a True -- perdue en silence, aucun redemarrage n'a
-            # lieu alors qu'un changement l'exigeait. Efface ici, en tete de
-            # boucle, rien ne l'efface plus jusqu'au prochain passage.
+            # spawn/le delai de grace tombe dans la fenetre entre le succes
+            # du spawn et ce clear() et se retrouve effacee avant meme que la
+            # boucle interne ne l'ait vue passer a True -- perdue en silence,
+            # aucun redemarrage n'a lieu alors qu'un changement l'exigeait.
+            # Efface ici, en tete de boucle, rien ne l'efface plus jusqu'au
+            # prochain passage.
             restart_event.clear()
             new_width, new_height = resolve_size(args)
             display_changed = (
@@ -939,15 +672,6 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                 or (new_width, new_height) != current_size
                 or args.fullscreen != current_fullscreen
             )
-            new_level_path = None
-            if args.reactive:
-                # Nom NEUF a chaque tentative (voir spawn_producer()/
-                # read_reactive_level): jamais le meme fichier que le
-                # producteur en cours, encore actif pendant le chevauchement.
-                reactive_counter += 1
-                new_level_path = (Path(tempfile.gettempdir())
-                                  / f"audio2wave_live_level_{os.getpid()}_{reactive_counter}.txt")
-
             if display_changed:
                 # Redemarrage "dur" : voir la docstring plus haut. Premier
                 # lancement (current_title encore None, aucune fenetre a
@@ -963,7 +687,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                 monitor = target_monitor_rect(current_title)
                 try:
                     new_display = spawn_display(args, new_width, new_height, position, monitor)
-                    new_producer = spawn_producer(args, new_level_path)
+                    new_producer = spawn_producer(args)
                 except OSError as exc:
                     status["text"] = f"echec du lancement: {exc}"
                     print(f"\nEchec du lancement: {exc}", file=sys.stderr)
@@ -972,11 +696,6 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                 if not wait_for_producer(new_producer, args, stop_event, new_display):
                     _terminate(new_producer)
                     _terminate(new_display)
-                    # Producteur jamais devenu actif: son fichier de niveau, si
-                    # present, n'a jamais ete lu par personne et peut partir
-                    # tout de suite.
-                    if new_level_path is not None:
-                        discard_level_file(new_level_path)
                     if display is None:
                         status["text"] = "echec du lancement"
                         break
@@ -1001,16 +720,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                         _terminate(old_producer)
                     if old_display is not None:
                         _terminate(old_display)
-                    # L'ancien producteur est confirme arrete: son fichier de
-                    # niveau peut maintenant etre efface (voir
-                    # discard_level_file: au mieux, Windows peut encore le
-                    # tenir un instant apres coup).
-                    if active_level_path is not None:
-                        discard_level_file(active_level_path)
                     producer, display = new_producer, new_display
-                    active_level_path = new_level_path
-                    if level_state is not None:
-                        level_state["path"] = new_level_path
                     current_size = (new_width, new_height)
                     current_fullscreen = args.fullscreen
                     current_title = window_title(args)
@@ -1022,7 +732,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                 # Redemarrage "doux" : voir la docstring plus haut. La fenetre
                 # ffplay DEJA OUVERTE (`display`) n'est jamais touchee.
                 try:
-                    new_producer = spawn_producer(args, new_level_path)
+                    new_producer = spawn_producer(args)
                 except OSError as exc:
                     status["text"] = f"echec du lancement: {exc}"
                     print(f"\nEchec du lancement: {exc}", file=sys.stderr)
@@ -1030,8 +740,6 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
 
                 if not wait_for_producer(new_producer, args, stop_event):
                     _terminate(new_producer)
-                    if new_level_path is not None:
-                        discard_level_file(new_level_path)
                     status["text"] = "echec du redemarrage, reglages precedents conserves"
                     print("\nEchec du redemarrage avec les nouveaux reglages: flux "
                           "precedent conserve.", file=sys.stderr)
@@ -1040,12 +748,7 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
                     relay_state["producer"] = new_producer
                     if old_producer is not None:
                         _terminate(old_producer)
-                    if active_level_path is not None:
-                        discard_level_file(active_level_path)
                     producer = new_producer
-                    active_level_path = new_level_path
-                    if level_state is not None:
-                        level_state["path"] = new_level_path
                     # Le titre affiche (mode/peripherique) ne peut pas etre
                     # repasse a un ffplay deja lance: mis a jour EN PLACE si
                     # besoin (voir set_window_title() dans common.py).
@@ -1072,8 +775,6 @@ def run(args: argparse.Namespace, width: int, height: int, status: dict,
             _terminate(producer)
         if display is not None:
             _terminate(display)
-        if active_level_path is not None:
-            discard_level_file(active_level_path)
         finished_event.set()
 
 
@@ -1118,6 +819,42 @@ class Tooltip:
             self.tip = None
 
 
+def confirm_dialog(parent: object, title: str, message: str, on_confirm: Callable[[], None]) -> None:
+    """Petite modale de confirmation (Toplevel), coherente avec le theme sombre
+    de style_gui plutot que la boite de dialogue OS de tkinter.messagebox (qui
+    ignore la palette posee par option_add). Sert a la suppression d'un preset
+    dans les trois fenetres --gui (demande explicite : "rend possible la
+    suppression d'un preset (avec modale de confirmation)") -- une action
+    destructive et sans annulation possible cote fichier, contrairement au
+    reste des reglages de cette fenetre.
+
+    `grab_set()` rend la modale bloquante (empeche toute interaction avec la
+    fenetre principale tant qu'elle est ouverte, sans quoi l'utilisateur
+    pourrait continuer a cliquer ailleurs et perdre le fil de ce qu'il est en
+    train de confirmer). `transient(parent)` la garde au-dessus de la fenetre
+    principale et la fait disparaitre avec elle. Meme motif que Tooltip
+    ci-dessus (pas dans common.py, exempt de tkinter) et meme raison d'etre
+    importee d'ici par audio2wave_snap.py/audio2wave_ridge.py plutot que
+    dupliquee.
+    """
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(parent)
+    win.grab_set()
+    tk.Label(win, text=message, justify="left", wraplength=280, padx=16, pady=16).pack()
+    row = tk.Frame(win)
+    row.pack(pady=(0, 14))
+
+    def confirm() -> None:
+        win.destroy()
+        on_confirm()
+
+    tk.Button(row, text="Annuler", command=win.destroy).pack(side="left", padx=6)
+    tk.Button(row, text="Supprimer", command=confirm).pack(side="left", padx=6)
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+
 # ---------------------------------------------------------------------------
 # Presets + automation de courbes, partages par les trois fenetres --gui --
 # demande explicite ("ajoute la possibilite d'avoir des presets et des
@@ -1140,7 +877,10 @@ AUTOMATE_CURVE_POINTS = 12       # points de controle par cycle, interpoles line
                                   # largeur d'image plutot qu'un cycle temporel)
 AUTOMATE_DEFAULT_PERIOD_S = 10.0
 AUTOMATE_PERIOD_MIN_S = 3.0
-AUTOMATE_PERIOD_MAX_S = 40.0
+# 400 s (~6,5 min), 10x plus lent que le plafond precedent (40 s) -- demande
+# explicite ("permet aux courbes d'automation d'avoir une vitesse de
+# variation 10 fois plus lente encore").
+AUTOMATE_PERIOD_MAX_S = 400.0
 AUTOMATE_CANVAS_W = 220
 AUTOMATE_CANVAS_H = 90
 
@@ -1199,6 +939,21 @@ class PresetStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
             json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+    def delete_user(self, name: str) -> bool:
+        """Retire un preset UTILISATEUR du JSON ; ne touche jamais `self.builtin`
+        (le code) -- un preset integre ne peut donc jamais etre "supprime", tout
+        au plus une version utilisateur qui le shadow (voir save_user) peut
+        l'etre, ce qui fait simplement reapparaitre l'original. Renvoie `False`
+        si `name` n'est pas dans le JSON (rien a faire, pas une erreur)."""
+        presets = self.load_user()
+        if name not in presets:
+            return False
+        del presets[name]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        return True
 
     def all(self) -> dict[str, dict]:
         merged = dict(self.builtin)
@@ -1449,8 +1204,13 @@ class AutomationManager:
 # collection exhaustive : "Sauvegarder sous" (voir build_gui) permet d'en
 # ajouter en quelques secondes depuis la fenetre.
 PRESETS: dict[str, dict[str, object]] = {
-    "club": dict(style="analyzer", shape="bar", theme="ember", gain=35.0, fullscreen=True),
-    "calme": dict(style="radio", shape="line", theme="ocean", gain=15.0),
+    # Aucune surcharge : reglages tels que argparse les fixe. Non modifiable
+    # (voir build_gui/on_update_preset) et charge par defaut a l'ouverture --
+    # demande explicite ("par defaut, un mode doit s'ouvrir sur le preset
+    # 'default' qui est non modifiable").
+    "default": {},
+    "club": dict(style="analyzer", shape="bar", gain=35.0, fullscreen=True),
+    "calme": dict(style="radio", shape="line", gain=15.0),
 }
 PRESET_ALIASES: dict[str, str] = {"c": "club"}
 USER_PRESETS_PATH = Path.home() / ".audio2wave" / "live_presets.json"
@@ -1520,8 +1280,8 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     # case -- quelle que soit la source du changement) plutot que sur un
     # `command=`/bind par widget: une seule ligne dans add_slider/add_entry/
     # add_dropdown couvre tout ce qui passe par ces trois fabriques, le reste
-    # (device/style/shape/stereo/theme/taille/plein ecran, construits a la
-    # main) est cable explicitement a sa creation.
+    # (device/style/shape/stereo/taille/plein ecran, construits a la main)
+    # est cable explicitement a sa creation.
     #
     # DEBOUNCE plutot qu'un redemarrage a chaque evenement : glisser un
     # curseur declenche des dizaines d'ecritures de variable par seconde, et
@@ -1765,29 +1525,6 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         controls[attr] = var.set
         return var
 
-    theme_var = tk.StringVar(value=args.theme)
-    r = next_row("left")
-    add_label("Ambiance", r, LEFT_LABEL_COL, tooltip="Preregle couleurs/halo/derive de teinte -- les "
-                                                     "toucher individuellement ci-dessous fige une "
-                                                     "valeur explicite.")
-    theme_menu = tk.OptionMenu(root, theme_var, "flat", *sorted(THEMES))
-    style_option_menu(theme_menu)
-    theme_menu.grid(row=r, column=LEFT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
-    theme_var.trace_add("write", schedule_apply)
-    controls["theme"] = theme_var.set
-
-    # --glow/--hue-cycle valent None par defaut (c'est alors le theme choisi qui
-    # fixe leur valeur, voir resolve_theme) : le curseur affiche la valeur deja
-    # resolue pour le theme courant, mais comme --bars ci-dessus, la toucher fige
-    # une valeur explicite dans args pour tous les Appliquer suivants, meme apres
-    # un changement de --theme. Automatables (`automatable=True`) : purement
-    # decoratifs, memes deux reglages mis en avant qu'audio2wave_snap.py pour
-    # la meme raison (une derive automatique y a un sens visuel direct).
-    resolved = resolve_theme(args)
-    glow_var = add_slider("Halo", "glow", 0, 15, 0.5, resolved["glow"], automatable=True)
-    hue_var = add_slider("Derive de teinte (deg/s)", "hue_cycle", -60, 60, 1, resolved["hue"],
-                         automatable=True)
-
     # ============================= PANNEAU DROIT ==============================
     add_section_title("right", "Spectre")
 
@@ -1870,9 +1607,6 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         args.freq_scale = freq_scale_var.get()
         args.amp_scale = amp_scale_var.get()
         args.stereo = stereo_var.get()
-        args.theme = theme_var.get()
-        args.glow = glow_var.get()
-        args.hue_cycle = hue_var.get()
         size_text = (width_var.get().strip(), height_var.get().strip())
         if size_text != untouched_size:
             try:
@@ -1965,7 +1699,10 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         elif names and preset_var.get() not in names:
             preset_var.set(names[0])
 
-    preset_var = tk.StringVar(value="")
+    # "default" (aucune surcharge) est la selection de depart, sauf si --preset
+    # a deja demande autre chose en ligne de commande -- demande explicite
+    # ("par defaut, un mode doit s'ouvrir sur le preset 'default'").
+    preset_var = tk.StringVar(value=args.preset or "default")
     r = next_shared_row()
     tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     preset_frame = tk.Frame(root)
@@ -1979,6 +1716,14 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         if not name:
             status["text"] = "aucun preset selectionne"
             return
+        if name == "default":
+            # "default" reste TOUJOURS les reglages argparse tels quels --
+            # demande explicite qu'il soit "non modifiable", contrairement aux
+            # autres presets integres (qui peuvent etre "mis a jour", voir
+            # juste en dessous : ca creerait une version utilisateur qui
+            # masque "default" pour toujours, brisant sa raison d'etre).
+            status["text"] = "'default' n'est pas modifiable"
+            return
         preset_store.save_user(name, capture_overrides())
         text = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
         if name in PRESETS:
@@ -1986,6 +1731,30 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         status["text"] = text
 
     tk.Button(preset_frame, text="Mettre a jour", command=on_update_preset,
+             ).pack(side="left", padx=(8, 0))
+
+    def on_delete_preset() -> None:
+        name = preset_var.get()
+        if not name:
+            status["text"] = "aucun preset selectionne"
+            return
+        if name not in preset_store.load_user():
+            # Couvre "default" et tout preset integre jamais "mis a jour" (donc
+            # jamais present dans le JSON utilisateur) -- rien a supprimer, le
+            # code en code n'est jamais touche par ce bouton.
+            status["text"] = f"'{name}' est un preset integre, impossible a supprimer"
+            return
+
+        def do_delete() -> None:
+            preset_store.delete_user(name)
+            refresh_preset_menu()
+            status["text"] = f"preset '{name}' supprime"
+
+        confirm_dialog(root, "Supprimer le preset",
+                       f"Supprimer definitivement le preset '{name}' ?\n"
+                       "Cette action est irreversible.", do_delete)
+
+    tk.Button(preset_frame, text="Supprimer", command=on_delete_preset,
              ).pack(side="left", padx=(8, 0))
 
     refresh_preset_menu()
@@ -2035,17 +1804,17 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     status_label.grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                       padx=ROW_PADX, pady=(10, 10))
 
-    # "Halo"/"Derive de teinte" avancent visuellement sur leur courbe a chaque
-    # tick (AUTOMATE_TICK_MS), exactement comme dans audio2wave_snap.py --
-    # mais a la difference de snap/ridge (une simple mutation d'attribut relue
-    # au rendu suivant), RIEN ici ne prend effet sans un redemarrage complet
-    # du pipeline (voir la docstring de cette fonction/de run()). Redemarrer a
-    # AUTOMATE_TICK_MS (50 ms) serait absurde (des dizaines de ffmpeg/ffplay
+    # Les curseurs automatables (Barres/points, Gain, Lissage, Espace entre
+    # barres) avancent visuellement sur leur courbe a chaque tick
+    # (AUTOMATE_TICK_MS), exactement comme dans audio2wave_snap.py -- mais a
+    # la difference de snap/ridge (une simple mutation d'attribut relue au
+    # rendu suivant), RIEN ici ne prend effet sans un redemarrage du
+    # producteur (voir la docstring de cette fonction/de run()). Redemarrer a
+    # AUTOMATE_TICK_MS (50 ms) serait absurde (des dizaines de ffmpeg
     # relances par seconde) -- `automation_restart_tick`, separee et bien plus
-    # lente, reutilise donc `restart_event` (le MEME mecanisme "seamless" que
-    # --reactive plus haut dans ce fichier: la nouvelle paire ffmpeg/ffplay
-    # est lancee avant que l'ancienne ne se ferme) a un rythme choisi pour
-    # rester discernable comme une derive lente plutot qu'un vrai temps reel.
+    # lente, reutilise donc `restart_event` (le MEME mecanisme que
+    # schedule_apply()) a un rythme choisi pour rester discernable comme une
+    # derive lente plutot qu'un vrai temps reel.
     AUTO_RESTART_INTERVAL_S = 2.0
 
     def automation_restart_tick() -> None:
@@ -2103,10 +1872,8 @@ def main() -> None:
     width, height = resolve_size(args)
 
     if args.dry_run:
-        dry_level_path = (Path(tempfile.gettempdir()) / "audio2wave_live_level_PID.txt"
-                          if args.reactive else None)
         print(" ".join(f'"{c}"' if " " in c else c
-                       for c in producer_command(args, dry_level_path)))
+                       for c in producer_command(args)))
         print("  |")
         print(" ".join(f'"{c}"' if " " in c else c for c in viewer_command(args, width, height)))
         return

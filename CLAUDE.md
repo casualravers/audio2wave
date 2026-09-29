@@ -71,14 +71,14 @@ resolution de chemins.
   **`--gui`** ne peut pas muter des attributs relus en direct comme les deux autres
   scripts : il n'y a pas de boucle Python par image ici pour le RENDU (deliberement,
   pour la latence). `run()` supervise donc un cycle spawn/attente/nettoyage et le
-  rejoue quand `restart_event` est positionne (clic sur "Appliquer" dans
-  `build_gui()`, ou `--reactive`/l'automation de courbes, voir plus bas).
+  rejoue quand `restart_event` est positionne (un reglage change dans
+  `build_gui()`, via `schedule_apply()`, ou l'automation de courbes, voir plus bas).
   **Deux natures de redemarrage, pas une seule** — c'est le point le plus important
   de ce script, ajoute apres coup suite a une question explicite de l'utilisateur
   ("n'est-il vraiment pas possible d'empecher la fermeture/reouverture de la fenetre
   ffplay lors des modifications de parametres du mode live ?") :
-  - **"Doux"** (le cas courant — couleurs, gain, style, peripherique, `--glow`/
-    `--hue-cycle`, `--reactive`...) : seul le PRODUCTEUR (`spawn_producer()`, ffmpeg
+  - **"Doux"** (le cas courant — couleurs, gain, style, peripherique...) :
+    seul le PRODUCTEUR (`spawn_producer()`, ffmpeg
     seul, stdout relie a un pipe Python) est remplace. L'AFFICHEUR (`spawn_display()`,
     ffplay seul, stdin relie a un pipe Python) n'est JAMAIS touche pour ce cas — sa
     fenetre ne clignote plus du tout.
@@ -188,98 +188,59 @@ resolution de chemins.
   pendant l'attente (pas un simple sleep), detecte une mort survenant EN
   COURS d'attente (pas seulement au tout debut), et s'interrompt
   immediatement si `stop_event` est deja positionne.
-  **Le fond anime d'un `--theme` (filtre `gradients`) "sautait" a chaque
-  redemarrage**, signale en usage reel juste apres le fix precedent
-  (alignement de frame) : "quand je bouge des params, cela peut faire se
-  decaler verticalement le pattern". Cause identifiee par mesure directe
-  (`ffmpeg -f lavfi gradients=...` lance deux fois avec les MEMES parametres,
-  hors de ce depot) : les options `x0`/`y0`/`x1`/`y1`/`seed` du filtre
-  valent `-1` (aleatoire) par defaut, donc CHAQUE nouveau process ffmpeg tire
-  une TOUTE NOUVELLE orientation de degrade -- confirme, deux lancements
-  identiques produisent des premieres images differentes (hash MD5 distincts).
-  Comme un redemarrage "doux" relance un process ffmpeg entier (voir plus
-  haut), le fond changeait donc d'orientation a CHAQUE reglage modifie --
-  invisible avant l'introduction du relais (la fenetre se rouvrait de toute
-  facon a chaque fois), devenu visible depuis qu'elle reste stable. Corrige
-  par `args.gradient_seed` (`parse_args()`, `random.randint(0, 2**31-1)`,
-  genere UNE FOIS par lancement/bascule de mode -- jamais regenere par un
-  redemarrage interne) transmis a `gradient_source()` (`audio2wave.py`,
-  parametre `seed` optionnel, `audio2wave_snap.py`/`ridge.py` ne l'utilisent
-  pas car ils n'ont pas ce probleme de redemarrage repete). Verifie par la
-  meme mesure directe qu'au diagnostic, avec `seed=` fixe cette fois : deux
-  lancements ffmpeg identiques produisent alors des premieres images
-  STRICTEMENT identiques (memes hash MD5).
-  **Tout parametre est exposable dans `build_gui()`**, a la difference de
+  **Ambiances (`--theme`/`--glow`/`--hue-cycle`) et `--reactive` retires
+  entierement**, demande explicite ("supprime les ambiances, ca donne une
+  vibe windows media player tres tres demodee"). Ce systeme (fond anime via
+  le filtre `gradients`, halo `gblur`, rotation `hue`, plus `--reactive` qui
+  faisait "respirer" le halo au niveau audio par redemarrages espaces) a ete
+  retire d'`audio2wave.py` ET `audio2wave_live.py` (seuls scripts a l'avoir
+  jamais eu -- `audio2wave_snap.py`/`audio2wave_ridge.py` ne l'ont jamais
+  importe). `THEMES`/`resolve_theme`/`gradient_source`/`compose_scene`
+  disparaissent ; `build_filter()` retombe sur le chemin "fond uni
+  `--bg-color`" deja existant (glow/hue valaient deja 0 par defaut, c'est
+  desormais le SEUL chemin). Emporte avec lui `add_reactive_metering`/
+  `read_reactive_level`/`reactive_watcher`/`discard_level_file` et le
+  parametre `level_path` de `spawn_producer()`/`producer_command()` (plus de
+  fichier de mesure RMS a ecrire/lire/nettoyer). Les deux curseurs
+  automatables "Halo"/"Derive de teinte" disparaissent de `--gui` ; les
+  quatre restants (Barres/points, Gain, Lissage, Espace entre barres, voir
+  plus bas "Presets + automation") suffisent desormais a couvrir "tous les
+  reglages numeriques de cette fenetre".
+  **A l'occasion, corrige aussi un leger decentrage vertical du rendu
+  `--style radio`** signale separement dans le meme message ("le mode live
+  avec l'option radio est legerement decentre verticalement") : mesure
+  directe (`ffmpeg -f lavfi` + une sinusoide de test, hors de ce depot) que
+  `showwaves` seul centre deja correctement son trace (a 0.5 px pres, pure
+  rondeur), mais l'ancien graphe passait TOUJOURS par la composition
+  glow/gradient meme a `--theme flat` par defaut des que `--bg-color` n'etait
+  pas noir -- ce chemin de composition disparaissant avec les ambiances, le
+  rendu retombe desormais sur le simple `overlay` deja utilise et verifie
+  centre.
+  **Tout parametre reste exposable dans `build_gui()`**, a la difference de
   `audio2wave_snap.py`/`audio2wave_ridge.py` : comme `apply()` redemarre tout le
   pipeline (rien n'est relu en direct par un `run()` par-image, voir ci-dessus), il
   n'y a pas de commande de capture ou de fenetre deja figee a proteger — la seule
-  limite est de ne pas surcharger la fenetre. `--glow`/`--hue-cycle` (halo et derive
-  de teinte de `--theme`), `--bar-gap` et `--freq-scale`/`--amp-scale` (forme du
-  spectre) sont ainsi exposes en plus du strict minimum initial. `--glow`/
-  `--hue-cycle` valent `None` par defaut (c'est alors `--theme` qui les fixe, voir
-  `resolve_theme`) : leurs curseurs affichent la valeur deja resolue pour le theme
-  courant a l'ouverture, mais comme `--bars` (valeur par defaut selon le style),
-  les toucher fige une valeur explicite dans `args` pour tous les "Appliquer"
-  suivants, y compris apres un changement de `--theme`.
-  **`--reactive`** fait "respirer" `--glow` avec le niveau audio mesure, par
-  redemarrages seamless automatiques (meme mecanisme que le bouton Appliquer,
-  voir plus haut) plutot que par une modulation continue. Exploration menee avant
-  d'ecrire le moindre code : ffmpeg n'expose qu'un seul canal pour piloter un
-  filtre (`gblur`) en cours de route sans redemarrer, le filtre `zmq` — confirme
-  fonctionnel (`sendcmd` scripte sur `gblur@nom`/`hue@nom`, la valeur moyenne des
-  pixels change exactement a l'image programmee) mais **le client ne peut venir
-  que de `pyzmq`, absent de la stdlib** (aucun `zmqsend` fourni avec ce build
-  ffmpeg Windows), ce qui violerait "stdlib seulement" en tete de ce document —
-  d'ou le choix du redemarrage plutot qu'un client ZMTP ecrit a la main.
-  Le niveau est mesure via `add_reactive_metering` : scinde `[0:a]` (`asplit`)
-  avant que `build_filter()` ne s'en empare, une derivation traverse
-  `astats=metadata=1,ametadata=print:...:direct=1` puis `anullsink`. Deux ecueils
-  mesures avant de se fixer sur cette forme : `file=-` (stdout) semblait ecrire
-  sur stderr dans un test isole (`-af` + `-f null -`), mais dans le vrai graphe a
-  plusieurs branches il ecrit sur le MEME stdout que le muxer rawvideo — confirme
-  en observant le texte entrelace dans les octets de trame, flux video corrompu ;
-  un fichier est donc la seule sortie sure. Et sans `direct=1`, l'ecriture reste
-  bufferisee par la libc et n'apparait qu'a la fermeture du processus (mesure via
-  `-re`, cadence temps reel : aucune ligne visible avant la toute fin sans
-  `direct=1`, incrementales avec). Chemin de fichier RELATIF uniquement (`cwd` du
-  sous-processus fixe a son dossier parent dans `spawn()`) : un chemin absolu
-  Windows (`C:\...`) casse le parseur d'options de filtre a cause du `:` du
-  lecteur — `\:` echappe et guillemets simples autour de la valeur testes,
-  echouent aussi.
-  **Chaque `spawn()` utilise un nom de fichier NEUF**, jamais reutilise : sur
-  Windows, effacer/recreer un meme fichier alors que l'ancien producteur (encore
-  actif pendant le court chevauchement du redemarrage seamless) le tient encore
-  ouvert leve `WinError 32` — contrairement a POSIX ou `unlink()` sur un fichier
-  ouvert reste silencieux. `read_reactive_level` (un seul fil pour toute la
-  session) suit donc le chemin COURANT via `level_state["path"]`, mis a jour par
-  `run()` apres chaque redemarrage reussi ; l'ancien fichier n'est efface qu'une
-  fois l'ancien producteur confirme termine (`wait()` deja passe). Meme ce
-  `wait()` ne garantit pas toujours que Windows a deja relache le fichier
-  (`PermissionError` constate malgre tout, vraisemblablement un antivirus/filtre
-  systeme qui garde la main un instant de plus) : `discard_level_file` avale
-  `OSError` plutot que de laisser une suppression best-effort planter tout le fil
-  de supervision pour un fichier temporaire sans consequence.
-  **Bug corrige, distinct de --reactive mais qui l'a rendu visible** : la
-  demande de redemarrage (`restart_event.set()`) etait effacee par un
+  limite est de ne pas surcharger la fenetre.
+  **`--reactive` a existe** (faisait "respirer" `--glow` avec le niveau audio
+  mesure, par redemarrages espaces) **avant d'etre retire avec le reste des
+  ambiances** (voir plus haut) : son exploration avait confirme que ffmpeg
+  n'expose qu'un seul canal pour piloter un filtre en cours de route sans
+  redemarrer (le filtre `zmq`), mais qu'un client ne peut venir que de
+  `pyzmq`, absent de la stdlib -- d'ou deja, a l'epoque, le choix d'un
+  redemarrage plutot qu'un client ZMTP ecrit a la main. Sans objet une fois
+  `--glow` lui-meme parti.
+  **Bug corrige (avant le retrait de --reactive, mais qui touchait
+  n'importe quelle source de redemarrage automatique)** : la demande de
+  redemarrage (`restart_event.set()`) etait effacee par un
   `restart_event.clear()` qui tournait juste APRES un spawn reussi. Un `set()`
   arrivant dans cette fenetre (le bouton Appliquer d'un humain n'y tombe presque
-  jamais, un fil automatique qui sonde toutes les REACTIVE_POLL_S si) etait perdu
-  en silence : aucun redemarrage n'avait lieu alors qu'un changement l'exigeait.
-  Deplace en tete de boucle, avant `spawn()` : rien n'efface plus la demande
-  jusqu'au prochain passage, un `set()` pendant le spawn/le delai de grace ou
-  pendant la boucle de service reste donc vu.
-  **`REACTIVE_SMOOTH` doit couvrir plusieurs secondes, pas juste quelques
-  lectures** : a 5 lectures (1,5 s a `REACTIVE_POLL_S=0.3`), un seul coup fort
-  isole (un kick, une attaque breve) suffisait a deplacer la moyenne glissante
-  au-dela de `REACTIVE_GLOW_DELTA` — observe en usage reel, la fenetre "se
-  rouvre" (le redemarrage reste visible, meme "seamless") au moindre changement
-  soudain, pas seulement sur un vrai changement d'ambiance. Passe a 20 lectures
-  (6 s) : un coup bref pese alors trop peu dans la moyenne pour a lui seul
-  franchir le seuil, il faut un changement de niveau SOUTENU (un couplet qui
-  monte, une transition) pour declencher un redemarrage. Verifie en isolant
-  l'algorithme de `reactive_watcher` d'un vrai ffmpeg (level_state pilote a la
-  main) : un pic d'une seule lecture ne redemarre rien, un changement plus long
-  que la fenetre de lissage si.
+  jamais, un fil automatique -- --reactive alors, schedule_apply()/l'automation
+  de courbes aujourd'hui -- si) etait perdu en silence : aucun redemarrage
+  n'avait lieu alors qu'un changement l'exigeait. Deplace en tete de boucle,
+  avant `spawn()` : rien n'efface plus la demande jusqu'au prochain passage,
+  un `set()` pendant le spawn/le delai de grace ou pendant la boucle de
+  service reste donc vu -- toujours vrai aujourd'hui, voir la docstring de
+  `run()`.
   **Plus de bouton "Appliquer"** — demande explicite ("enleve le bouton
   appliquer et applique les params automatiquement a la place"), une fois le
   relais/l'alignement de frame en place ayant rendu les redemarrages assez
@@ -521,6 +482,15 @@ resolution de chemins.
   stricte. Un `Tooltip` sur le label "Vitesse" precise desormais le sens
   ("droite = plus rapide, gauche = plus lent") : cette fenetre popup n'avait
   jusque-la aucune info-bulle, a la difference de la fenetre principale.
+  **`AUTOMATE_PERIOD_MAX_S` releve ensuite de 40 s a 400 s** (10x plus lent),
+  demande explicite ("permet aux courbes d'automation d'avoir une vitesse de
+  variation 10 fois plus lente encore") -- meme constante dans les deux
+  fichiers qui la definissent (`audio2wave_snap.py`, `audio2wave_live.py` ;
+  `audio2wave_ridge.py` reutilise celle de `audio2wave_live.py` via
+  `AutomationManager`). Le curseur garde `resolution=1` (secondes) sur cette
+  plage elargie, et `speed_value_label` continue d'afficher la valeur telle
+  quelle (`f"{periode:.0f} s/cycle"`), donc jusqu'a "400 s/cycle" sans
+  changement de format.
   **Bug corrige, distinct du precedent : le chiffre affiche par le `Scale`
   restait un nombre brut de secondes** (`showvalue=True`), lu comme incoherent
   malgre la direction desormais correcte et la tooltip juste au-dessus —
@@ -971,8 +941,7 @@ verification des outils (`require_tools`, `add_bundled_ffmpeg_to_path` — voir
 juste apres), et le socle des reglages `--gui`
 (`parse_size`, `auto_win_size`, `gain_value`, palette `GUI_*`, `style_gui`,
 `style_option_menu`). Extrait pour etre importable **sans** tirer la logique de
-rendu d'`audio2wave.py` (THEMES/compose_scene/gradient_source/resolve_theme
-restent la, propres au style visuel) — c'est ce point d'entree qu'importe
+rendu d'`audio2wave.py` — c'est ce point d'entree qu'importe
 `audioreactive-warp` (depot separe), qui a besoin de la capture et du tube mais
 pas du rendu de waveform.
 
@@ -1960,6 +1929,119 @@ un vrai `--video` choisi via le bouton "Parcourir..." (mock d'`askopenfilename`,
 meme mecanisme que le test de ce bouton) puis une sauvegarde de preset : le JSON
 ecrit contient bien une chaine, pas un objet illisible.
 
+### Preset "default" non modifiable, suppression avec confirmation, VJ multi-mode
+
+Trois demandes explicites du meme message, appliquees IDENTIQUEMENT aux trois
+scripts (`all_presets()`/`PresetStore`, selon le mecanisme propre a chacun) :
+
+**"Par defaut, un mode doit s'ouvrir sur le preset 'default' qui est non
+modifiable"** : `"default": {}` (aucune surcharge -- les reglages argparse
+tels quels) ajoute a `PRESETS` dans les trois fichiers, EN PREMIER (ordre
+d'affichage dans `--list-presets`/le menu **Charger**). `preset_var` (le
+`tk.StringVar` du menu **Charger**) s'initialise desormais a `args.preset or
+"default"` plutot qu'une chaine vide : si `--preset <nom>` a deja ete
+demande en ligne de commande, la fenetre l'affiche des l'ouverture (bonus) ;
+sinon "default" est deja selectionne, coherent avec le fait que `args` est
+DEJA aux valeurs par defaut a ce stade (pas de rechargement declenche,
+juste l'AFFICHAGE qui reflete l'etat reel). Un dict VIDE traverse
+`apply_preset()` sans rien faire (`for key, value in overrides.items()`
+n'itere sur rien) — "non modifiable" vient de `on_update_preset()`, qui
+refuse desormais explicitement `name == "default"` AVANT d'ecrire quoi que
+ce soit dans le JSON (message "'default' n'est pas modifiable"), a la
+difference des AUTRES presets integres (`club`, `wave`...) qui, eux,
+peuvent toujours etre "mis a jour" (shadow local, voir plus haut). **Sauvegarder
+sous** refuse deja tout nom present dans `PRESETS` (donc "default" aussi,
+sans changement necessaire la).
+
+**"Rend possible la suppression d'un preset (avec modale de confirmation)"** :
+`delete_user_preset(name)` (`audio2wave_snap.py`, fonction module-level) /
+`PresetStore.delete_user(name)` (`audio2wave_live.py`, reutilisee par
+`audio2wave_ridge.py`) retirent une entree du JSON UTILISATEUR et renvoient
+`False` si elle n'y est pas (rien a faire, jamais une erreur) — ne touchent
+JAMAIS `PRESETS` (le code) : un preset integre "supprime" reapparait tel
+quel, exactement comme "Mettre a jour" le shadow deja sans y toucher (meme
+logique, sens inverse). Le bouton **Supprimer** (a cote de **Mettre a
+jour**) refuse un nom absent du JSON utilisateur AVANT meme d'ouvrir la
+modale -- couvre a la fois "default" (jamais modifiable donc jamais dans le
+JSON) et tout preset integre jamais "mis a jour" localement, pas de
+verification separee necessaire pour "default" ici.
+**`confirm_dialog(parent, title, message, on_confirm)`** (nouvelle fonction
+dans `audio2wave_live.py`, a cote de `Tooltip` — meme raison de s'y trouver
+et d'y etre importee par les deux autres scripts) est une petite `Toplevel`
+avec le theme sombre de `style_gui` plutot que la boite de dialogue OS de
+`tkinter.messagebox` (qui ignore cette palette) : `grab_set()` la rend
+bloquante (empeche toute interaction avec la fenetre principale tant qu'elle
+est ouverte), `transient(parent)` la garde au-dessus et la fait disparaitre
+avec elle. Suppression IRREVERSIBLE cote fichier, d'ou la confirmation --
+premiere action destructive sans un "annuler en rechargeant" possible dans
+ces trois fenetres.
+**Bug de test decouvert en ecrivant la verification, pas un bug de code** :
+un premier test supposait que charger "club" donnerait toujours le preset
+INTEGRE (`style="analyzer"`) ; sur la machine de developpement, un "club"
+UTILISATEUR reel (sauvegarde lors d'un usage anterieur, avant ce changement,
+avec `style="radio"` et d'anciennes cles `theme`/`glow`/`hue_cycle` du
+systeme d'ambiance depuis retire) le masquait deja — comportement CORRECT du
+mecanisme de shadow (voir plus haut), le test avait juste une hypothese
+fausse sur l'etat du profil utilisateur. Corrige en isolant
+`preset_store.path`/`USER_PRESETS_PATH` vers un fichier temporaire pour la
+duree du test, plutot que de toucher au vrai profil `~/.audio2wave/` —
+lecon a retenir pour tout futur test qui clique "Mettre a jour"/"Sauvegarder
+sous"/"Supprimer" dans ces fenetres.
+
+**"Le mode vj doit prendre en compte les presets de tous les modes, pas
+juste snap"** : `all_presets_all_modes()` (`audio2wave_snap.py`, a cote
+d'`all_presets()`) fusionne les presets de snap (noms nus, inchange) avec
+ceux de `audio2wave_live.py`/`audio2wave_ridge.py` (leurs `preset_store`
+MODULE-level respectifs, deja exposes), **prefixes `live:`/`ridge:`** pour
+eviter toute ambiguite de nom (les trois scripts ont chacun un preset
+"default", fusionne UNE SEULE FOIS sans prefixe puisque son contenu -- vide
+-- est identique partout). Import PARESSEUX (dans la fonction, pas en tete
+de fichier) : `audio2wave_ridge.py` importe deja `audio2wave_snap.py` en
+tete de fichier, un import en tete inverse ici creerait un cycle -- meme
+precaution que les imports lies a la bascule de mode.
+**Les cles `style`/`shape` d'un preset ETRANGER (live) sont retirees avant
+fusion** : leurs valeurs valides la-bas (`analyzer`/`radio`, `bar`/`line`)
+n'ont aucun sens pour les attributs DE MEME NOM cote snap (`pencil`/
+`rekordbox`/`simple`) — `apply_preset()` ne filtre que par PRESENCE de la
+cle dans `controls`, pas par la VALIDITE de la valeur pour ce style-ci ;
+sans ce filtrage, charger `live:club` depuis le Mode VJ aurait pousse
+`args.style = "analyzer"` dans snap, une valeur qu'aucun de ses trois styles
+ne reconnait, cassant silencieusement le rendu suivant. `ridge` n'a ni
+`--style` ni `--shape`, rien a filtrer de son cote. L'automation
+(`_automation`) d'un preset etranger est retiree aussi : sa structure
+(attributs automatables propres a CE mode) n'a pas de sens transposee dans
+le systeme d'automation, distinct, de snap.py. Le reste (gain, couleurs,
+`line_width`, `fullscreen`...) partage un sens compatible d'un mode a
+l'autre, ou est de toute facon absent de `controls` cote snap
+(`ridge_spacing`, `averaging`...) et deja ignore silencieusement par
+`apply_preset` (voir `skipped`, deja documente plus haut).
+`refresh_vj_preset_menu()`/`vj_tick()` utilisent `all_presets_all_modes()` a
+la place de `all_presets()` ; `vj_add_entry()` n'a rien a changer, il ne lit
+que le menu deja peuple. Verifie sans vrai ffmpeg/ffplay/GUI live-ridge :
+`all_presets_all_modes()` inclut bien les noms nus de snap ET les noms
+prefixes `live:`/`ridge:`, "default" n'apparait qu'une fois (pas
+`live:default`/`ridge:default`), et un preset `live:*` fusionne perd bien
+`style`/`shape` tout en gardant `gain`/`fullscreen`.
+
+### Selection automatique du premier peripherique (`audio2wave_snap.py`)
+
+Demande explicite : "par defaut selectionne le premier device dispo dans la
+liste." Avant ce changement, lancer `--gui` sans `-d` (deja possible, voir
+plus haut : `-d`/`--device` optionnel en `--gui`) peuplait bien le menu
+**Entree audio** via `refresh_devices()` (appelee une fois au demarrage),
+mais laissait `args.device`/`device_var` VIDES tant que l'utilisateur n'avait
+pas cliqu manuellement une entree -- la fenetre s'ouvrait donc sur
+`NoDeviceCapture` (rien affiche, voir sa section plus haut) meme quand des
+peripheriques etaient bel et bien detectes. `refresh_devices()` appelle
+desormais `on_device_change(names[0])` si `args.device` est encore vide ET
+que la liste n'est pas vide -- ne touche JAMAIS une entree deja choisie
+(par `-d` ou par l'utilisateur avant un `Actualiser` ulterieur), et ne fait
+rien sur une liste vide (rien a choisir). La comparaison `args.device !=
+last_device` DEJA en place pour changer de peripherique EN COURS DE ROUTE
+(voir plus haut) voit cette premiere selection comme un changement normal,
+aucun code special supplementaire necessaire pour que `run()` demarre
+vraiment la capture dessus.
+
 ### Presets + automation de courbes pour les trois modes
 
 `audio2wave_snap.py` avait deja les presets et la "variation automatique"
@@ -2054,10 +2136,12 @@ le prochain redemarrage n'a pas eu lieu -- assume comme une derive
 perceptible plutot qu'un temps reel, coherent avec la nature deja
 "purement decorative" de cette fonctionnalite. **Curseurs automatables :
 tous les reglages numeriques de cette fenetre** (meme extension, meme
-demande explicite, que `audio2wave_ridge.py` ci-dessus) -- Halo/Derive de
-teinte du premier jet, plus desormais Barres/points (`bars`), Gain (dB),
-Lissage (`averaging`), Espace entre barres (`bar_gap`). Ce dernier lot
-profite directement du relais Python introduit depuis (voir la docstring de
+demande explicite, que `audio2wave_ridge.py` ci-dessus) -- Barres/points
+(`bars`), Gain (dB), Lissage (`averaging`), Espace entre barres (`bar_gap`).
+Halo/Derive de teinte du premier jet ont depuis disparu avec le reste des
+"ambiances" (`--glow`/`--hue-cycle`, voir plus haut), qui etaient a l'origine
+du choix de ces deux-la comme "seuls reglages ou une derive automatique a un
+sens visuel direct". Ce lot profite directement du relais Python (voir la docstring de
 `run()`/`relay_loop()` plus haut) : `automation_restart_tick()` continue
 d'appeler `apply()` toutes les `AUTO_RESTART_INTERVAL_S` (2 s), mais AUCUN de
 ces quatre reglages ne touche `--size`/`--fullscreen`, donc chacun de ces
@@ -2093,8 +2177,8 @@ attributs attendus (`audio2wave_ridge.py` : mutation directe d'`args`, verifiee
 sans delai ; `audio2wave_live.py` : verifiee apres avoir attendu le spawn()
 declenche par l'`apply()` immediat) ; cocher '~' sous un curseur automatable
 fait bien avancer sa valeur tout seul (`args.ridge_spacing` cote
-`audio2wave_ridge.py`, la position du curseur Halo cote `audio2wave_live.py`,
-suivie jusqu'a ce qu'`automation_restart_tick()` declenche un nouveau spawn
+`audio2wave_ridge.py`, la position du curseur Barres/points cote
+`audio2wave_live.py`, suivie jusqu'a ce qu'`automation_restart_tick()` declenche un nouveau spawn
 avec le halo deplace).
 
 ### Frequence d'echantillonnage

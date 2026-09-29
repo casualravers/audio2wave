@@ -42,8 +42,8 @@ from audio2wave import (
     GUI_MUTED_FG, GUI_PANEL_BG, gain_value, parse_size, style_gui, style_option_menu,
 )
 from audio2wave_live import (
-    Tooltip, find_window_position, list_audio_devices, primary_screen_size, require_tools,
-    secondary_monitor_rect, target_monitor_rect,
+    Tooltip, confirm_dialog, find_window_position, list_audio_devices, primary_screen_size,
+    require_tools, secondary_monitor_rect, target_monitor_rect,
 )
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
@@ -186,7 +186,10 @@ AUTOMATE_DEFAULT_PERIOD_S = 10.0  # duree par defaut d'un cycle complet, avant r
 # erreur (justement a cause de l'inversion), une fois la direction corrigee la
 # valeur la plus rapide n'a plus besoin d'etre aussi extreme.
 AUTOMATE_PERIOD_MIN_S = 3.0
-AUTOMATE_PERIOD_MAX_S = 40.0
+# 400 s (~6,5 min), 10x plus lent que le plafond precedent (40 s) -- demande
+# explicite ("permet aux courbes d'automation d'avoir une vitesse de
+# variation 10 fois plus lente encore").
+AUTOMATE_PERIOD_MAX_S = 400.0
 AUTOMATE_CANVAS_W = 220          # taille du petit editeur de courbe (Canvas), en pixels
 AUTOMATE_CANVAS_H = 90
 
@@ -274,6 +277,9 @@ CLUB_COLOR = "0x39c9ff"
 # la ligne de commande garde la priorite, y compris sur un preset. Les cles sont les
 # noms longs des options (avec des _), tels qu'argparse les stocke.
 PRESETS: dict[str, dict[str, object]] = {
+    # Aucune surcharge, non modifiable, charge par defaut a l'ouverture -- voir
+    # la meme entree dans audio2wave_live.py/audio2wave_ridge.py.
+    "default": {},
     # Contour anime en sinusoide plutot qu'en silhouette figee.
     "wave": dict(style="pencil", wave=WAVE_CYCLES),
     # Plein ecran pour une projection: trait plus epais et couleur vive pour rester
@@ -324,11 +330,67 @@ def save_user_preset(name: str, overrides: dict) -> None:
         json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
+def delete_user_preset(name: str) -> bool:
+    """Retire un preset UTILISATEUR du JSON ; ne touche jamais PRESETS (le code)
+    -- un preset integre ne peut donc jamais etre "supprime", tout au plus une
+    version utilisateur qui le shadow (voir save_user_preset) peut l'etre, ce
+    qui fait simplement reapparaitre l'original. Renvoie `False` si `name`
+    n'est pas dans le JSON (rien a faire, pas une erreur)."""
+    presets = load_user_presets()
+    if name not in presets:
+        return False
+    del presets[name]
+    USER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_PRESETS_PATH.write_text(
+        json.dumps(presets, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    return True
+
+
 def all_presets() -> dict[str, dict]:
     """PRESETS integres + presets utilisateur, ces derniers prioritaires en cas de
     nom identique (l'utilisateur re-sauvegarde volontairement par-dessus)."""
     merged = dict(PRESETS)
     merged.update(load_user_presets())
+    return merged
+
+
+def all_presets_all_modes() -> dict[str, dict]:
+    """Presets de snap (noms nus) + ceux de live/ridge (prefixes "live:"/"ridge:"
+    pour eviter toute ambiguite de nom) -- sert au Mode VJ, demande explicite
+    ("le mode vj doit prendre en compte les presets de tous les modes, pas
+    juste snap"). Import PARESSEUX (dans la fonction, pas en tete de fichier) :
+    audio2wave_ridge.py importe deja audio2wave_snap.py en tete de fichier, un
+    import en tete inverse ici creerait un cycle -- meme precaution que les
+    imports lies a la bascule de mode (voir handle_switch()/enter_gui()).
+
+    Les cles `style`/`shape` d'un preset ETRANGER (live) sont retirees avant
+    fusion : leurs valeurs valides la-bas (analyzer/radio, bar/line) n'ont
+    aucun sens pour les attributs DE MEME NOM cote snap (pencil/rekordbox/
+    simple) -- `apply_preset()` ne filtre que par PRESENCE de la cle dans
+    `controls`, pas par la VALIDITE de la valeur pour ce style-ci, donc les
+    laisser passer appliquerait une valeur incoherente a `args.style`/
+    `args.shape`. `ridge` n'a ni l'un ni l'autre (pas de --style/--shape la-bas),
+    rien a filtrer de son cote. Le reste (gain, colors, bg_color, fullscreen,
+    line_width...) partage un sens compatible d'un mode a l'autre, ou est de
+    toute facon absent de `controls` cote snap (`ridge_spacing`, `averaging`...)
+    et deja ignore silencieusement par `apply_preset` (voir sa docstring,
+    `skipped`). L'automation (`_automation`) d'un preset etranger est aussi
+    retiree : sa structure (attributs automatables propres a CE mode) n'a pas
+    de sens transposee telle quelle dans le systeme d'automation, distinct,
+    de snap.py.
+    """
+    import audio2wave_live
+    import audio2wave_ridge
+
+    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
+    merged = dict(all_presets())
+    for prefix, store in (("live", audio2wave_live.preset_store),
+                          ("ridge", audio2wave_ridge.preset_store)):
+        for name, overrides in store.all().items():
+            if name == "default":
+                continue  # deja present (vide) depuis snap, pas la peine de dupliquer
+            merged[f"{prefix}:{name}"] = {k: v for k, v in overrides.items()
+                                          if k not in UNSAFE_CROSS_MODE_KEYS}
     return merged
 
 
@@ -1965,6 +2027,15 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         for name in names:
             menu.add_command(label=name, command=lambda n=name: on_device_change(n))
         status["text"] = f"{len(names)} entree(s) audio detectee(s)"
+        # Selectionne le premier peripherique dispo par defaut si aucun n'est
+        # deja choisi -- demande explicite ("par defaut selectionne le premier
+        # device dispo dans la liste") : sans -d en ligne de commande, la
+        # fenetre s'ouvrait sur un menu deja peuple mais VIDE (NoDeviceCapture,
+        # voir plus bas), obligeant un premier clic manuel avant de voir quoi
+        # que ce soit. Ne touche jamais une entree DEJA choisie (par -d ou par
+        # l'utilisateur), et ne fait rien si la liste est vide (rien a choisir).
+        if not args.device and names:
+            on_device_change(names[0])
 
     tk.Button(device_frame, text="Actualiser", command=refresh_devices,
              ).pack(side="left", padx=(8, 0))
@@ -2849,7 +2920,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             apply_automation(automation_data)
         return skipped
 
-    preset_var = tk.StringVar(value="")
+    # "default" par defaut a l'ouverture, sauf --preset explicite -- demande
+    # explicite ("par defaut, un mode doit s'ouvrir sur le preset 'default'").
+    preset_var = tk.StringVar(value=args.preset or "default")
     r = next_shared_row()
     tk.Label(root, text="Charger").grid(row=r, column=0, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     preset_frame = tk.Frame(root)
@@ -2930,6 +3003,13 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         if not name:
             status["text"] = "aucun preset selectionne"
             return
+        if name == "default":
+            # "default" reste TOUJOURS les reglages argparse tels quels --
+            # demande explicite qu'il soit "non modifiable", a la difference
+            # des autres presets integres juste au-dessus (qui peuvent, eux,
+            # etre "mis a jour").
+            status["text"] = "'default' n'est pas modifiable"
+            return
         save_user_preset(name, capture_overrides())
         text = f"preset '{name}' mis a jour ({USER_PRESETS_PATH})"
         if name in PRESETS:
@@ -2937,6 +3017,31 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         status["text"] = text
 
     tk.Button(preset_frame, text="Mettre a jour", command=on_update_preset,
+             ).pack(side="left", padx=(8, 0))
+
+    def on_delete_preset() -> None:
+        name = preset_var.get()
+        if not name:
+            status["text"] = "aucun preset selectionne"
+            return
+        if name not in load_user_presets():
+            # Couvre "default" et tout preset integre jamais "mis a jour"
+            # (donc jamais present dans le JSON utilisateur) -- rien a
+            # supprimer, PRESETS (le code) n'est jamais touche par ce bouton.
+            status["text"] = f"'{name}' est un preset integre, impossible a supprimer"
+            return
+
+        def do_delete() -> None:
+            delete_user_preset(name)
+            refresh_preset_menu()
+            refresh_vj_preset_menu()  # le preset supprime doit aussi disparaitre de la liste VJ
+            status["text"] = f"preset '{name}' supprime"
+
+        confirm_dialog(root, "Supprimer le preset",
+                       f"Supprimer definitivement le preset '{name}' ?\n"
+                       "Cette action est irreversible.", do_delete)
+
+    tk.Button(preset_frame, text="Supprimer", command=on_delete_preset,
              ).pack(side="left", padx=(8, 0))
 
     save_name_var = tk.StringVar(value="")
@@ -3071,7 +3176,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         preset_var = vj_state["preset_var"]
         if menu_widget is None or preset_var is None:
             return
-        names = sorted(all_presets())
+        names = sorted(all_presets_all_modes())
         menu = menu_widget["menu"]
         menu.delete(0, "end")
         for name in names:
@@ -3306,7 +3411,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                 if idx != vj_state["current"]:
                     vj_state["current"] = idx
                     entry = vj_state["entries"][idx]
-                    presets = all_presets()
+                    presets = all_presets_all_modes()
                     if entry["preset"] in presets:
                         skipped = apply_preset(presets[entry["preset"]])
                         text = (f"VJ: '{entry['preset']}' "

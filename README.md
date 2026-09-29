@@ -107,9 +107,6 @@ python audio2wave.py <source.wav> [sortie] [options]
 | `--shape bar\|line` | forme du trace pour `--style analyzer` | `bar` |
 | `--colors` | couleur(s) du trace, separees par `\|` | `white` |
 | `--bg-color` | couleur du fond (avec `--no-transparent`) | `black` |
-| `--theme` | ambiance : degrade anime + halo + derive de teinte | `flat` |
-| `--glow <n>` | rayon du halo lumineux ; `0` desactive | selon le theme |
-| `--hue-cycle <n>` | derive de la teinte du trace, en degres/seconde | selon le theme |
 | `--gain auto\|<dB>` | niveau avant analyse ; `auto` mesure la crete et remplit l'image | `auto` |
 | `--averaging <n>` | lissage temporel (1 = nerveux, 20+ = pose) | `10` |
 | `--bars <n>` | nombre de barres/points (0 = pleine resolution) | `128` (analyzer) / largeur/4 (radio) |
@@ -119,31 +116,6 @@ python audio2wave.py <source.wav> [sortie] [options]
 | `--dry-run` | affiche la commande ffmpeg sans l'executer | - |
 
 Liste complete : `python audio2wave.py -h`
-
-## Ambiances (`--theme`)
-
-Fond en degrade anime, halo lumineux autour du trace, et teinte du trace qui derive
-lentement. Disponible dans les deux programmes.
-
-| theme | ambiance |
-|---|---|
-| `flat` (defaut) | fond uni `--bg-color` |
-| `aurora` | bleu nuit vers vert menthe, balayage lent |
-| `sunset` | violet, orange et peche |
-| `nebula` | violet profond, halo magenta |
-| `ocean` | bleu nuit vers cyan, en radial |
-| `ember` | noir vers orange braise |
-
-```bash
-python audio2wave.py voix.wav --style radio --theme nebula --colors "0x00e5ff"
-```
-
-`--theme` fournit un fond, donc la sortie devient opaque (le programme le signale).
-`--glow` et `--hue-cycle` fonctionnent aussi seuls, sans theme : le halo est alors
-conserve avec son alpha, et reste utilisable en overlay transparent.
-
-Le trace doit avoir une couleur saturee pour que `--hue-cycle` ait un effet : sur du
-blanc ou du noir, il n'y a pas de teinte a faire tourner.
 
 ## Exemples
 
@@ -224,14 +196,12 @@ touche deja les bords a crete normalisee, alors qu'une barre reste loin du plafo
 | `--averaging <n>` | lissage ; **poste de latence principal**, analyzer seul | `6` |
 | `--win-size <n>` | fenetre FFT ; plus petit = plus reactif, moins precis | auto (max 512) |
 | `--bg-color` | couleur du fond, independante de `--colors` | `black` |
-| `--theme` | ambiance (voir plus haut) ; `--glow 0` si ca saccade | `flat` |
-| `--reactive` | fait varier `--glow` avec le niveau audio (voir plus bas) | - |
 | `--size` | resolution de rendu | `960x540`, ou l'ecran avec `--fullscreen` |
 | `--fullscreen` | plein ecran | - |
 | `--gui` | ouvre une fenetre de reglages (voir plus bas) | - |
 
 `--shape`, `--colors`, `--bars`, `--bar-gap`, `--max-freq`, `--freq-scale`,
-`--amp-scale`, `--stereo`, `--glow`, `--hue-cycle` se comportent comme en mode fichier.
+`--amp-scale`, `--stereo` se comportent comme en mode fichier.
 
 ## Fenetre de reglages (`--gui`)
 
@@ -241,81 +211,24 @@ python audio2wave_live.py -d "<entree>" --gui
 
 **Different des deux autres scripts** (`audio2wave_snap.py`/`audio2wave_ridge.py`) :
 ici il n'y a pas de boucle Python par image a relire en direct — le producteur ffmpeg
-et l'afficheur ffplay sont relies par un tube direct, delibere pour la latence (voir
-CLAUDE.md). Un reglage change dans la fenetre ne prend donc effet **qu'au clic sur
-"Appliquer"**, qui relance le pipeline avec les nouvelles valeurs, contrairement au
-changement instantane de `--ridge-spacing` ou `--line-width` dans les deux autres
-scripts. Les curseurs seuls (sans clic sur Appliquer) ne redemarrent rien.
+et l'afficheur ffplay sont relies par un relais Python (voir CLAUDE.md), delibere
+pour la latence. Chaque reglage change dans la fenetre relance donc automatiquement
+le flux (debounce de quelques centaines de ms apres la derniere modification, pas de
+bouton "Appliquer" a cliquer) — mais la fenetre video elle-meme ne se ferme/rouvre
+plus a chaque reglage, seulement si la taille ou le mode plein ecran changent (ffplay
+ne peut pas changer ca sans se redemarrer lui-meme).
 
 Meme theme sombre (fond ardoise, accent cyan) que les deux autres fenetres `--gui`,
 partage via `style_gui()` dans `audio2wave.py`.
 
-**Le redemarrage est masque autant que possible** : la nouvelle paire ffmpeg/ffplay
-est lancee *avant* que l'ancienne ne soit fermee (les deux coexistent brievement),
-et la nouvelle fenetre reprend la position exacte de l'ancienne sur l'ecran (reperee
-via l'API Windows) — le changement se voit comme une mise a jour sur place, pas comme
-une fenetre qui se ferme puis se rouvre ailleurs. Sans effet en `--fullscreen`, deja
-seamless des deux cotes. Si le nouveau reglage fait echouer ffmpeg (peripherique
-perdu, par exemple), l'ancienne fenetre, toujours fonctionnelle, est conservee au
-lieu d'etre perdue — le probleme est signale dans le terminal et dans la fenetre de
-reglages, et il faut corriger puis re-cliquer sur Appliquer.
+Si le nouveau reglage fait echouer ffmpeg (peripherique perdu, par exemple),
+l'ancienne configuration, toujours fonctionnelle, est conservee au lieu d'etre
+perdue — le probleme est signale dans le terminal et dans la fenetre de reglages.
 
 Reglable dans la fenetre : style, forme, couleurs, barres/points, gain, lissage,
-espace entre barres, echelle des frequences et de l'amplitude, stereo, ambiance,
-halo (`--glow`) et derive de teinte (`--hue-cycle`). Ces deux derniers valent
-`None` par defaut (fixes par l'ambiance choisie) : le curseur affiche la valeur du
-theme courant a l'ouverture, mais la toucher fige une valeur explicite pour tous
-les "Appliquer" suivants, meme apres avoir change d'ambiance. Fermer la fenetre de
-reglages arrete le programme en entier (meme effet que Ctrl+C) ; fermer la fenetre
-video le fait aussi, comme sans `--gui`.
-
-Pour une projection :
-
-```bash
-python audio2wave_live.py -d "<entree>" --style radio --theme nebula --fullscreen
-```
-
-Les ambiances tiennent le temps reel en 1920x1080 : mesure sur 30 s d'audio, entre
-22 et 26 s de traitement selon le theme, halo compris. Le halo est l'effet le plus
-couteux — `--glow 0` le desactive si la machine peine.
-
-## Halo reactif au niveau audio (`--reactive`)
-
-```bash
-python audio2wave_live.py -d "<entree>" --reactive
-python audio2wave_live.py -d "<entree>" --theme aurora --reactive
-```
-
-Fait grossir/retomber `--glow` avec le niveau audio mesure, plutot que de le garder
-fixe (ou anime sur une horloge independante, comme les ambiances seules). **Pas une
-modulation image par image** : ffmpeg n'expose de canal pour changer un filtre
-(`gblur`) en cours de route sans redemarrer que via son filtre `zmq`, qui demande un
-client ZeroMQ absent de la bibliotheque standard Python — hors de portee pour ce
-projet ("stdlib seulement", voir CLAUDE.md). `--reactive` redemarre donc le pipeline
-par a-coups (meme mecanisme "seamless" que le bouton Appliquer du `--gui`, coexistence
-breve le temps de la transition), quelques secondes au minimum entre deux
-redemarrages — pas un pouls continu, plutot une ambiance qui se recalibre par
-paliers avec les passages forts/calmes.
-
-Le niveau est mesure sur le signal capture (avant `--gain`), via une derivation
-interne du graphe ffmpeg qui n'affecte ni le son ni l'image. La plage par defaut
-(-50 a -15 dBFS pour couvrir tout `--glow`) depend du peripherique, comme `--gain` :
-si le halo reste toujours au minimum ou au maximum, c'est a ajuster (constantes
-`REACTIVE_FLOOR_DB`/`REACTIVE_CEIL_DB` dans le fichier, pas encore exposees en
-option).
-
-**Le niveau est lisse sur 6 secondes avant de decider quoi que ce soit** (une
-moyenne glissante, pas juste la derniere mesure) : un coup isole (un kick, une
-attaque breve) ne pese presque rien dans cette moyenne, il faut un changement
-SOUTENU (un couplet qui monte, une transition) pour justifier un redemarrage.
-Observe en usage reel avant ce reglage : sur une fenetre plus courte, un seul
-changement soudain de dynamique suffisait a faire "rouvrir" la fenetre (le
-redemarrage, meme seamless, reste visible) pour un evenement trop bref pour
-meriter un ajustement d'ambiance.
-
-Combinable avec `--gui` (les deux pilotent les memes redemarrages, sans conflit) ;
-utilisable seule (sans `--theme`) pour un halo autour du trace qui repond au niveau,
-sur fond uni.
+espace entre barres, echelle des frequences et de l'amplitude, stereo, taille de
+fenetre, plein ecran. Fermer la fenetre de reglages arrete le programme en entier
+(meme effet que Ctrl+C) ; fermer la fenetre video le fait aussi, comme sans `--gui`.
 
 ## Latence
 
@@ -516,6 +429,13 @@ lira alors cette version), sans toucher au preset d'origine dans le code —
 supprimer l'entree du JSON restaure le comportement integre. **Sauvegarder**
 (nouveau nom), lui, refuse toujours un nom de preset integre, pour eviter
 qu'une faute de frappe n'ecrase un preset existant sans intention explicite.
+**`default`** (aucune surcharge, les reglages argparse tels quels) est un
+preset integre special : il est charge par defaut a l'ouverture de la fenetre
+(sauf `--preset <autre>` explicite) et **n'est jamais modifiable**, ni par
+Mettre a jour ni par Sauvegarder sous. **Supprimer** retire un preset du JSON
+utilisateur, avec une modale de confirmation (irreversible) ; un preset
+integre jamais "mis a jour" (donc absent du JSON) ne peut pas etre supprime,
+il n'y a rien a retirer.
 Charger un preset qui contient une option figee au lancement
 (ex. `--fullscreen` dans `club`) l'ignore silencieusement dans la fenetre — ces
 options ne peuvent de toute facon pas se relancer en direct sans redemarrer le
@@ -527,9 +447,15 @@ statut.
 Un bouton **Mode VJ -- Ouvrir...** dans la fenetre `--gui` ouvre un petit popup
 pour planifier un enchainement de presets sur toute la duree d'un set :
 
-1. **Ajouter** une entree : choisis un preset (integre ou utilisateur, meme
-   liste que **Charger**) et une duree en minutes, puis **Ajouter** — elle
-   rejoint la fin de la liste.
+1. **Ajouter** une entree : choisis un preset et une duree en minutes, puis
+   **Ajouter** — elle rejoint la fin de la liste. La liste couvre **tous les
+   modes**, pas seulement snap : les presets de `audio2wave_live.py`/
+   `audio2wave_ridge.py` apparaissent aussi, prefixes `live:`/`ridge:` pour
+   eviter toute ambiguite de nom (ex. `live:club`). Un preset etranger ne
+   change pas de mode (le Mode VJ reste dans snap) : seules les options qui
+   ont un sens ici (gain, couleurs, epaisseur...) s'appliquent, celles sans
+   equivalent (`style`/`shape` de live, dont les valeurs n'existent pas cote
+   snap) sont retirees avant meme d'atteindre `apply_preset()`.
 2. Reordonne avec **Monter**/**Descendre**, retire une entree avec
    **Supprimer**. Les durees sont relatives : deplacer une entree decale
    automatiquement l'horaire de toutes celles qui suivent, pas besoin de
@@ -824,7 +750,7 @@ tel quel puis dans `--asset-dir` comme au demarrage) relance le decodeur video
 correspondant. Dans les deux cas la fenetre ffplay ne bouge pas : seul le flux
 source change, avec une courte coupure (quelques centaines de ms pour l'audio,
 le temps qu'un nouveau ffmpeg dshow s'ouvre) plutot qu'un redemarrage seamless
-comme `--reactive` d'`audio2wave_live.py`. Un chemin video introuvable est
+comme les reglages d'`audio2wave_live.py`. Un chemin video introuvable est
 signale en statut sans toucher au flux en cours, pour ne pas couper une video
 qui marchait sur une faute de frappe pas encore corrigee. Un bouton
 **Parcourir...** a cote de chaque champ video ouvre le selecteur de fichiers
