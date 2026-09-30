@@ -121,7 +121,7 @@ Liste complete : `python audio2wave.py -h`
 
 ```bash
 python audio2wave.py voix.wav                                    # -> output/voix_analyzer.mov
-python audio2wave.py voix.wav --shape line --colors grey
+python audio2wave.py voix.wav --shape line --colors gray
 python audio2wave.py voix.wav --style radio --colors "0xff00ff"
 python audio2wave.py voix.wav clip.webm --format webm --style spectrum --colormap rainbow
 python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
@@ -171,7 +171,7 @@ python audio2wave_live.py -d "<entree>" --style radio --gain -10 # onde temporel
 Le fond se regle separement du trace, dans les deux programmes :
 
 ```bash
-python audio2wave_live.py -d "<entree>" --colors grey --bg-color navy
+python audio2wave_live.py -d "<entree>" --colors gray --bg-color navy
 ```
 
 | mode | rendu | latence |

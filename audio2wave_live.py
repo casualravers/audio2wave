@@ -6,7 +6,7 @@ fenetre FFT courte, resolution reduite, pas de canal alpha, pas de pre-analyse d
 
     python audio2wave_live.py --list-devices          # nom exact des entrees disponibles
     python audio2wave_live.py -d "Line In (Realtek)" --tune    # mesure et conseille un gain
-    python audio2wave_live.py -d "Line In (Realtek)" --gain 32 --colors grey
+    python audio2wave_live.py -d "Line In (Realtek)" --gain 32 --colors gray
     python audio2wave_live.py -d "Line In (Realtek)" --shape line --fullscreen
 
 Le son n'est pas reproduit: seul le visuel est affiche, l'ecoute reste sur la chaine hifi.
@@ -95,8 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shape", choices=["bar", "line"], default="bar",
                     help="Forme du trace pour --style analyzer: bar = barres separees, "
                          "line = courbe continue. Ignore en --style radio (defaut: bar)")
-    p.add_argument("--colors", default="grey",
-                    help="Couleur(s) du trace, separees par | (defaut: grey)")
+    p.add_argument("--colors", default="gray",
+                    help="Couleur(s) du trace, separees par | (defaut: gray)")
     p.add_argument("--bg-color", default="black",
                     help="Couleur du fond, independante de --colors. Accepte un nom (white, navy) "
                          "ou un code 0xRRGGBB (defaut: black)")
@@ -1598,7 +1598,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
             args.device = device
         args.style = style_var.get()
         args.shape = shape_var.get()
-        args.colors = colors_var.get().strip() or "grey"
+        args.colors = colors_var.get().strip() or "gray"
         args.bg_color = bg_var.get().strip() or "black"
         args.bars = int(bars_var.get())
         args.gain = gain_var.get()
