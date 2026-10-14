@@ -804,14 +804,29 @@ class Tooltip:
     def _show(self, _evt: object = None) -> None:
         if self.tip is not None:
             return
-        x = self.widget.winfo_rootx() + 4
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
+        self.tip.withdraw()
         tk.Label(self.tip, text=self.text, justify="left", bg=GUI_PANEL_BG, fg=GUI_FG,
                 font=GUI_FONT, relief="solid", borderwidth=1, padx=6, pady=4, wraplength=260,
                 ).pack()
+        # Mesure puis garde l'info-bulle DANS la fenetre de reglages : sous le
+        # widget par defaut, au-dessus s'il n'y a pas la place en bas, decalee
+        # a gauche si elle depasse a droite (sinon elle sortait de la fenetre
+        # pour un controle pres d'un bord).
+        self.tip.update_idletasks()
+        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+        win = self.widget.winfo_toplevel()
+        left, top = win.winfo_rootx(), win.winfo_rooty()
+        right, bottom = left + win.winfo_width(), top + win.winfo_height()
+        x = self.widget.winfo_rootx() + 4
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        if y + h > bottom:
+            y = self.widget.winfo_rooty() - h - 4
+        x = max(left, min(x, right - w))
+        y = max(top, y)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        self.tip.deiconify()
 
     def _hide(self, _evt: object = None) -> None:
         if self.tip is not None:
@@ -1018,8 +1033,16 @@ class AutomationManager:
 
     AUTOMATION_KEY = "_automation"  # cle reservee dans un preset JSON, voir capture()/apply()
 
-    def __init__(self, root: object, tooltip_cls: type, panel_bg: str, muted_fg: str, accent: str):
+    def __init__(self, root: object, tooltip_cls: type, panel_bg: str, muted_fg: str, accent: str,
+                 curve_label: str = "∿",
+                 on_editor_open: Callable[[object, str, object], None] | None = None):
+        """`curve_label` : texte du bouton d'edition (petite vague par defaut).
+        `on_editor_open(window, attr, canvas)` : appele une fois la fenetre
+        d'edition construite, pour qu'un programme hote l'habille a sa facon
+        sans remplacer `open_editor` ni parcourir ses widgets."""
         self.root = root
+        self.curve_label = curve_label
+        self.on_editor_open = on_editor_open
         self.Tooltip = tooltip_cls
         self.bg = panel_bg
         self.muted = muted_fg
@@ -1048,7 +1071,7 @@ class AutomationManager:
                             "position du curseur.")
         # Petite vague (U+223F, ecrite en echappement: sources ASCII) plutot que
         # le mot "courbe", comme la GUI de casual-overlay.
-        edit_btn = tk.Button(row, text="∿", padx=3, pady=0,
+        edit_btn = tk.Button(row, text=self.curve_label, padx=3, pady=0,
                              command=lambda: self.open_editor(attr))
         edit_btn.pack(side="left", padx=(4, 0))
         self.Tooltip(edit_btn, "Ouvre l'editeur de courbe pour CE reglage : glisse les points "
@@ -1145,6 +1168,8 @@ class AutomationManager:
         win.protocol("WM_DELETE_WINDOW", on_close)
         tk.Button(win, text="Fermer", command=on_close).pack(pady=(0, 12))
         state["editor"] = win
+        if self.on_editor_open is not None:
+            self.on_editor_open(win, attr, state["canvas"])
 
     def tick(self, controls: dict, finished_event: object) -> None:
         """A programmer par l'appelant via root.after(AUTOMATE_TICK_MS, ...) ; se

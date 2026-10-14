@@ -39,6 +39,22 @@ GUI_FONT_MONO = ("Consolas", 9)
 GUI_FONT_SMALL = ("Segoe UI", 8, "bold")
 
 
+def set_gui_accent(accent: str, accent_fg: str | None = None) -> None:
+    """Change l'accent de la palette pour tous les modules audio2wave DEJA importes.
+
+    Chaque module fait `from common import GUI_ACCENT` (copie a l'import), donc
+    changer la constante de `common` seule ne suffit pas : un programme hote
+    (ex. casual-overlay) doit appeler ceci AVANT de construire les widgets, au
+    lieu d'aller reecrire les constantes module par module. Sans effet sur les
+    modules pas encore importes (ils liront la valeur de `common` modifiee)."""
+    for name in ("common", "audio2wave", "audio2wave_live", "audio2wave_snap", "audio2wave_ridge"):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "GUI_ACCENT"):
+            module.GUI_ACCENT = accent
+            if accent_fg is not None and hasattr(module, "GUI_ACCENT_FG"):
+                module.GUI_ACCENT_FG = accent_fg
+
+
 def style_gui(root) -> None:
     """Theme sombre applique aux fenetres --gui, pour un rendu plus soigne que le
     gris Tk par defaut.
