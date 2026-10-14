@@ -767,7 +767,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     gain_holder = tk.Frame(root)
     gain_holder.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     tk.Scale(gain_holder, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
-            length=170, showvalue=True, command=lambda _v: on_gain_change(),
+            length=170, showvalue=True, command=lambda *_: on_gain_change(),
             ).pack(side="top", anchor="w")
     automation.register(gain_holder, "gain", "Gain manuel (dB)", -40, 40)
     add_slider("Lissage (lignes)", "gain_window", 1, 60, 1, panel="right",
@@ -984,7 +984,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     save_name_entry.pack(side="left")
 
     def on_save_preset(_evt: object = None) -> None:
-        name = save_name_var.get().strip().lower()
+        from preset_registry import normalize_name
+        name = normalize_name(save_name_var.get())
         if not name:
             status["text"] = "nom de preset vide"
             return

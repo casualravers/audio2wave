@@ -102,6 +102,51 @@ for mode in preset_registry.MODES:
     for method in ("user", "all", "save", "delete", "override_default"):
         check(callable(getattr(store, method, None)), f"ModeStore.{method} ({mode})")
 
+print("defauts corriges a la source")
+import argparse
+_argv = sys.argv
+sys.argv = ["live", "-d", "x", "--bar-gap", "1.4"]
+try:
+    gap_args = live.parse_args()
+finally:
+    sys.argv = _argv
+gap_filter = live.build_filter(gap_args)
+width = live.resolve_size(gap_args)[0]
+bars = live.resolve_bars(gap_args, width)
+thickness = int(gap_filter.split("drawgrid=")[1].split(":t=")[1].split(":")[0])
+check(thickness < width / bars, "bar_gap=1.4: le separateur drawgrid reste plus fin qu'une barre",
+      f"t={thickness} pour une barre de {width / bars:.1f}")
+sys.argv = ["live", "-d", "x", "--shape", "line"]
+try:
+    line_args = live.parse_args()
+finally:
+    sys.argv = _argv
+check(live.resolve_bars(line_args, 1920) >= 400, "analyzer --shape line: au moins 400 points")
+check(live.live_win_size(line_args, 44100) == 2048, "analyzer --shape line: fenetre FFT de 2048")
+check(common.readable_fg("#2f6fed") == common.GUI_FG and common.readable_fg("#5fd4c8") == common.GUI_ACCENT_FG,
+      "readable_fg: texte clair sur un accent bleu, sombre sur le turquoise")
+import tkinter as _tk
+_root = _tk.Tk()
+_menu = _tk.OptionMenu(_root, _tk.StringVar(value="a"), "a", "b")
+common.set_gui_accent("#2f6fed")
+common.style_option_menu(_menu)
+check(str(_menu.cget("activeforeground")) == common.GUI_FG, "style_option_menu: survol lisible sur un accent bleu")
+common.set_gui_accent("#5fd4c8")
+_root.destroy()
+check(callable(common.make_scrollbar), "common.make_scrollbar")
+check(preset_registry.normalize_name("  Mon Live ") == "mon live", "normalize_name('  Mon Live ') == 'mon live'")
+_stored = preset_registry.store_for("ridge")
+_stored.__class__  # noqa
+_tmp_path = Path(__import__("tempfile").gettempdir()) / "a2w_contract_ridge.json"
+_tmp_path.unlink(missing_ok=True)
+_old_path, ridge.preset_store.path = ridge.preset_store.path, _tmp_path
+try:
+    check(_stored.save("Mon Preset", {"gain": 1}) == "mon preset", "ModeStore.save renvoie le nom reellement enregistre")
+    check("mon preset" in _stored.user(), "ModeStore.save enregistre sous le nom normalise")
+finally:
+    ridge.preset_store.path = _old_path
+    _tmp_path.unlink(missing_ok=True)
+
 print("analyze_block (sortie machine, --json-status)")
 _argv = sys.argv
 sys.argv = ["snap", "-d", "x", "--json-status", "-"]

@@ -2480,7 +2480,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                        "d'oscillations sur la largeur.")
     tk.Scale(root, from_=1, to=64, resolution=1, orient="horizontal", variable=wave_cycles,
             length=170, showvalue=True,
-            command=lambda _v: on_wave_change()).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
+            command=lambda *_: on_wave_change()).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
 
     add_slider("Points / colonnes", "columns", 0, 400, 4,
               initial=args.columns if args.columns is not None else PENCIL_POINTS,
@@ -2687,7 +2687,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     add_label("Gain manuel", r, RIGHT_LABEL_COL,
              tooltip="En dB, actif quand gain automatique est decoche.")
     tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
-            length=170, showvalue=True, command=lambda _v: on_gain_change(),
+            length=170, showvalue=True, command=lambda *_: on_gain_change(),
             ).grid(row=r, column=RIGHT_CTRL_COL, padx=ROW_PADX, pady=ROW_PADY)
 
     # Tuning: mesure la crete (et le facteur de crete, pour detecter un ecretage
@@ -3090,7 +3090,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     save_name_entry.pack(side="left")
 
     def on_save_preset(_evt: object = None) -> None:
-        name = save_name_var.get().strip().lower()
+        from preset_registry import normalize_name
+        name = normalize_name(save_name_var.get())
         if not name:
             status["text"] = "nom de preset vide"
             return
@@ -3423,7 +3424,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                              selectforeground=GUI_ACCENT_FG, activestyle="none",
                              exportselection=False, font=GUI_FONT_MONO)
         listbox.pack(side="left", fill="both", expand=True)
-        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        import common  # attribut lu a l'appel : un hote peut remplacer common.make_scrollbar
+        scrollbar = common.make_scrollbar(list_frame, listbox.yview)
         scrollbar.pack(side="left", fill="y")
         listbox.config(yscrollcommand=scrollbar.set)
         vj_state["listbox"] = listbox

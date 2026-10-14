@@ -66,6 +66,18 @@ RADIO_POINTS_PER_WIDTH = 4
 # (win_size / frequence) se paie directement en latence a l'ecran.
 LIVE_WIN_SIZE_CAP = 512
 
+# analyzer en --shape line : une COURBE continue. Avec 128 points et une fenetre de
+# 512 elle est un escalier flou (peu de points, resolution frequentielle grossiere) ;
+# 400 points et une fenetre de 2048 la rendent nette, au prix d'environ 35 ms de
+# latence en plus (report_latency() les compte). Reste l'ecart des barres, ou la
+# finesse n'apporte rien : leur largeur a l'ecran ne change pas.
+LINE_ANALYZER_BARS = 400
+LINE_WIN_SIZE = 2048
+
+# Au-dela de 1, le separateur de barres (drawgrid) est plus epais que la barre elle-meme
+# et la couvre entierement : ecran noir. 0,7 laisse toujours un tiers de barre visible.
+MAX_BAR_GAP = 0.7
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -197,8 +209,19 @@ def resolve_bars(args: argparse.Namespace, width: int) -> int:
     if args.bars is not None:
         return args.bars
     if args.style == "analyzer":
-        return DEFAULT_ANALYZER_BARS
+        return LINE_ANALYZER_BARS if args.shape == "line" else DEFAULT_ANALYZER_BARS
     return width // RADIO_POINTS_PER_WIDTH
+
+
+def live_win_size(args: argparse.Namespace, rate: int) -> int:
+    """Fenetre FFT du mode analyzer : `--win-size` si donne ; sinon 2048 en
+    --shape line (LINE_WIN_SIZE, fixe : la finesse auto tomberait a 1024 a 30 img/s,
+    insuffisant pour une courbe nette), ou la finesse auto bornee a 512 en barres."""
+    if args.win_size:
+        return args.win_size
+    if args.shape == "line":
+        return LINE_WIN_SIZE
+    return min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
 
 
 def tune(args: argparse.Namespace) -> None:
@@ -257,7 +280,7 @@ def build_filter(args: argparse.Namespace) -> str:
 
     if args.style == "analyzer":
         rate = args.max_freq * 2 if args.max_freq > 0 else 44100
-        win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
+        win_size = live_win_size(args, rate)
         if args.max_freq > 0:
             # Borne la bande affichee, et allege la FFT au passage.
             chain.append(f"aresample={rate}")
@@ -282,7 +305,7 @@ def build_filter(args: argparse.Namespace) -> str:
     chain.append("setsar=1")
     if bar_mode and args.bar_gap > 0:
         # Separateurs noirs, rendus transparents plus bas quand un fond est demande.
-        thickness = max(1, round(width / bars * args.bar_gap))
+        thickness = max(1, round(width / bars * min(args.bar_gap, MAX_BAR_GAP)))
         chain.append(f"drawgrid=w=iw/{bars}:h=ih:t={thickness}:c=black")
 
     trace = "[0:a]" + ",".join(chain)
@@ -312,7 +335,7 @@ def report_latency(args: argparse.Namespace) -> None:
         return
 
     rate = args.max_freq * 2 if args.max_freq > 0 else 44100
-    win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
+    win_size = live_win_size(args, rate)
     window_ms = win_size / rate * 1000
     averaging_ms = args.averaging / max(args.fps, 1) * 1000 / 2
     print(
@@ -344,7 +367,7 @@ def producer_warmup_seconds(args: argparse.Namespace) -> float:
         # moyenne, seule la capture doit se remplir.
         return args.buffer / 1000
     rate = args.max_freq * 2 if args.max_freq > 0 else 44100
-    win_size = args.win_size or min(auto_win_size(rate, args.fps), LIVE_WIN_SIZE_CAP)
+    win_size = live_win_size(args, rate)
     return args.buffer / 1000 + win_size / rate + args.averaging / max(args.fps, 1)
 
 
@@ -1570,7 +1593,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
                               tooltip="Uniquement pour le style analyzer: nombre de trames "
                                       "moyennees, poste de latence principal en live.",
                               automatable=True)
-    bar_gap_var = add_slider("Espace entre barres", "bar_gap", 0, 1.5, 0.05, args.bar_gap, panel="right",
+    bar_gap_var = add_slider("Espace entre barres", "bar_gap", 0, MAX_BAR_GAP, 0.05, args.bar_gap, panel="right",
                              automatable=True)
     freq_scale_var = add_dropdown("Echelle frequences", "freq_scale", args.freq_scale,
                                   ("lin", "log", "rlog"), panel="right",
@@ -1802,7 +1825,8 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     save_name_entry.pack(side="left")
 
     def on_save_preset(_evt: object = None) -> None:
-        name = save_name_var.get().strip().lower()
+        from preset_registry import normalize_name
+        name = normalize_name(save_name_var.get())
         if not name:
             status["text"] = "nom de preset vide"
             return

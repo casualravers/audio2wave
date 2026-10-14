@@ -2060,6 +2060,25 @@ rien a mesurer cote Python. Verifie : signal synthetique a 120 BPM -> BPM estime
 ~120 ; silence -> `peak_dbfs` None ; `run()` reel avec capture/affichage
 factices ecrit bien une ligne par photo.
 
+### Defauts corriges a la source (signales par casual-overlay, qui les contournait)
+
+- **`--bar-gap` plafonne a `MAX_BAR_GAP = 0.7`** (`build_filter` ET plage du curseur) : a partir de 1, le
+  separateur `drawgrid` est aussi epais que la barre et la couvre (ecran noir).
+- **`analyzer --shape line`** : 400 points (`LINE_ANALYZER_BARS`) et fenetre FFT de 2048 (`LINE_WIN_SIZE`)
+  au lieu de 128/512 (escalier flou), +35 ms de latence comptes par `report_latency()` ; helper
+  `live_win_size(args, rate)` partage par `build_filter`/`report_latency`/`producer_warmup_seconds`.
+- **Survol des menus lisible** : `common.readable_fg(bg)` (texte sombre seulement si contraste >= 4,5, sinon
+  clair) remplace `GUI_ACCENT_FG` pour `*Menu.activeForeground` et `style_option_menu(menu, hover_fg=None)` ;
+  turquoise inchange, un accent bleu recoit du texte clair.
+- **`common.make_scrollbar(parent, command)`** : ascenseur au theme (la liste du Mode VJ l'utilise, via
+  l'attribut du module, donc un hote peut le remplacer).
+- **`preset_registry.normalize_name`** (strip + minuscules, regle des trois fenetres) ; `ModeStore.save`
+  normalise et RENVOIE le nom enregistre.
+- Commandes de `tk.Scale` en `lambda *_:` (gain/sinusoide) : tolerantes a un appel sans valeur. Le message
+  « missing ... '_v' » n'a pas pu etre reproduit ici (aucune exception en agitant tous les widgets des
+  trois fenetres) ; correctif de robustesse, a reverifier cote hote.
+`check_contract.py` couvre chaque point.
+
 ### Selection automatique du premier peripherique (`audio2wave_snap.py`)
 
 Demande explicite : "par defaut selectionne le premier device dispo dans la

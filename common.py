@@ -55,6 +55,41 @@ def set_gui_accent(accent: str, accent_fg: str | None = None) -> None:
                 module.GUI_ACCENT_FG = accent_fg
 
 
+def _luminance(hex_color: str) -> float | None:
+    """Luminance relative (WCAG) d'une couleur "#rrggbb", ou None si le format est autre."""
+    if not (len(hex_color) == 7 and hex_color.startswith("#")):
+        return None
+    try:
+        channels = [int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    except ValueError:
+        return None
+    lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def readable_fg(bg: str, dark: str | None = None, light: str | None = None) -> str:
+    """Texte lisible sur `bg` : le plus contraste de `dark` (defaut GUI_ACCENT_FG) et
+    `light` (defaut GUI_FG). Sert au survol des menus et selects, dont le fond est
+    l'accent : un accent clair (turquoise) garde son texte sombre, un accent plus
+    sature ou plus sombre (le bleu d'un programme hote) recoit du texte clair au
+    lieu de rester quasi noir dessus."""
+    dark = dark or GUI_ACCENT_FG
+    light = light or GUI_FG
+    lum_bg = _luminance(bg)
+    lum_dark, lum_light = _luminance(dark), _luminance(light)
+    if lum_bg is None or lum_dark is None or lum_light is None:
+        return dark
+
+    def contrast(a: float, b: float) -> float:
+        return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+    # Texte sombre seulement s'il atteint un contraste confortable (4,5, seuil WCAG AA) :
+    # sur un bleu moyen les deux choix mesurent presque pareil (~3,9 contre ~3,7), mais le
+    # texte clair y est celui qui se lit le mieux a l'ecran.
+    c_dark, c_light = contrast(lum_bg, lum_dark), contrast(lum_bg, lum_light)
+    return dark if c_dark >= 4.5 and c_dark >= c_light else light
+
+
 def style_gui(root) -> None:
     """Theme sombre applique aux fenetres --gui, pour un rendu plus soigne que le
     gris Tk par defaut.
@@ -110,23 +145,39 @@ def style_gui(root) -> None:
     root.option_add("*Menu.Background", GUI_PANEL_BG)
     root.option_add("*Menu.Foreground", GUI_FG)
     root.option_add("*Menu.activeBackground", GUI_ACCENT)
-    root.option_add("*Menu.activeForeground", GUI_ACCENT_FG)
+    root.option_add("*Menu.activeForeground", readable_fg(GUI_ACCENT))
     root.option_add("*Menubutton.Background", GUI_PANEL_BG)
     root.option_add("*Menubutton.relief", "flat")
     root.option_add("*Menubutton.highlightThickness", 0)
 
 
-def style_option_menu(menu_widget) -> None:
+def style_option_menu(menu_widget, hover_fg: str | None = None) -> None:
     """A appeler apres chaque tk.OptionMenu(...): contrairement aux autres widgets
     classiques, OptionMenu fixe ses propres couleurs a la construction, ignorant le
     theme pose par style_gui via option_add. Reconfigure le bouton et son menu
     deroulant (`["menu"]`, une fenetre Tk separee, pas touchee par la config du
-    bouton) a la main pour rattraper les deux."""
+    bouton) a la main pour rattraper les deux. `hover_fg` : couleur du texte au
+    survol (sur le fond d'accent) ; par defaut le plus contraste des deux, voir
+    `readable_fg`."""
+    hover_fg = hover_fg or readable_fg(GUI_ACCENT)
     menu_widget.configure(bg=GUI_PANEL_BG, fg=GUI_FG, activebackground=GUI_ACCENT,
-                          activeforeground=GUI_ACCENT_FG, highlightthickness=0,
+                          activeforeground=hover_fg, highlightthickness=0,
                           relief="flat", bd=0, padx=8, pady=3)
     menu_widget["menu"].configure(bg=GUI_PANEL_BG, fg=GUI_FG, activebackground=GUI_ACCENT,
-                                  activeforeground=GUI_ACCENT_FG)
+                                  activeforeground=hover_fg)
+
+
+def make_scrollbar(parent, command, **options):
+    """Ascenseur vertical au theme sombre (le `tk.Scrollbar` natif reste clair sous
+    Windows). Fabrique unique : un programme hote peut la remplacer par la sienne
+    (`common.make_scrollbar = ...`) sans toucher aux fenetres qui l'appellent.
+    Import tkinter paresseux : ce module reste utilisable sans interface."""
+    import tkinter as tk
+    settings = dict(orient="vertical", command=command, bg=GUI_PANEL_BG, troughcolor=GUI_BG,
+                    activebackground=GUI_ACCENT, highlightthickness=0, bd=0, relief="flat",
+                    elementborderwidth=0, width=12)
+    settings.update(options)
+    return tk.Scrollbar(parent, **settings)
 
 
 def parse_size(size: str) -> tuple[int, int]:

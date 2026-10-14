@@ -29,6 +29,13 @@ MODES = ("snap", "live", "ridge")
 CROSS_MODE_UNSAFE_KEYS = frozenset({"style", "shape", "_automation"})
 
 
+def normalize_name(name: str) -> str:
+    """Nom sous lequel un preset est enregistre : espaces de bord retires, minuscules.
+    Regle unique des trois modes (les fenetres l'appliquent toutes a la saisie) ;
+    un programme hote qui sauvegarde lui-meme doit l'utiliser pour retrouver le meme nom."""
+    return name.strip().lower()
+
+
 def strip_foreign(overrides: dict) -> dict:
     """Preset d'un AUTRE mode, sans les cles qui n'ont pas de sens ici."""
     return {k: v for k, v in overrides.items() if k not in CROSS_MODE_UNSAFE_KEYS}
@@ -54,11 +61,18 @@ class ModeStore:
     def all(self) -> dict:
         return dict(self._obj.all() if self._obj else self.module.all_presets())
 
-    def save(self, name: str, overrides: dict) -> None:
+    def save(self, name: str, overrides: dict) -> str:
+        """Enregistre sous `normalize_name(name)` et RENVOIE le nom reellement utilise
+        (l'appelant ne doit pas supposer qu'il est identique a celui qu'il a passe).
+        Nom vide apres normalisation : ValueError."""
+        name = normalize_name(name)
+        if not name:
+            raise ValueError("nom de preset vide")
         if self._obj:
             self._obj.save_user(name, overrides)
         else:
             self.module.save_user_preset(name, overrides)
+        return name
 
     def delete(self, name: str) -> bool:
         return bool(self._obj.delete_user(name) if self._obj else self.module.delete_user_preset(name))
