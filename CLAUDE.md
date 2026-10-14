@@ -2023,6 +2023,20 @@ prefixes `live:`/`ridge:`, "default" n'apparait qu'une fois (pas
 `live:default`/`ridge:default`), et un preset `live:*` fusionne perd bien
 `style`/`shape` tout en gardant `gain`/`fullscreen`.
 
+### `preset_registry.py` : un seul endroit pour les presets multi-modes
+
+Snap stocke ses presets dans des fonctions de module, live/ridge dans un objet
+`preset_store` : `preset_registry.ModeStore` (`store_for(mode, module=None)`)
+cache cette difference (`user()`/`all()`/`save()`/`delete()`/`override_default()`)
+et porte la regle de partage entre modes (`CROSS_MODE_UNSAFE_KEYS` = `style`,
+`shape`, `_automation`, retirees par `strip_foreign`). `presets_for_category()`/
+`all_presets_all_modes()` d'`audio2wave_snap.py` n'en sont plus que des
+wrappers (ils passent `sys.modules[__name__]` : lance en `__main__`, snap ne doit
+pas etre recharge en seconde copie). casual-overlay (`gl_gui.mode_store`) utilise
+le meme module au lieu de ses propres classes de magasin. Imports des modules de
+mode paresseux (cycle snap/ridge). Verifie : memes resultats qu'avant pour le Mode
+VJ, `override_default` restitue bien l'etat d'origine, `check_gl.py` d'overlay passe.
+
 ### Selection automatique du premier peripherique (`audio2wave_snap.py`)
 
 Demande explicite : "par defaut selectionne le premier device dispo dans la

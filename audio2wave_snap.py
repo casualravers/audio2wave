@@ -355,67 +355,24 @@ def all_presets() -> dict[str, dict]:
 
 
 def all_presets_all_modes() -> dict[str, dict]:
-    """Presets de snap (noms nus) + ceux de live/ridge (prefixes "live:"/"ridge:"
-    pour eviter toute ambiguite de nom) -- sert au Mode VJ, demande explicite
-    ("le mode vj doit prendre en compte les presets de tous les modes, pas
-    juste snap"). Import PARESSEUX (dans la fonction, pas en tete de fichier) :
-    audio2wave_ridge.py importe deja audio2wave_snap.py en tete de fichier, un
-    import en tete inverse ici creerait un cycle -- meme precaution que les
-    imports lies a la bascule de mode (voir handle_switch()/enter_gui()).
-
-    Les cles `style`/`shape` d'un preset ETRANGER (live) sont retirees avant
-    fusion : leurs valeurs valides la-bas (analyzer/radio, bar/line) n'ont
-    aucun sens pour les attributs DE MEME NOM cote snap (pencil/rekordbox/
-    simple) -- `apply_preset()` ne filtre que par PRESENCE de la cle dans
-    `controls`, pas par la VALIDITE de la valeur pour ce style-ci, donc les
-    laisser passer appliquerait une valeur incoherente a `args.style`/
-    `args.shape`. `ridge` n'a ni l'un ni l'autre (pas de --style/--shape la-bas),
-    rien a filtrer de son cote. Le reste (gain, colors, bg_color, fullscreen,
-    line_width...) partage un sens compatible d'un mode a l'autre, ou est de
-    toute facon absent de `controls` cote snap (`ridge_spacing`, `averaging`...)
-    et deja ignore silencieusement par `apply_preset` (voir sa docstring,
-    `skipped`). L'automation (`_automation`) d'un preset etranger est aussi
-    retiree : sa structure (attributs automatables propres a CE mode) n'a pas
-    de sens transposee telle quelle dans le systeme d'automation, distinct,
-    de snap.py.
-    """
-    import audio2wave_live
-    import audio2wave_ridge
-
-    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
-    merged = dict(all_presets())
-    for prefix, store in (("live", audio2wave_live.preset_store),
-                          ("ridge", audio2wave_ridge.preset_store)):
-        for name, overrides in store.all().items():
-            if name == "default":
-                continue  # deja present (vide) depuis snap, pas la peine de dupliquer
-            merged[f"{prefix}:{name}"] = {k: v for k, v in overrides.items()
-                                          if k not in UNSAFE_CROSS_MODE_KEYS}
-    return merged
+    """Presets de snap (noms nus) + ceux de live/ridge (prefixes "live:"/"ridge:"),
+    cles internes du Mode VJ. Logique (retrait de `style`/`shape`/`_automation` des
+    presets etrangers, imports paresseux) dans `preset_registry.py`, partage avec
+    les programmes hotes ; on lui passe CE module (peut etre `__main__`) pour ne
+    pas en charger une seconde copie."""
+    import preset_registry
+    return preset_registry.all_presets_all_modes(sys.modules[__name__])
 
 
 VJ_CATEGORIES = ("snap", "live", "ridge")
 
 
 def presets_for_category(category: str) -> dict[str, dict]:
-    """Presets d'UN SEUL mode, noms NUS (jamais prefixes) -- sert au Mode VJ
-    une fois la selection en deux temps (categorie puis preset, voir
-    open_vj_editor) : contrairement a `all_presets_all_modes()`, qui aplati
-    les trois modes dans un seul espace de noms prefixe `live:`/`ridge:` pour
-    un menu deroulant PLAT, ici chaque categorie garde ses noms tels quels --
-    c'est la selection de categorie elle-meme qui leve l'ambiguite, plus
-    besoin de prefixe. `style`/`shape`/`_automation` restent filtres pour
-    live/ridge (memes raisons que `all_presets_all_modes`, un preset la-bas
-    peut encore etre choisi et applique cote snap via le Mode VJ)."""
-    import audio2wave_live
-    import audio2wave_ridge
+    """Presets d'UN SEUL mode, noms NUS, pour la selection en deux temps du Mode VJ
+    (categorie puis preset). Voir `preset_registry.presets_for_category`."""
+    import preset_registry
+    return preset_registry.presets_for_category(category, sys.modules[__name__])
 
-    if category == "snap":
-        return dict(all_presets())
-    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
-    store = audio2wave_live.preset_store if category == "live" else audio2wave_ridge.preset_store
-    return {name: {k: v for k, v in overrides.items() if k not in UNSAFE_CROSS_MODE_KEYS}
-            for name, overrides in store.all().items()}
 
 
 # Enchainements du "Mode VJ" (voir build_gui) sauvegardes depuis --gui : meme
