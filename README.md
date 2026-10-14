@@ -616,6 +616,7 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--asset-dir <dir>` | dossier ou chercher `--video`/`--video2` si le chemin donne n'existe pas tel quel | `asset` |
 | `--gui` | ouvre une fenetre de reglages en direct (voir plus bas) | - |
 | `--save-dir <dir>` | ecrit aussi chaque photo en PNG (image entiere) | - |
+| `--json-status <fichier>` | une ligne JSON par photo : `peak_dbfs`, `rms_dbfs`, `gain_db`, `kicks_s` (instants des kicks en secondes), `bpm_set`, `bpm_estimate`, `glow`. `-` = sortie standard (la ligne de statut humaine est alors supprimee). Fonction equivalente : `audio2wave_snap.analyze_block(pcm, channels, rate)` | - |
 | `--size` | resolution | largeur de l'ecran, tiers de sa hauteur |
 | `--rate auto\|<Hz>` | frequence d'echantillonnage de la capture | `auto` |
 | `--buffer <ms>` | tampon de capture | `50` |

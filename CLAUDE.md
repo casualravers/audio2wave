@@ -2037,6 +2037,29 @@ le meme module au lieu de ses propres classes de magasin. Imports des modules de
 mode paresseux (cycle snap/ridge). Verifie : memes resultats qu'avant pour le Mode
 VJ, `override_default` restitue bien l'etat d'origine, `check_gl.py` d'overlay passe.
 
+### Test de contrat (`check_contract.py`) et sortie machine (`--json-status`)
+
+`check_contract.py` (racine, pas de ffmpeg ni de fenetre ; code de sortie non nul
+si casse) verifie par `inspect` les noms et l'ORDRE des parametres dont dependent
+les hotes (casual-overlay) : `AutomationManager(root, tooltip_cls, panel_bg,
+muted_fg, accent, curve_label, on_editor_open)` + `default_on_editor_open`,
+`Tooltip(widget, text)`, `PresetStore`, les trois `build_gui(..., root,
+on_switch_mode)`, `run`/`parse_args`/`subprocess` de snap et ridge,
+`common.set_gui_accent`, `preset_registry`, `confirm_dialog`. A relancer apres
+toute modification d'API publique ; en ajouter une ligne quand un hote commence
+a dependre d'un nouveau nom.
+
+`audio2wave_snap.analyze_block(pcm, channels, rate, nominal_bpm)` renvoie un dict
+JSON (crete/RMS en dBFS, `kicks_s` en secondes, `bpm_estimate` = mediane des
+intervalles entre kicks repliee dans 70-180) avec le MEME detecteur que
+`--kick-glow` (`detect_kicks`). `--json-status <fichier|->` l'ecrit en une ligne
+par photo depuis `run()` (calcule seulement si l'option est donnee, donc aucun
+cout par defaut ; `-` = stdout et supprime la ligne de statut `\r`, sinon le flux
+serait illisible). Seul snap l'a : live n'a pas de boucle Python par image, donc
+rien a mesurer cote Python. Verifie : signal synthetique a 120 BPM -> BPM estime
+~120 ; silence -> `peak_dbfs` None ; `run()` reel avec capture/affichage
+factices ecrit bien une ligne par photo.
+
 ### Selection automatique du premier peripherique (`audio2wave_snap.py`)
 
 Demande explicite : "par defaut selectionne le premier device dispo dans la

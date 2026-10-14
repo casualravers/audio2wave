@@ -562,6 +562,12 @@ def parse_args() -> argparse.Namespace:
                          "du trace pendant que le programme tourne, sans le relancer")
     p.add_argument("--save-dir", type=Path, default=None,
                     help="Enregistre aussi chaque photo en PNG dans ce dossier, cree au besoin")
+    p.add_argument("--json-status", metavar="FICHIER", default=None,
+                    help="Ecrit une ligne JSON par photo (niveau crete/RMS, gain, kicks en "
+                         "secondes, BPM regle et estime, halo temps reel) dans ce fichier, "
+                         "ajoute en fin ; '-' = sortie standard, la ligne de statut humaine "
+                         "est alors supprimee. Sert a un programme hote (casual-overlay) qui "
+                         "veut reagir aux kicks sans refaire l'analyse")
     p.add_argument("--rate", default="auto",
                     help=f"Frequence d'echantillonnage de la capture, en Hz. 'auto' interroge le "
                          f"peripherique et prend la sienne, ce qui supprime tout "
@@ -1296,6 +1302,54 @@ def detect_kicks(pcm: bytes, channels: int, rate: int, width: int,
             kicks.append(i + 1)  # flux[i] = energy[i+1] - energy[i]
             last = i
     return [round(k * (width - 1) / max(1, n - 1)) for k in kicks]
+
+
+STATUS_KICK_RESOLUTION = 1000  # colonnes virtuelles pour convertir les kicks en secondes
+STATUS_BPM_RANGE = (70.0, 180.0)  # plage ou le BPM estime est replie (x2 / /2)
+
+
+def analyze_block(pcm: bytes, channels: int, rate: int,
+                  nominal_bpm: float | None = None) -> dict:
+    """Mesures d'un bloc PCM `s16le`, sous forme de dict JSON-serialisable, pour un
+    programme hote qui veut reagir au son sans refaire l'analyse (meme detecteur que
+    --kick-glow, `detect_kicks`, donc memes kicks que le halo).
+
+    Cles : `window_s` (duree du bloc), `peak_dbfs`/`rms_dbfs` (None si silence),
+    `kicks_s` (instants des kicks, en secondes depuis le debut du bloc),
+    `kick_count`, `bpm_set` (celui passe en parametre) et `bpm_estimate` (mediane
+    des intervalles entre kicks, repliee dans STATUS_BPM_RANGE ; None s'il y a moins
+    de 3 kicks). Une approximation, comme le detecteur lui-meme."""
+    import statistics
+
+    frames = len(pcm) // (SAMPLE_BYTES * channels) if channels else 0
+    duration = frames / rate if rate else 0.0
+    kicks_s: list[float] = []
+    bpm_estimate = None
+    if duration > 0:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % SAMPLE_BYTES])
+        columns = detect_kicks(pcm, channels, rate, STATUS_KICK_RESOLUTION, samples=samples)
+        kicks_s = [round(c / (STATUS_KICK_RESOLUTION - 1) * duration, 4) for c in columns]
+    if len(kicks_s) >= 3:
+        median = statistics.median(b - a for a, b in zip(kicks_s, kicks_s[1:]))
+        if median > 0:
+            bpm = 60.0 / median
+            low, high = STATUS_BPM_RANGE
+            while bpm < low:
+                bpm *= 2
+            while bpm > high:
+                bpm /= 2
+            bpm_estimate = round(bpm, 1)
+    peak, mean = peak_dbfs(pcm), mean_dbfs(pcm)
+    return {
+        "window_s": round(duration, 4),
+        "peak_dbfs": None if peak is None else round(peak, 2),
+        "rms_dbfs": None if mean is None else round(mean, 2),
+        "kicks_s": kicks_s,
+        "kick_count": len(kicks_s),
+        "bpm_set": nominal_bpm,
+        "bpm_estimate": bpm_estimate,
+    }
 
 
 class LiveGlowMeter:
@@ -3547,6 +3601,23 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
         capture_rate(args) * GLOW_LIVE_WINDOW_MS / 1000) * SAMPLE_BYTES * channel_count(args)
     glow_meter = LiveGlowMeter()
 
+    # --json-status : une ligne JSON par photo (voir analyze_block). "-" = stdout.
+    json_to_stdout = args.json_status == "-"
+    json_sink = None
+    if args.json_status and not json_to_stdout:
+        Path(args.json_status).parent.mkdir(parents=True, exist_ok=True)
+        json_sink = open(args.json_status, "a", encoding="utf-8", buffering=1)
+
+    def emit_json_status(pcm: bytes, gain: float) -> None:
+        record = analyze_block(pcm, channel_count(args), capture_rate(args), args.bpm)
+        record.update(t=round(time.time(), 3), gain_db=round(gain, 2), style=args.style,
+                      glow=round(glow_meter.value, 3) if args.kick_glow and args.glow_live else None)
+        line = json.dumps(record, ensure_ascii=False)
+        if json_to_stdout:
+            print(line, flush=True)
+        elif json_sink is not None:
+            json_sink.write(line + "\n")
+
     def read_live_glow() -> float | None:
         if not (args.kick_glow and args.glow_live):
             return None
@@ -3755,7 +3826,10 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             text = (f"[{time.strftime('%H:%M:%S')}] {level}{kick_info}"
                     f"{f' -> {png.name}' if png else ''}")
             status["text"] = text
-            print(f"\r{text}   ", end="", flush=True)
+            if args.json_status:
+                emit_json_status(pcm, gain)
+            if not json_to_stdout:
+                print(f"\r{text}   ", end="", flush=True)
 
             # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
             # bord droit au moment ou la photo suivante prend sa place.
@@ -3794,7 +3868,10 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     except KeyboardInterrupt:
         pass
     finally:
-        print(flush=True)
+        if not json_to_stdout:
+            print(flush=True)
+        if json_sink is not None:
+            json_sink.close()
         capture_proc.terminate()
         capture_proc.wait()
         if video is not None:
