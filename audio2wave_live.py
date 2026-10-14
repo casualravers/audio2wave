@@ -1044,9 +1044,11 @@ class AutomationManager:
         check = tk.Checkbutton(row, text="~", variable=enabled_var, command=on_toggle)
         check.pack(side="left")
         self.Tooltip(check, "Fait varier ce reglage tout seul en suivant sa propre courbe "
-                            "(bouton 'courbe' a cote) au lieu de le laisser fixe a la "
+                            "(petite vague a cote) au lieu de le laisser fixe a la "
                             "position du curseur.")
-        edit_btn = tk.Button(row, text="courbe", padx=4, pady=0,
+        # Petite vague (U+223F, ecrite en echappement: sources ASCII) plutot que
+        # le mot "courbe", comme la GUI de casual-overlay.
+        edit_btn = tk.Button(row, text="∿", padx=3, pady=0,
                              command=lambda: self.open_editor(attr))
         edit_btn.pack(side="left", padx=(4, 0))
         self.Tooltip(edit_btn, "Ouvre l'editeur de courbe pour CE reglage : glisse les points "

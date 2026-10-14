@@ -2271,7 +2271,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                                    command=on_toggle)
             check.pack(side="left")
             Tooltip(check, "Fait varier ce reglage tout seul en suivant sa propre courbe "
-                          "(bouton 'courbe' a cote) au lieu de le laisser fixe a la "
+                          "(petite vague a cote) au lieu de le laisser fixe a la "
                           "position du curseur.")
 
             # Bouton volontairement plus discret que les boutons d'action de cette
@@ -2279,7 +2279,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             # point de theme via style_gui, pas de couleur recreee ici), mais
             # marges reduites pour rester a l'echelle d'un simple bouton d'edition
             # accole a une case a cocher, pas une action principale.
-            edit_btn = tk.Button(automate_row, text="courbe", padx=4, pady=0,
+            # Petite vague (U+223F) plutot que le mot "courbe", comme la GUI de
+            # casual-overlay ; l'info-bulle ci-dessous garde l'explication.
+            edit_btn = tk.Button(automate_row, text="∿", padx=3, pady=0,
                                  command=lambda a=attr: open_curve_editor(a))
             edit_btn.pack(side="left", padx=(4, 0))
             Tooltip(edit_btn, "Ouvre l'editeur de courbe pour CE reglage : glisse les points "
