@@ -88,8 +88,37 @@ check(starts_with(ridge.build_gui, ["args", "size", "status", "stop_event", "fin
 for mod in (snap, ridge):
     check(callable(getattr(mod, "run", None)) and callable(getattr(mod, "parse_args", None)),
           f"{mod.__name__}.run / parse_args")
-    check(hasattr(mod, "subprocess"), f"{mod.__name__}.subprocess (remplacable par un hote)")
+    check("frame_sink" in params(mod.run), f"{mod.__name__}.run(..., frame_sink=...)")
+    check("argv" in params(mod.parse_args), f"{mod.__name__}.parse_args(argv=None)")
+    check(callable(getattr(mod, "start_headless", None)) and "frame_sink" in params(mod.start_headless),
+          f"{mod.__name__}.start_headless(..., frame_sink=...)")
     check(hasattr(mod, "preset_store") or hasattr(mod, "load_user_presets"), f"{mod.__name__}: magasin de presets")
+check("argv" in params(live.parse_args), "live.parse_args(argv=None)")
+
+print("contrat GUI commun (GuiController, build_gui uniforme)")
+check(isinstance(common.API_VERSION, int) and not isinstance(common.API_VERSION, bool), "common.API_VERSION entier")
+for method in ("capture_state", "apply_state", "commit_pending"):
+    check(callable(getattr(common.GuiController, method, None)), f"GuiController.{method}")
+for name, build in (("live", live.build_gui), ("snap", snap.build_gui), ("ridge", ridge.build_gui)):
+    names = params(build)
+    for option in ("on_change", "parent", "embedded", "presets_first", "compact"):
+        check(option in names, f"{name}.build_gui(..., {option}=...)")
+import threading as _threading
+import tkinter as _tk
+_root = _tk.Tk()
+try:
+    _ctl = ridge.build_gui(ridge.parse_args(["-d", "x"]), (320, 180), {}, _threading.Event(),
+                           _threading.Event(), root=_root, compact=True)
+    _root.update()
+    check(isinstance(_ctl, common.GuiController) and _ctl.mode == "ridge"
+          and {"status", "preset_menu", "save_name", "section_titles", "presets"} <= set(_ctl.widgets),
+          "build_gui renvoie un GuiController avec ses widgets nommes")
+    check(isinstance(_ctl.capture_state(), dict) and "_automation" in _ctl.capture_state(),
+          "GuiController.capture_state() -> dict avec _automation")
+finally:
+    _root.destroy()
+check(callable(live.AutomationManager.snapshot), "AutomationManager.snapshot")
+check(hasattr(common, "move_rows_to_top") and hasattr(common, "watch_args"), "common.move_rows_to_top / watch_args")
 
 print("preset_registry")
 check(preset_registry.MODES == ("snap", "live", "ridge"), "MODES")

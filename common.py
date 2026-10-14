@@ -55,6 +55,102 @@ def set_gui_accent(accent: str, accent_fg: str | None = None) -> None:
                 module.GUI_ACCENT_FG = accent_fg
 
 
+# Version de l'API publique que consomment les programmes hotes (casual-overlay) :
+# GuiController, build_gui(..., on_change/parent/embedded/presets_first/compact),
+# run(..., frame_sink), start_headless, parse_args(argv), preset_registry, hooks de
+# AutomationManager. A incrementer (entier) quand un de ces contrats change de
+# facon incompatible ; un hote compare `common.API_VERSION` a la version qu'il exige
+# au lieu de multiplier les hasattr. 1 = avant GuiController ; 2 = celle-ci.
+API_VERSION = 2
+
+
+class GuiController:
+    """Poignee renvoyee par chaque `build_gui()` : tout ce qu'un programme hote doit
+    pouvoir faire avec une fenetre de reglages sans fouiller ses widgets.
+
+    - `capture_state()` -> dict JSON des reglages courants (ce que sauvegarde un preset,
+      `_automation` compris), sans toucher au statut ni a un magasin de presets.
+    - `apply_state(state)` -> liste des cles ignorees : applique un tel dict comme le
+      ferait le chargement d'un preset, sans cliquer dans un menu ni ecrire de statut.
+    - `commit_pending()` : valide ce qui est encore en cours de saisie (champs texte
+      pas encore quittes, redemarrage differe) ; a appeler avant `capture_state()`
+      quand l'utilisateur a pu taper juste avant.
+    - `widgets` : dict de widgets nommes (cle = attribut d'`args` pour les reglages,
+      plus "status", "preset_menu", "save_name", "presets" (liste), "section_titles"
+      (liste, le « role titre de section »), "separators").
+    - `on_change` : callback `f(args)` (attribuable apres coup), appele dans le fil de
+      l'interface, regroupe (une fois par rafale de modifications d'`args`).
+    - `args` : le Namespace pilote.
+    """
+
+    def __init__(self, mode: str, args, widgets: dict, capture, apply, commit) -> None:
+        self.mode = mode
+        self.args = args
+        self.widgets = widgets
+        self.on_change = None
+        self._capture, self._apply, self._commit = capture, apply, commit
+
+    def capture_state(self) -> dict:
+        self._commit()
+        return self._capture()
+
+    def apply_state(self, state: dict) -> list[str]:
+        return self._apply(state)
+
+    def commit_pending(self) -> None:
+        self._commit()
+
+
+def watch_args(args, root, notify) -> None:
+    """Appelle `notify(args)` (regroupe, dans le fil de `root`) apres toute
+    modification d'un attribut d'`args` PAR CE FIL : le fil de rendu qui ecrit lui
+    aussi dans `args` n'en declenche pas. Remplace la classe de l'instance par une
+    sous-classe observatrice : l'objet reste le meme (le fil de rendu le partage).
+    Rappeler la fonction sur les memes `args` remplace le crochet precedent."""
+    import threading
+
+    base = type(args)
+    while getattr(base, "_a2w_watched", False):
+        base = base.__mro__[1]
+    gui_thread = threading.get_ident()
+    state = {"scheduled": False}
+
+    def flush() -> None:
+        state["scheduled"] = False
+        notify(args)
+
+    class Watched(base):
+        _a2w_watched = True
+
+        def __setattr__(self, name, value):
+            changed = name not in self.__dict__ or self.__dict__[name] != value
+            super().__setattr__(name, value)
+            # `self is args` : une copie (copy.copy) garde la classe observatrice mais ne
+            # doit pas declencher le crochet de l'original.
+            if (changed and self is args and threading.get_ident() == gui_thread
+                    and not state["scheduled"]):
+                state["scheduled"] = True
+                root.after_idle(flush)
+
+    args.__class__ = Watched
+
+
+def move_rows_to_top(root, first_row: int, last_row: int, start: int = 1) -> None:
+    """Deplace les lignes `first_row..last_row` de la grille de `root` juste a partir de
+    la ligne `start`, en decalant vers le bas ce qui s'y trouvait. Les widgets qui
+    s'etendent sur plusieurs lignes (rowspan) sont decales entiers."""
+    count = last_row - first_row + 1
+    if count <= 0 or first_row <= start:
+        return
+    for widget in root.grid_slaves():
+        info = widget.grid_info()
+        row = int(info["row"])
+        if first_row <= row <= last_row:
+            widget.grid_configure(row=start + (row - first_row))
+        elif start <= row < first_row:
+            widget.grid_configure(row=row + count)
+
+
 def _luminance(hex_color: str) -> float | None:
     """Luminance relative (WCAG) d'une couleur "#rrggbb", ou None si le format est autre."""
     if not (len(hex_color) == 7 and hex_color.startswith("#")):

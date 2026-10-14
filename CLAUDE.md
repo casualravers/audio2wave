@@ -2060,6 +2060,43 @@ rien a mesurer cote Python. Verifie : signal synthetique a 120 BPM -> BPM estime
 ~120 ; silence -> `peak_dbfs` None ; `run()` reel avec capture/affichage
 factices ecrit bien une ligne par photo.
 
+### API pour programmes hotes (casual-overlay) : controleur, mise en page, rendu sans fenetre
+
+Demande : supprimer les accrochages fragiles d'overlay (clic sur la ligne `default`, `<FocusOut>`
+synthetiques, regrid des presets, shim `subprocess`...). Tout est additif (defauts = comportement
+historique) ; `common.API_VERSION` (entier, 2) permet a un hote de tester une version plutot que des
+`hasattr`. Couvert par `check_contract.py`.
+
+- **`GuiController`** (`common.py`, sans tkinter), renvoye par les trois `build_gui()` :
+  `capture_state()` (valide d'abord ce qui est en saisie, puis dict de preset avec `_automation`),
+  `apply_state(dict)` (-> cles ignorees, comme charger un preset : pas de clic de menu, pas d'ecriture
+  dans un magasin ; en live il declenche aussi le redemarrage du producteur, seule facon de prendre
+  effet), `commit_pending()` (champs texte via `bind_commit` = Entree/FocusOut enregistres ; en live
+  avance un `apply()` differe), `widgets` (dict nomme : un widget par attribut d'`args`, plus `status`,
+  `preset_menu`, `save_name`, `presets` (liste du bloc), `section_titles`, `separators`, `root`),
+  `on_change`.
+- **`build_gui(..., *, parent, on_change, embedded, presets_first, compact)`** : `parent` remplace `root`
+  (conteneur DEDIE, vide avant construction) ; `embedded` = ni titre/redimensionnement/`protocol`, ni
+  `root.destroy()` en fin de rendu ; `compact` = marges 6/2/4 au lieu de 11/4/7 ; `presets_first` = le
+  bloc presets passe sous le titre (`common.move_rows_to_top`, sur les numeros de lignes enregistres
+  autour du bloc, pas sur des textes de labels). `on_change(args)` vient de `common.watch_args` : classe
+  observatrice posee sur l'instance (`args.__class__`, meme objet donc partage avec le fil de rendu),
+  notification regroupee via `after_idle`, uniquement pour les ecritures du fil de l'interface (le fil
+  de rendu n'en declenche pas) et pas sur une copie (`copy.copy`).
+- **`parse_args(argv=None)`** dans les trois scripts ; les `enter_gui()` n'echangent plus `sys.argv`.
+- **Rendu sans fenetre (snap, ridge)** : `run(..., frame_sink=f)` -- `f(frame, size)` recoit chaque
+  image RGB24 (tampon de travail, a copier si garde) au lieu de ffplay, via `FrameSinkViewer` (un faux
+  `Popen`) ; `--fullscreen` n'agit plus, `args.size` change -> puits recree. `start_headless(args|argv,
+  size, frame_sink, status)` ouvre capture/couleurs/fil de rendu et renvoie un `HeadlessSession`
+  (`stop()`, `alive`, `args`, `status`). Live n'en a pas : pas de rendu Python (ffmpeg -> ffplay).
+  `require_tools()` reste a la charge de l'appelant. `resolve_capture_rate(args, say)` extrait de
+  `run_app`. Verifie avec de faux `Popen` : 6+ images a la bonne taille, redimensionnement a chaud, arret
+  propre, aucun ffplay lance.
+- **`AutomationManager.snapshot()`** : etat en types simples (`enabled`, `points`, `period`, `phase`,
+  `value`) au lieu de lire `.state`. Non fait : un « chemin de reglages injectable » (les magasins de
+  presets exposent deja `preset_store.path`/`USER_PRESETS_PATH`, reaffectables) ; snap garde son
+  automation locale (pas un `AutomationManager`), donc pas de `snapshot()` cote snap.
+
 ### Defauts corriges a la source (signales par casual-overlay, qui les contournait)
 
 - **`--bar-gap` plafonne a `MAX_BAR_GAP = 0.7`** (`build_filter` ET plage du curseur) : a partir de 1, le

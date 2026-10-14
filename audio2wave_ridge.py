@@ -41,12 +41,16 @@ from audio2wave_live import (
     find_window_position, list_audio_devices, primary_screen_size, require_tools,
     secondary_monitor_rect, target_monitor_rect,
 )
+from common import GuiController, move_rows_to_top, watch_args
 # Reutilise la plomberie generique d'audio2wave_snap.py (capture, fil de lecture,
 # enveloppe d'amplitude, sonde de couleur) plutot que de la dupliquer: c'est le meme
 # choix qu'audio2wave_snap.py fait deja vis-a-vis d'audio2wave.py/audio2wave_live.py.
 # Modifier ces fonctions dans audio2wave_snap.py peut casser ce script.
 from audio2wave_snap import (
+    FrameSinkViewer,
+    HeadlessSession,
     LiveCapture,
+    resolve_capture_rate,
     amplitude_envelope,
     capture_command,
     chunk_size,
@@ -121,7 +125,8 @@ USER_PRESETS_PATH = Path.home() / ".audio2wave" / "ridge_presets.json"
 preset_store = PresetStore(PRESETS, USER_PRESETS_PATH, PRESET_ALIASES)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """`argv` : arguments a analyser (sans le nom du programme), `None` = sys.argv[1:]."""
     p = argparse.ArgumentParser(
         description="Vagues empilees facon ridge plot: chaque photo devient une ligne de "
                      "plus, qui defile devant les precedentes comme un sismographe.",
@@ -209,7 +214,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                     help="Affiche les commandes ffmpeg/ffplay sans les executer")
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.list_presets:
         preset_store.print_all()
@@ -221,7 +226,7 @@ def parse_args() -> argparse.Namespace:
         # a toute option explicite, preset ou pas -- meme mecanique
         # qu'audio2wave_snap.py (voir sa propre gestion de --preset).
         p.set_defaults(**preset_store.all()[args.preset])
-        args = p.parse_args()
+        args = p.parse_args(argv)
 
     # Ce script ne trace jamais qu'un seul trait: pas de --stereo/--split-channels.
     # Les fonctions importees d'audio2wave_snap.py lisent quand meme ces deux
@@ -478,8 +483,16 @@ def viewer_command(args: argparse.Namespace, size: tuple[int, int],
 def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
              stop_event: threading.Event, finished_event: threading.Event,
              root: "tk.Tk | None" = None,
-             on_switch_mode: Callable[[str], None] | None = None) -> None:
+             on_switch_mode: Callable[[str], None] | None = None,
+             *, parent: object | None = None,
+             on_change: Callable[[argparse.Namespace], None] | None = None,
+             embedded: bool = False, presets_first: bool = False,
+             compact: bool = False) -> "GuiController":
     """Petite fenetre de reglages en direct.
+
+    Options pour un programme HOTE, memes qu'audio2wave_snap.py (voir sa
+    docstring) : `parent`, `embedded`, `presets_first`, `compact`, `on_change`.
+    Renvoie un `GuiController` (capture_state/apply_state/commit_pending/widgets).
 
     Ne touche a rien d'autre qu'aux attributs de `args`: le fil de rendu (run(), dans
     un thread separe) les relit a chaque ligne, donc un changement ici prend effet a
@@ -501,14 +514,26 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     docstring de build_gui() pour le detail. `None` (defaut, ex. appel direct
     dans un test) leur fait juste afficher un message plutot que planter.
     """
+    host_on_change = on_change  # `on_change` est aussi le nom d'une fonction locale d'add_slider
+    if root is None and parent is not None:
+        root = parent
     if root is None:
         root = tk.Tk()
     else:
         for child in list(root.winfo_children()):
             child.destroy()
-    root.title("audio2wave ridge - reglages")
-    root.resizable(False, False)
+    if not embedded:
+        root.title("audio2wave ridge - reglages")
+        root.resizable(False, False)
     style_gui(root)
+
+    widgets: dict = {"root": root, "section_titles": [], "separators": [], "presets": []}
+    commit_callbacks: list[Callable[[], None]] = []
+
+    def bind_commit(entry: object, handler: Callable[..., None]) -> None:
+        entry.bind("<Return>", handler)
+        entry.bind("<FocusOut>", handler)
+        commit_callbacks.append(handler)
 
     refresh_after_id: dict[str, str | None] = {"id": None}
 
@@ -527,9 +552,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # audio2wave_live.py --gui desormais (voir leurs docstrings) : demande
     # explicite ("rend les GUI de live et ridge moins hautes et plus large,
     # pour que l'on puisse tout voir sur 1 ecran facilement").
-    ROW_PADX = 11
-    ROW_PADY = 4
-    SECTION_GAP = 7
+    ROW_PADX = 6 if compact else 11
+    ROW_PADY = 2 if compact else 4
+    SECTION_GAP = 4 if compact else 7
     LEFT_LABEL_COL, LEFT_CTRL_COL = 0, 1
     SPACER_COL = 2
     RIGHT_LABEL_COL, RIGHT_CTRL_COL = 3, 4
@@ -558,15 +583,17 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
     def add_section_title(panel: str, title: str) -> None:
         label_col, ctrl_col = cols(panel)
-        tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG,
-                ).grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
-                       padx=ROW_PADX, pady=(0, 2))
+        title_label = tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG)
+        title_label.grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
+                         padx=ROW_PADX, pady=(0, 2))
+        widgets["section_titles"].append(title_label)
 
     def add_separator(panel: str, title: str | None = None) -> None:
         label_col, ctrl_col = cols(panel)
-        tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-            row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
-            padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        line = tk.Frame(root, bg=GUI_PANEL_BG, height=1)
+        line.grid(row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
+                  padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        widgets["separators"].append(line)
         if title:
             add_section_title(panel, title)
 
@@ -662,6 +689,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             holder.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
         scale = tk.Scale(holder, from_=lo, to=hi, resolution=step, orient="horizontal",
                          variable=var, length=170, showvalue=True, command=on_change)
+        widgets[attr] = scale
         if automatable:
             scale.pack(side="top", anchor="w")
         else:
@@ -709,8 +737,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
         entry = tk.Entry(root, textvariable=var, width=20)
         entry.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
-        entry.bind("<Return>", apply)
-        entry.bind("<FocusOut>", apply)
+        widgets[attr] = entry
+        bind_commit(entry, apply)
 
         def set_value(value: object) -> None:
             var.set(value or "")
@@ -766,9 +794,11 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # rejouer exactement ce chemin existant.
     gain_holder = tk.Frame(root)
     gain_holder.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
-    tk.Scale(gain_holder, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
-            length=170, showvalue=True, command=lambda *_: on_gain_change(),
-            ).pack(side="top", anchor="w")
+    gain_scale = tk.Scale(gain_holder, from_=-40, to=40, resolution=1, orient="horizontal",
+                          variable=gain_db_var, length=170, showvalue=True,
+                          command=lambda *_: on_gain_change())
+    gain_scale.pack(side="top", anchor="w")
+    widgets["gain"] = gain_scale
     automation.register(gain_holder, "gain", "Gain manuel (dB)", -40, 40)
     add_slider("Lissage (lignes)", "gain_window", 1, 60, 1, panel="right",
               tooltip="Nombre de lignes recentes sur lesquelles le gain automatique lisse "
@@ -803,8 +833,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                                                          "cree au besoin. Vide = desactive.")
     save_entry = tk.Entry(root, textvariable=save_var, width=20)
     save_entry.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
-    save_entry.bind("<Return>", apply_save_dir)
-    save_entry.bind("<FocusOut>", apply_save_dir)
+    widgets["save_dir"] = save_entry
+    bind_commit(save_entry, apply_save_dir)
 
     # --size/--fullscreen: redemarrent la fenetre ffplay (et recreent le canevas a
     # la nouvelle taille), meme mecanique qu'audio2wave_snap.py --gui -- voir
@@ -836,8 +866,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     for var in (width_var, height_var):
         entry = tk.Entry(size_frame, textvariable=var, width=6)
         entry.pack(side="left", padx=(0, 6))
-        entry.bind("<Return>", apply_size)
-        entry.bind("<FocusOut>", apply_size)
+        bind_commit(entry, apply_size)
 
     fullscreen_var = tk.BooleanVar(value=args.fullscreen)
 
@@ -874,6 +903,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     tk.Label(root, text="PRESETS", font=GUI_FONT_SMALL, fg=GUI_MUTED_FG,
             ).grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                    padx=ROW_PADX, pady=(0, 2))
+    presets_block_first_row = row_shared - 2  # separateur + titre ci-dessus
 
     # "size" n'est volontairement PAS dans `controls` (voir plus haut, aucun
     # setter enregistre pour lui) -- independant du rendu, meme raison
@@ -934,6 +964,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     preset_menu = tk.OptionMenu(preset_frame, preset_var, "")
     style_option_menu(preset_menu)
     preset_menu.pack(side="left")
+    widgets["preset_menu"] = preset_menu
 
     def on_update_preset() -> None:
         name = preset_var.get()
@@ -982,6 +1013,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     save_preset_frame.grid(row=r, column=1, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     save_name_entry = tk.Entry(save_preset_frame, textvariable=save_name_var, width=14)
     save_name_entry.pack(side="left")
+    widgets["save_name"] = save_name_entry
+    presets_block_last_row = r
 
     def on_save_preset(_evt: object = None) -> None:
         from preset_registry import normalize_name
@@ -1016,15 +1049,37 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # dedie a la difference d'audio2wave_live.py.
     root.after(AUTOMATE_TICK_MS, lambda: automation.tick(controls, finished_event))
 
+    widgets["status"] = status_label
+
     def refresh() -> None:
         status_label.config(text=status.get("text", ""))
         if finished_event.is_set():
-            root.destroy()
+            if not embedded:  # un hote garde sa fenetre : il voit finished_event lui-meme
+                root.destroy()
             return
         refresh_after_id["id"] = root.after(200, refresh)
 
-    root.protocol("WM_DELETE_WINDOW", stop_event.set)
+    if not embedded:
+        root.protocol("WM_DELETE_WINDOW", stop_event.set)
     refresh()
+
+    block_first = presets_block_first_row
+    if presets_first:
+        move_rows_to_top(root, presets_block_first_row, presets_block_last_row)
+        block_first = 1
+    block_last = block_first + (presets_block_last_row - presets_block_first_row)
+    widgets["presets"] = [w for w in root.grid_slaves()
+                          if block_first <= int(w.grid_info()["row"]) <= block_last]
+
+    def commit_now() -> None:
+        for handler in commit_callbacks:
+            handler()
+
+    controller = GuiController("ridge", args, widgets, capture_overrides, apply_preset, commit_now)
+    if host_on_change is not None:
+        controller.on_change = host_on_change
+    watch_args(args, root, lambda a: controller.on_change(a) if controller.on_change else None)
+    return controller
     # PAS de root.mainloop()/root.destroy() ici -- voir la docstring de cette
     # fonction et celle de build_gui() dans audio2wave_snap.py: `root` est
     # partage entre les trois modes, mainloop() n'est demarre QU'UNE FOIS par
@@ -1034,10 +1089,16 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink: bytes,
        capture_proc: subprocess.Popen, viewer: subprocess.Popen, capture: LiveCapture,
        canvas: bytearray, status: dict, stop_event: threading.Event,
-       finished_event: threading.Event) -> None:
+       finished_event: threading.Event, *,
+       frame_sink: Callable[[object, tuple[int, int]], None] | None = None) -> None:
     """Boucle de capture/rendu/affichage. Tourne dans un fil separe quand --gui est
     actif (pour laisser tkinter posseder le fil principal), directement dans main()
     sinon.
+
+    `frame_sink(frame, size)` : si fourni, les images vont a ce callback au lieu de
+    ffplay (voir `FrameSinkViewer` dans audio2wave_snap.py) ; `viewer` est alors
+    ignore (peut valoir None), `--fullscreen` n'a plus d'effet et un changement de
+    `args.size` recree le puits et le canevas a la nouvelle taille.
 
     --size/--fullscreen suivent le meme traitement que dans audio2wave_snap.py --gui
     (voir sa docstring de run() pour le detail) : contrairement au reste de cette
@@ -1057,6 +1118,9 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     ciblage de moniteur (find_window_position/SDL_VIDEO_WINDOW_POS) ici : pas
     demande, et ce script n'a pas plusieurs fenetres video a repositionner.
     """
+    if frame_sink is not None:
+        viewer = FrameSinkViewer(frame_sink, size)
+
     def stop_viewer(v: subprocess.Popen) -> None:
         try:
             v.stdin.close()  # EOF: -autoexit referme la fenetre d'elle-meme
@@ -1113,7 +1177,7 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                 status["text"] = f"entree audio: {args.device}"
 
             current_size = resolve_size(args)
-            if current_size != size or args.fullscreen != last_fullscreen:
+            if current_size != size or (frame_sink is None and args.fullscreen != last_fullscreen):
                 status["text"] = f"changement d'affichage -> {current_size[0]}x{current_size[1]}..."
                 # Position de la fenetre ENCORE OUVERTE, retrouvee par son titre
                 # avant de la fermer -- PRESERVE une position choisie/deplacee a
@@ -1123,15 +1187,19 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                 # mecanique qu'audio2wave_snap.py, voir sa docstring de run()).
                 # `monitor` determine, lui, le moniteur a remplir en plein
                 # ecran borderless -- celui qui heberge deja cette position.
-                old_title = window_title(args)
-                position = find_window_position(old_title)
-                monitor = target_monitor_rect(old_title)
+                if frame_sink is None:
+                    old_title = window_title(args)
+                    position = find_window_position(old_title)
+                    monitor = target_monitor_rect(old_title)
                 stop_viewer(viewer)
                 size = current_size
                 width, height = size
                 last_fullscreen = args.fullscreen
-                viewer = subprocess.Popen(viewer_command(args, size, position, monitor),
-                                          stdin=subprocess.PIPE)
+                if frame_sink is not None:
+                    viewer = FrameSinkViewer(frame_sink, size)
+                else:
+                    viewer = subprocess.Popen(viewer_command(args, size, position, monitor),
+                                              stdin=subprocess.PIPE)
                 canvas = bytearray(background * (width * height))
                 status["text"] = (f"affichage: {size[0]}x{size[1]}"
                                   f"{' plein ecran' if args.fullscreen else ''}")
@@ -1226,6 +1294,40 @@ def main() -> None:
         return
 
     run_app(args, size)
+
+
+def start_headless(args: argparse.Namespace | None = None, *, argv: list[str] | None = None,
+                   size: tuple[int, int] | None = None,
+                   frame_sink: Callable[[object, tuple[int, int]], None],
+                   status: dict | None = None) -> HeadlessSession:
+    """Lance le rendu SANS fenetre ni ffplay : chaque image va a `frame_sink(frame,
+    size)`. Meme contrat que `audio2wave_snap.start_headless` (voir sa docstring) ;
+    ici une entree audio (`args.device`) est obligatoire (ValueError sinon), ce mode
+    n'ayant pas de capture "vide" en attente d'un choix."""
+    if args is None:
+        args = parse_args(argv)
+    if not args.device:
+        raise ValueError("start_headless: args.device est obligatoire pour ridge")
+    if size is not None:
+        args.size = f"{size[0]}x{size[1]}"
+    size = resolve_size(args)
+    if args.save_dir:
+        args.save_dir.mkdir(parents=True, exist_ok=True)
+    resolve_capture_rate(args, say=lambda *a, **k: None)
+    background = probe_color(args.bg_color)
+    ink = probe_color(args.colors)
+    capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
+    capture = LiveCapture(capture_proc.stdout, chunk_size(args))
+    canvas = bytearray(background * (size[0] * size[1]))
+    status = status if status is not None else {}
+    stop_event = threading.Event()
+    finished_event = threading.Event()
+    thread = threading.Thread(
+        target=run, daemon=True, kwargs={"frame_sink": frame_sink},
+        args=(args, size, background, ink, capture_proc, None, capture, canvas, status,
+              stop_event, finished_event))
+    thread.start()
+    return HeadlessSession(args, thread, stop_event, finished_event, status, {"capture": capture})
 
 
 def run_app(args: argparse.Namespace, size: tuple[int, int],
@@ -1362,12 +1464,7 @@ def enter_gui(device: str, root: "tk.Tk | None" = None) -> None:
     obligatoire au demarrage, voir main()) -- garanti par request_switch()
     cote appelant.
     """
-    saved_argv = sys.argv
-    try:
-        sys.argv = ["audio2wave_ridge.py", "-d", device, "--gui"]
-        args = parse_args()
-    finally:
-        sys.argv = saved_argv
+    args = parse_args(["-d", device, "--gui"])
     require_tools()
     size = resolve_size(args)
     run_app(args, size, root=root)

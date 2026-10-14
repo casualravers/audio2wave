@@ -32,6 +32,7 @@ from audio2wave import (
     style_option_menu,
 )
 from common import (
+    GuiController, move_rows_to_top, watch_args,
     capture_input_args, find_window_position, list_audio_devices, measure_level,
     primary_screen_size, require_tools, secondary_monitor_rect,
     set_window_title, target_monitor_rect,
@@ -79,7 +80,8 @@ LINE_WIN_SIZE = 2048
 MAX_BAR_GAP = 0.7
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """`argv` : arguments a analyser (sans le nom du programme), `None` = sys.argv[1:]."""
     p = argparse.ArgumentParser(
         description="Analyseur de spectre temps reel sur une entree audio (carte son, table de mixage).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -164,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                     help="Affiche les commandes ffmpeg/ffplay sans les executer")
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.list_presets:
         preset_store.print_all()
@@ -176,7 +178,7 @@ def parse_args() -> argparse.Namespace:
         # a toute option explicite, preset ou pas -- meme mecanique
         # qu'audio2wave_snap.py (voir sa propre gestion de --preset).
         p.set_defaults(**preset_store.all()[args.preset])
-        args = p.parse_args()
+        args = p.parse_args(argv)
 
     return args
 
@@ -1236,6 +1238,31 @@ class AutomationManager:
             for attr, state in self.state.items()
         }
 
+    def snapshot(self) -> dict:
+        """Etat lisible de chaque curseur automatable, en types Python simples (aucun
+        tk.Variable) : `label`, `lo`, `hi`, `enabled`, `points`, `period` (secondes),
+        `phase` (0..1 dans le cycle courant, 0 si inactif) et `value` (valeur que la
+        courbe donne maintenant, dans [lo, hi], None si inactif). Pour qu'un hote ou
+        un test lise l'automation sans toucher a `self.state`."""
+        now = time.monotonic()
+        out = {}
+        for attr, state in self.state.items():
+            enabled = bool(state["enabled"].get())
+            period = max(0.5, float(state["period"].get()))
+            points = list(state["points"])
+            phase, value = 0.0, None
+            if enabled and points:
+                phase = ((now - state["start"]) / period) % 1.0
+                n = len(points)
+                pos = phase * n
+                i0, frac = int(pos) % n, pos - int(pos)
+                v = points[i0] + (points[(i0 + 1) % n] - points[i0]) * frac
+                value = state["lo"] + (state["hi"] - state["lo"]) * v
+            out[attr] = {"label": state["label"], "lo": state["lo"], "hi": state["hi"],
+                         "enabled": enabled, "points": points, "period": period,
+                         "phase": round(phase, 4), "value": value}
+        return out
+
     def apply(self, data: dict) -> None:
         for attr, entry in data.items():
             state = self.state.get(attr)
@@ -1278,8 +1305,18 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
              restart_event: threading.Event, stop_event: threading.Event,
              finished_event: threading.Event,
              root: "tk.Tk | None" = None,
-             on_switch_mode: Callable[[str], None] | None = None) -> None:
+             on_switch_mode: Callable[[str], None] | None = None,
+             *, parent: object | None = None,
+             on_change: Callable[[argparse.Namespace], None] | None = None,
+             embedded: bool = False, presets_first: bool = False,
+             compact: bool = False) -> "GuiController":
     """Petite fenetre de reglages.
+
+    Options pour un programme HOTE, memes qu'audio2wave_snap.py (voir sa
+    docstring) : `parent`, `embedded`, `presets_first`, `compact`, `on_change`.
+    Renvoie un `GuiController`. Ici `args` ne change qu'a chaque `apply()` (le
+    redemarrage differe), donc `on_change` aussi, et `commit_pending()` declenche
+    tout de suite un `apply()` en attente au lieu d'attendre le delai.
 
     A la difference de audio2wave_snap.py/audio2wave_ridge.py, un changement ici ne
     prend pas effet tout seul: ce script n'a pas de boucle Python par image a relire.
@@ -1306,14 +1343,20 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     -- voir sa docstring pour le detail. `None` (defaut, ex. appel direct dans
     un test) leur fait juste afficher un message plutot que planter.
     """
+    host_on_change = on_change
+    if root is None and parent is not None:
+        root = parent
     if root is None:
         root = tk.Tk()
     else:
         for child in list(root.winfo_children()):
             child.destroy()
-    root.title("audio2wave live - reglages")
-    root.resizable(False, False)
+    if not embedded:
+        root.title("audio2wave live - reglages")
+        root.resizable(False, False)
     style_gui(root)
+
+    widgets: dict = {"root": root, "section_titles": [], "separators": [], "presets": []}
 
     refresh_after_id: dict[str, str | None] = {"id": None}
 
@@ -1376,9 +1419,9 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     # colonne unique rendait cette fenetre plus haute qu'un ecran usuel --
     # demande explicite ("rend les GUI de live et ridge moins hautes et plus
     # large, pour que l'on puisse tout voir sur 1 ecran facilement").
-    ROW_PADX = 11
-    ROW_PADY = 4
-    SECTION_GAP = 7
+    ROW_PADX = 6 if compact else 11
+    ROW_PADY = 2 if compact else 4
+    SECTION_GAP = 4 if compact else 7
     LEFT_LABEL_COL, LEFT_CTRL_COL = 0, 1
     SPACER_COL = 2
     RIGHT_LABEL_COL, RIGHT_CTRL_COL = 3, 4
@@ -1407,15 +1450,17 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
 
     def add_section_title(panel: str, title: str) -> None:
         label_col, ctrl_col = cols(panel)
-        tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG,
-                ).grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
-                       padx=ROW_PADX, pady=(0, 2))
+        title_label = tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG)
+        title_label.grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
+                         padx=ROW_PADX, pady=(0, 2))
+        widgets["section_titles"].append(title_label)
 
     def add_separator(panel: str, title: str | None = None) -> None:
         label_col, ctrl_col = cols(panel)
-        tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-            row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
-            padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        line = tk.Frame(root, bg=GUI_PANEL_BG, height=1)
+        line.grid(row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
+                  padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        widgets["separators"].append(line)
         if title:
             add_section_title(panel, title)
 
@@ -1522,7 +1567,9 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         r = next_row(panel)
         add_label(label, r, label_col, tooltip=tooltip)
         var = tk.StringVar(value=initial)
-        tk.Entry(root, textvariable=var, width=20).grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        entry = tk.Entry(root, textvariable=var, width=20)
+        entry.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        widgets[attr] = entry
         var.trace_add("write", schedule_apply)
 
         def set_value(value: object) -> None:
@@ -1553,6 +1600,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
             holder.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
         scale = tk.Scale(holder, from_=lo, to=hi, resolution=step, orient="horizontal",
                          variable=var, length=170, showvalue=True)
+        widgets[attr] = scale
         var.trace_add("write", schedule_apply)
         if automatable:
             scale.pack(side="top", anchor="w")
@@ -1578,6 +1626,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
         menu = tk.OptionMenu(root, var, *choices)
         style_option_menu(menu)
         menu.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        widgets[attr] = menu
         var.trace_add("write", schedule_apply)
         controls[attr] = var.set
         return var
@@ -1697,6 +1746,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     tk.Label(root, text="PRESETS", font=GUI_FONT_SMALL, fg=GUI_MUTED_FG,
             ).grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                    padx=ROW_PADX, pady=(0, 2))
+    presets_block_first_row = row_shared - 2  # separateur + titre ci-dessus
 
     # "size" en est exclu (independant du rendu, meme raison
     # qu'audio2wave_snap.py -- voir PRESET_EXCLUDED_CONTROLS la-bas) ;
@@ -1767,6 +1817,7 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     preset_menu = tk.OptionMenu(preset_frame, preset_var, "")
     style_option_menu(preset_menu)
     preset_menu.pack(side="left")
+    widgets["preset_menu"] = preset_menu
 
     def on_update_preset() -> None:
         name = preset_var.get()
@@ -1823,6 +1874,8 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     save_preset_frame.grid(row=r, column=1, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     save_name_entry = tk.Entry(save_preset_frame, textvariable=save_name_var, width=14)
     save_name_entry.pack(side="left")
+    widgets["save_name"] = save_name_entry
+    presets_block_last_row = r
 
     def on_save_preset(_evt: object = None) -> None:
         from preset_registry import normalize_name
@@ -1885,15 +1938,45 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     root.after(AUTOMATE_TICK_MS, lambda: automation.tick(controls, finished_event))
     root.after(int(AUTO_RESTART_INTERVAL_S * 1000), automation_restart_tick)
 
+    widgets["status"] = status_label
+
     def refresh() -> None:
         status_label.config(text=status.get("text", ""))
         if finished_event.is_set():
-            root.destroy()
+            if not embedded:  # un hote garde sa fenetre : il voit finished_event lui-meme
+                root.destroy()
             return
         refresh_after_id["id"] = root.after(200, refresh)
 
-    root.protocol("WM_DELETE_WINDOW", stop_event.set)
+    if not embedded:
+        root.protocol("WM_DELETE_WINDOW", stop_event.set)
     refresh()
+
+    block_first = presets_block_first_row
+    if presets_first:
+        move_rows_to_top(root, presets_block_first_row, presets_block_last_row)
+        block_first = 1
+    block_last = block_first + (presets_block_last_row - presets_block_first_row)
+    widgets["presets"] = [w for w in root.grid_slaves()
+                          if block_first <= int(w.grid_info()["row"]) <= block_last]
+
+    def apply_state_now(state: dict) -> list[str]:
+        skipped = apply_preset(state)
+        apply()  # ici rien ne prend effet sans redemarrage du producteur (voir on_load_preset)
+        return skipped
+
+    def commit_now() -> None:
+        # Un redemarrage differe (debounce) est avance au lieu d'attendre son delai.
+        if apply_after_id["id"] is not None:
+            root.after_cancel(apply_after_id["id"])
+            apply_after_id["id"] = None
+            apply()
+
+    controller = GuiController("live", args, widgets, capture_overrides, apply_state_now, commit_now)
+    if host_on_change is not None:
+        controller.on_change = host_on_change
+    watch_args(args, root, lambda a: controller.on_change(a) if controller.on_change else None)
+    return controller
     # PAS de root.mainloop()/root.destroy() ici -- voir la docstring de cette
     # fonction et celle de build_gui() dans audio2wave_snap.py: `root` est
     # partage entre les trois modes, mainloop() n'est demarre QU'UNE FOIS par
@@ -2042,12 +2125,7 @@ def enter_gui(device: str, root: "tk.Tk | None" = None) -> None:
     garanti par request_switch() cote appelant (snap refuse de basculer sans
     entree choisie, et rester dans live/ridge suppose deja en avoir une).
     """
-    saved_argv = sys.argv
-    try:
-        sys.argv = ["audio2wave_live.py", "-d", device, "--gui"]
-        args = parse_args()
-    finally:
-        sys.argv = saved_argv
+    args = parse_args(["-d", device, "--gui"])
     require_tools()
     width, height = resolve_size(args)
     run_app(args, width, height, root=root)
