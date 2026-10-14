@@ -39,6 +39,153 @@ GUI_FONT_MONO = ("Consolas", 9)
 GUI_FONT_SMALL = ("Segoe UI", 8, "bold")
 
 
+def set_gui_accent(accent: str, accent_fg: str | None = None) -> None:
+    """Change l'accent de la palette pour tous les modules audio2wave DEJA importes.
+
+    Chaque module fait `from common import GUI_ACCENT` (copie a l'import), donc
+    changer la constante de `common` seule ne suffit pas : un programme hote
+    (ex. casual-overlay) doit appeler ceci AVANT de construire les widgets, au
+    lieu d'aller reecrire les constantes module par module. Sans effet sur les
+    modules pas encore importes (ils liront la valeur de `common` modifiee)."""
+    for name in ("common", "audio2wave", "audio2wave_live", "audio2wave_snap", "audio2wave_ridge"):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "GUI_ACCENT"):
+            module.GUI_ACCENT = accent
+            if accent_fg is not None and hasattr(module, "GUI_ACCENT_FG"):
+                module.GUI_ACCENT_FG = accent_fg
+
+
+# Version de l'API publique que consomment les programmes hotes (casual-overlay) :
+# GuiController, build_gui(..., on_change/parent/embedded/presets_first/compact),
+# run(..., frame_sink), start_headless, parse_args(argv), preset_registry, hooks de
+# AutomationManager. A incrementer (entier) quand un de ces contrats change de
+# facon incompatible ; un hote compare `common.API_VERSION` a la version qu'il exige
+# au lieu de multiplier les hasattr. 1 = avant GuiController ; 2 = celle-ci.
+API_VERSION = 2
+
+
+class GuiController:
+    """Poignee renvoyee par chaque `build_gui()` : tout ce qu'un programme hote doit
+    pouvoir faire avec une fenetre de reglages sans fouiller ses widgets.
+
+    - `capture_state()` -> dict JSON des reglages courants (ce que sauvegarde un preset,
+      `_automation` compris), sans toucher au statut ni a un magasin de presets.
+    - `apply_state(state)` -> liste des cles ignorees : applique un tel dict comme le
+      ferait le chargement d'un preset, sans cliquer dans un menu ni ecrire de statut.
+    - `commit_pending()` : valide ce qui est encore en cours de saisie (champs texte
+      pas encore quittes, redemarrage differe) ; a appeler avant `capture_state()`
+      quand l'utilisateur a pu taper juste avant.
+    - `widgets` : dict de widgets nommes (cle = attribut d'`args` pour les reglages,
+      plus "status", "preset_menu", "save_name", "presets" (liste), "section_titles"
+      (liste, le « role titre de section »), "separators").
+    - `on_change` : callback `f(args)` (attribuable apres coup), appele dans le fil de
+      l'interface, regroupe (une fois par rafale de modifications d'`args`).
+    - `args` : le Namespace pilote.
+    """
+
+    def __init__(self, mode: str, args, widgets: dict, capture, apply, commit) -> None:
+        self.mode = mode
+        self.args = args
+        self.widgets = widgets
+        self.on_change = None
+        self._capture, self._apply, self._commit = capture, apply, commit
+
+    def capture_state(self) -> dict:
+        self._commit()
+        return self._capture()
+
+    def apply_state(self, state: dict) -> list[str]:
+        return self._apply(state)
+
+    def commit_pending(self) -> None:
+        self._commit()
+
+
+def watch_args(args, root, notify) -> None:
+    """Appelle `notify(args)` (regroupe, dans le fil de `root`) apres toute
+    modification d'un attribut d'`args` PAR CE FIL : le fil de rendu qui ecrit lui
+    aussi dans `args` n'en declenche pas. Remplace la classe de l'instance par une
+    sous-classe observatrice : l'objet reste le meme (le fil de rendu le partage).
+    Rappeler la fonction sur les memes `args` remplace le crochet precedent."""
+    import threading
+
+    base = type(args)
+    while getattr(base, "_a2w_watched", False):
+        base = base.__mro__[1]
+    gui_thread = threading.get_ident()
+    state = {"scheduled": False}
+
+    def flush() -> None:
+        state["scheduled"] = False
+        notify(args)
+
+    class Watched(base):
+        _a2w_watched = True
+
+        def __setattr__(self, name, value):
+            changed = name not in self.__dict__ or self.__dict__[name] != value
+            super().__setattr__(name, value)
+            # `self is args` : une copie (copy.copy) garde la classe observatrice mais ne
+            # doit pas declencher le crochet de l'original.
+            if (changed and self is args and threading.get_ident() == gui_thread
+                    and not state["scheduled"]):
+                state["scheduled"] = True
+                root.after_idle(flush)
+
+    args.__class__ = Watched
+
+
+def move_rows_to_top(root, first_row: int, last_row: int, start: int = 1) -> None:
+    """Deplace les lignes `first_row..last_row` de la grille de `root` juste a partir de
+    la ligne `start`, en decalant vers le bas ce qui s'y trouvait. Les widgets qui
+    s'etendent sur plusieurs lignes (rowspan) sont decales entiers."""
+    count = last_row - first_row + 1
+    if count <= 0 or first_row <= start:
+        return
+    for widget in root.grid_slaves():
+        info = widget.grid_info()
+        row = int(info["row"])
+        if first_row <= row <= last_row:
+            widget.grid_configure(row=start + (row - first_row))
+        elif start <= row < first_row:
+            widget.grid_configure(row=row + count)
+
+
+def _luminance(hex_color: str) -> float | None:
+    """Luminance relative (WCAG) d'une couleur "#rrggbb", ou None si le format est autre."""
+    if not (len(hex_color) == 7 and hex_color.startswith("#")):
+        return None
+    try:
+        channels = [int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    except ValueError:
+        return None
+    lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def readable_fg(bg: str, dark: str | None = None, light: str | None = None) -> str:
+    """Texte lisible sur `bg` : le plus contraste de `dark` (defaut GUI_ACCENT_FG) et
+    `light` (defaut GUI_FG). Sert au survol des menus et selects, dont le fond est
+    l'accent : un accent clair (turquoise) garde son texte sombre, un accent plus
+    sature ou plus sombre (le bleu d'un programme hote) recoit du texte clair au
+    lieu de rester quasi noir dessus."""
+    dark = dark or GUI_ACCENT_FG
+    light = light or GUI_FG
+    lum_bg = _luminance(bg)
+    lum_dark, lum_light = _luminance(dark), _luminance(light)
+    if lum_bg is None or lum_dark is None or lum_light is None:
+        return dark
+
+    def contrast(a: float, b: float) -> float:
+        return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+    # Texte sombre seulement s'il atteint un contraste confortable (4,5, seuil WCAG AA) :
+    # sur un bleu moyen les deux choix mesurent presque pareil (~3,9 contre ~3,7), mais le
+    # texte clair y est celui qui se lit le mieux a l'ecran.
+    c_dark, c_light = contrast(lum_bg, lum_dark), contrast(lum_bg, lum_light)
+    return dark if c_dark >= 4.5 and c_dark >= c_light else light
+
+
 def style_gui(root) -> None:
     """Theme sombre applique aux fenetres --gui, pour un rendu plus soigne que le
     gris Tk par defaut.
@@ -94,23 +241,39 @@ def style_gui(root) -> None:
     root.option_add("*Menu.Background", GUI_PANEL_BG)
     root.option_add("*Menu.Foreground", GUI_FG)
     root.option_add("*Menu.activeBackground", GUI_ACCENT)
-    root.option_add("*Menu.activeForeground", GUI_ACCENT_FG)
+    root.option_add("*Menu.activeForeground", readable_fg(GUI_ACCENT))
     root.option_add("*Menubutton.Background", GUI_PANEL_BG)
     root.option_add("*Menubutton.relief", "flat")
     root.option_add("*Menubutton.highlightThickness", 0)
 
 
-def style_option_menu(menu_widget) -> None:
+def style_option_menu(menu_widget, hover_fg: str | None = None) -> None:
     """A appeler apres chaque tk.OptionMenu(...): contrairement aux autres widgets
     classiques, OptionMenu fixe ses propres couleurs a la construction, ignorant le
     theme pose par style_gui via option_add. Reconfigure le bouton et son menu
     deroulant (`["menu"]`, une fenetre Tk separee, pas touchee par la config du
-    bouton) a la main pour rattraper les deux."""
+    bouton) a la main pour rattraper les deux. `hover_fg` : couleur du texte au
+    survol (sur le fond d'accent) ; par defaut le plus contraste des deux, voir
+    `readable_fg`."""
+    hover_fg = hover_fg or readable_fg(GUI_ACCENT)
     menu_widget.configure(bg=GUI_PANEL_BG, fg=GUI_FG, activebackground=GUI_ACCENT,
-                          activeforeground=GUI_ACCENT_FG, highlightthickness=0,
+                          activeforeground=hover_fg, highlightthickness=0,
                           relief="flat", bd=0, padx=8, pady=3)
     menu_widget["menu"].configure(bg=GUI_PANEL_BG, fg=GUI_FG, activebackground=GUI_ACCENT,
-                                  activeforeground=GUI_ACCENT_FG)
+                                  activeforeground=hover_fg)
+
+
+def make_scrollbar(parent, command, **options):
+    """Ascenseur vertical au theme sombre (le `tk.Scrollbar` natif reste clair sous
+    Windows). Fabrique unique : un programme hote peut la remplacer par la sienne
+    (`common.make_scrollbar = ...`) sans toucher aux fenetres qui l'appellent.
+    Import tkinter paresseux : ce module reste utilisable sans interface."""
+    import tkinter as tk
+    settings = dict(orient="vertical", command=command, bg=GUI_PANEL_BG, troughcolor=GUI_BG,
+                    activebackground=GUI_ACCENT, highlightthickness=0, bd=0, relief="flat",
+                    elementborderwidth=0, width=12)
+    settings.update(options)
+    return tk.Scrollbar(parent, **settings)
 
 
 def parse_size(size: str) -> tuple[int, int]:

@@ -45,6 +45,7 @@ from audio2wave_live import (
     Tooltip, confirm_dialog, find_window_position, list_audio_devices, primary_screen_size,
     require_tools, secondary_monitor_rect, target_monitor_rect,
 )
+from common import GuiController, move_rows_to_top, watch_args
 
 # Format du flux PCM intermediaire. Contrairement aux deux autres scripts, l'audio
 # transite par Python entre la capture et le rendu: fixer le format a la sortie de
@@ -355,67 +356,24 @@ def all_presets() -> dict[str, dict]:
 
 
 def all_presets_all_modes() -> dict[str, dict]:
-    """Presets de snap (noms nus) + ceux de live/ridge (prefixes "live:"/"ridge:"
-    pour eviter toute ambiguite de nom) -- sert au Mode VJ, demande explicite
-    ("le mode vj doit prendre en compte les presets de tous les modes, pas
-    juste snap"). Import PARESSEUX (dans la fonction, pas en tete de fichier) :
-    audio2wave_ridge.py importe deja audio2wave_snap.py en tete de fichier, un
-    import en tete inverse ici creerait un cycle -- meme precaution que les
-    imports lies a la bascule de mode (voir handle_switch()/enter_gui()).
-
-    Les cles `style`/`shape` d'un preset ETRANGER (live) sont retirees avant
-    fusion : leurs valeurs valides la-bas (analyzer/radio, bar/line) n'ont
-    aucun sens pour les attributs DE MEME NOM cote snap (pencil/rekordbox/
-    simple) -- `apply_preset()` ne filtre que par PRESENCE de la cle dans
-    `controls`, pas par la VALIDITE de la valeur pour ce style-ci, donc les
-    laisser passer appliquerait une valeur incoherente a `args.style`/
-    `args.shape`. `ridge` n'a ni l'un ni l'autre (pas de --style/--shape la-bas),
-    rien a filtrer de son cote. Le reste (gain, colors, bg_color, fullscreen,
-    line_width...) partage un sens compatible d'un mode a l'autre, ou est de
-    toute facon absent de `controls` cote snap (`ridge_spacing`, `averaging`...)
-    et deja ignore silencieusement par `apply_preset` (voir sa docstring,
-    `skipped`). L'automation (`_automation`) d'un preset etranger est aussi
-    retiree : sa structure (attributs automatables propres a CE mode) n'a pas
-    de sens transposee telle quelle dans le systeme d'automation, distinct,
-    de snap.py.
-    """
-    import audio2wave_live
-    import audio2wave_ridge
-
-    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
-    merged = dict(all_presets())
-    for prefix, store in (("live", audio2wave_live.preset_store),
-                          ("ridge", audio2wave_ridge.preset_store)):
-        for name, overrides in store.all().items():
-            if name == "default":
-                continue  # deja present (vide) depuis snap, pas la peine de dupliquer
-            merged[f"{prefix}:{name}"] = {k: v for k, v in overrides.items()
-                                          if k not in UNSAFE_CROSS_MODE_KEYS}
-    return merged
+    """Presets de snap (noms nus) + ceux de live/ridge (prefixes "live:"/"ridge:"),
+    cles internes du Mode VJ. Logique (retrait de `style`/`shape`/`_automation` des
+    presets etrangers, imports paresseux) dans `preset_registry.py`, partage avec
+    les programmes hotes ; on lui passe CE module (peut etre `__main__`) pour ne
+    pas en charger une seconde copie."""
+    import preset_registry
+    return preset_registry.all_presets_all_modes(sys.modules[__name__])
 
 
 VJ_CATEGORIES = ("snap", "live", "ridge")
 
 
 def presets_for_category(category: str) -> dict[str, dict]:
-    """Presets d'UN SEUL mode, noms NUS (jamais prefixes) -- sert au Mode VJ
-    une fois la selection en deux temps (categorie puis preset, voir
-    open_vj_editor) : contrairement a `all_presets_all_modes()`, qui aplati
-    les trois modes dans un seul espace de noms prefixe `live:`/`ridge:` pour
-    un menu deroulant PLAT, ici chaque categorie garde ses noms tels quels --
-    c'est la selection de categorie elle-meme qui leve l'ambiguite, plus
-    besoin de prefixe. `style`/`shape`/`_automation` restent filtres pour
-    live/ridge (memes raisons que `all_presets_all_modes`, un preset la-bas
-    peut encore etre choisi et applique cote snap via le Mode VJ)."""
-    import audio2wave_live
-    import audio2wave_ridge
+    """Presets d'UN SEUL mode, noms NUS, pour la selection en deux temps du Mode VJ
+    (categorie puis preset). Voir `preset_registry.presets_for_category`."""
+    import preset_registry
+    return preset_registry.presets_for_category(category, sys.modules[__name__])
 
-    if category == "snap":
-        return dict(all_presets())
-    UNSAFE_CROSS_MODE_KEYS = {"style", "shape", "_automation"}
-    store = audio2wave_live.preset_store if category == "live" else audio2wave_ridge.preset_store
-    return {name: {k: v for k, v in overrides.items() if k not in UNSAFE_CROSS_MODE_KEYS}
-            for name, overrides in store.all().items()}
 
 
 # Enchainements du "Mode VJ" (voir build_gui) sauvegardes depuis --gui : meme
@@ -479,7 +437,9 @@ def preset_value(raw: str) -> str:
     raise argparse.ArgumentTypeError(f"preset inconnu: {raw} (disponibles: {describe_presets()})")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """`argv` : arguments a analyser (sans le nom du programme), `None` = sys.argv[1:].
+    Permet a un programme hote de construire des `args` sans toucher a sys.argv."""
     p = argparse.ArgumentParser(
         description="Photo de la waveform d'une entree audio, rafraichie a intervalle regulier.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -605,6 +565,12 @@ def parse_args() -> argparse.Namespace:
                          "du trace pendant que le programme tourne, sans le relancer")
     p.add_argument("--save-dir", type=Path, default=None,
                     help="Enregistre aussi chaque photo en PNG dans ce dossier, cree au besoin")
+    p.add_argument("--json-status", metavar="FICHIER", default=None,
+                    help="Ecrit une ligne JSON par photo (niveau crete/RMS, gain, kicks en "
+                         "secondes, BPM regle et estime, halo temps reel) dans ce fichier, "
+                         "ajoute en fin ; '-' = sortie standard, la ligne de statut humaine "
+                         "est alors supprimee. Sert a un programme hote (casual-overlay) qui "
+                         "veut reagir aux kicks sans refaire l'analyse")
     p.add_argument("--rate", default="auto",
                     help=f"Frequence d'echantillonnage de la capture, en Hz. 'auto' interroge le "
                          f"peripherique et prend la sienne, ce qui supprime tout "
@@ -618,7 +584,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                     help="Affiche les commandes ffmpeg/ffplay sans les executer")
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.list_presets:
         reverse_alias = {name: alias for alias, name in PRESET_ALIASES.items()}
@@ -654,7 +620,7 @@ def parse_args() -> argparse.Namespace:
         if overrides.get("save_dir") is not None:
             overrides["save_dir"] = Path(overrides["save_dir"])
         p.set_defaults(**overrides)
-        args = p.parse_args()  # re-parse: --preset est deja resolu, refait a l'identique
+        args = p.parse_args(argv)  # re-parse: --preset est deja resolu, refait a l'identique
 
     # --interval reste la mesure de reference partout dans le programme; --bpm/--beats
     # ne sont qu'une facon plus musicale de le fixer.
@@ -1341,6 +1307,54 @@ def detect_kicks(pcm: bytes, channels: int, rate: int, width: int,
     return [round(k * (width - 1) / max(1, n - 1)) for k in kicks]
 
 
+STATUS_KICK_RESOLUTION = 1000  # colonnes virtuelles pour convertir les kicks en secondes
+STATUS_BPM_RANGE = (70.0, 180.0)  # plage ou le BPM estime est replie (x2 / /2)
+
+
+def analyze_block(pcm: bytes, channels: int, rate: int,
+                  nominal_bpm: float | None = None) -> dict:
+    """Mesures d'un bloc PCM `s16le`, sous forme de dict JSON-serialisable, pour un
+    programme hote qui veut reagir au son sans refaire l'analyse (meme detecteur que
+    --kick-glow, `detect_kicks`, donc memes kicks que le halo).
+
+    Cles : `window_s` (duree du bloc), `peak_dbfs`/`rms_dbfs` (None si silence),
+    `kicks_s` (instants des kicks, en secondes depuis le debut du bloc),
+    `kick_count`, `bpm_set` (celui passe en parametre) et `bpm_estimate` (mediane
+    des intervalles entre kicks, repliee dans STATUS_BPM_RANGE ; None s'il y a moins
+    de 3 kicks). Une approximation, comme le detecteur lui-meme."""
+    import statistics
+
+    frames = len(pcm) // (SAMPLE_BYTES * channels) if channels else 0
+    duration = frames / rate if rate else 0.0
+    kicks_s: list[float] = []
+    bpm_estimate = None
+    if duration > 0:
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - len(pcm) % SAMPLE_BYTES])
+        columns = detect_kicks(pcm, channels, rate, STATUS_KICK_RESOLUTION, samples=samples)
+        kicks_s = [round(c / (STATUS_KICK_RESOLUTION - 1) * duration, 4) for c in columns]
+    if len(kicks_s) >= 3:
+        median = statistics.median(b - a for a, b in zip(kicks_s, kicks_s[1:]))
+        if median > 0:
+            bpm = 60.0 / median
+            low, high = STATUS_BPM_RANGE
+            while bpm < low:
+                bpm *= 2
+            while bpm > high:
+                bpm /= 2
+            bpm_estimate = round(bpm, 1)
+    peak, mean = peak_dbfs(pcm), mean_dbfs(pcm)
+    return {
+        "window_s": round(duration, 4),
+        "peak_dbfs": None if peak is None else round(peak, 2),
+        "rms_dbfs": None if mean is None else round(mean, 2),
+        "kicks_s": kicks_s,
+        "kick_count": len(kicks_s),
+        "bpm_set": nominal_bpm,
+        "bpm_estimate": bpm_estimate,
+    }
+
+
 class LiveGlowMeter:
     """Lissage attaque/relachement du niveau audio courant, pour --glow-live.
 
@@ -1658,6 +1672,66 @@ def send_frame(viewer: subprocess.Popen, frame) -> bool:
         return False
 
 
+class FrameSinkViewer:
+    """Se fait passer pour le `Popen` de ffplay (ce que `run()` en utilise : `stdin`
+    ecrivable/fermable, `poll()`, `terminate()`, `wait()`) mais remet chaque image a
+    `sink(frame, size)` au lieu de l'afficher. `frame` est un bloc RGB24 de
+    `largeur*hauteur*3` octets ; c'est le tampon de travail de `run()`, a COPIER si
+    l'appelant le garde apres le retour. Un hote (casual-overlay) l'utilise avec
+    `run(..., frame_sink=...)`/`start_headless()` au lieu de remplacer
+    `subprocess` dans ce module."""
+
+    def __init__(self, sink: Callable[[object, tuple[int, int]], None],
+                 size: tuple[int, int]) -> None:
+        self.size = size
+        self._sink = sink
+        self._closed = False
+        self.stdin = self
+
+    def write(self, data) -> int:
+        if self._closed:
+            raise BrokenPipeError("FrameSinkViewer ferme")
+        self._sink(data, self.size)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self._closed = True
+
+    def poll(self) -> int | None:
+        return 0 if self._closed else None
+
+    def terminate(self) -> None:
+        self._closed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+class HeadlessSession:
+    """Session de rendu sans fenetre (voir `start_headless`). `status` : dict dont
+    `status["text"]` est la derniere ligne de statut ; `args` : le Namespace pilote
+    (modifiable en direct, comme avec --gui) ; `stop()` arrete proprement."""
+
+    def __init__(self, args, thread, stop_event, finished_event, status, capture_state) -> None:
+        self.args = args
+        self.thread = thread
+        self.stop_event = stop_event
+        self.finished_event = finished_event
+        self.status = status
+        self.capture_state = capture_state
+
+    @property
+    def alive(self) -> bool:
+        return self.thread.is_alive()
+
+    def stop(self, timeout: float | None = 10.0) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout)
+
+
 def draw_progressively(viewer: subprocess.Popen, previous: bytes, frame: bytes,
                        size: tuple[int, int], deadline: float, fps: int) -> bool:
     """Dessine l'image de gauche a droite, pour atteindre le bord droit a l'echeance.
@@ -1848,8 +1922,25 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
              capture_state: dict, stop_event: threading.Event,
              finished_event: threading.Event,
              root: "tk.Tk | None" = None,
-             on_switch_mode: Callable[[str], None] | None = None) -> None:
+             on_switch_mode: Callable[[str], None] | None = None,
+             *, parent: object | None = None,
+             on_change: Callable[[argparse.Namespace], None] | None = None,
+             embedded: bool = False, presets_first: bool = False,
+             compact: bool = False) -> "GuiController":
     """Petite fenetre de reglages en direct.
+
+    Options pour un programme HOTE (identiques dans les trois build_gui, voir
+    `common.GuiController`) -- toutes optionnelles, defauts = comportement
+    historique :
+    - `parent` : conteneur (Tk, Toplevel ou Frame DEDIE : il est vide avant de
+      construire) a la place de `root`.
+    - `embedded` : pas de titre/redimensionnement de fenetre, pas de
+      `root.destroy()` quand le rendu se termine -- l'hote possede la fenetre.
+    - `presets_first` : le bloc des presets passe tout en haut, sous le titre.
+    - `compact` : marges de lignes reduites.
+    - `on_change(args)` : appele (dans le fil de l'interface, regroupe) apres chaque
+      modification d'`args` par la fenetre.
+    Renvoie un `GuiController` (capture_state/apply_state/commit_pending/widgets).
 
     `root` (voir run_app() plus bas) : la fenetre Tk a peupler. Fournie et
     PARTAGEE entre les trois modes des qu'un switch a deja eu lieu (voir
@@ -1902,6 +1993,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     perimee des le premier changement de peripherique.
     """
     width = size[0]
+    host_on_change = on_change  # `on_change` est aussi le nom d'une fonction locale d'add_slider
+    if root is None and parent is not None:
+        root = parent
     if root is None:
         root = tk.Tk()
     else:
@@ -1912,9 +2006,22 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         # courbe, popup Mode VJ...) laissees ouvertes par le mode precedent.
         for child in list(root.winfo_children()):
             child.destroy()
-    root.title("audio2wave snap - reglages")
-    root.resizable(False, False)
+    if not embedded:
+        root.title("audio2wave snap - reglages")
+        root.resizable(False, False)
     style_gui(root)
+
+    # Poignee pour un hote (voir common.GuiController) : widgets nommes, entrees
+    # de texte a valider (commit_pending), crochet on_change.
+    widgets: dict = {"root": root, "section_titles": [], "separators": [], "presets": []}
+    commit_callbacks: list[Callable[[], None]] = []
+
+    def bind_commit(entry: object, handler: Callable[..., None]) -> None:
+        """Valide un champ texte sur Entree et a la perte du focus, et le
+        memorise pour GuiController.commit_pending()."""
+        entry.bind("<Return>", handler)
+        entry.bind("<FocusOut>", handler)
+        commit_callbacks.append(handler)
 
     # Reprogramme apres chaque refresh() (voir la fin de cette fonction) ; une
     # bascule de mode l'annule AVANT d'arreter le fil de rendu (voir
@@ -1928,9 +2035,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # Un point de reglage unique, reutilise par add_label/add_slider/add_entry/
     # add_dropdown/add_separator ci-dessous, plutot que des litteraux repetes a
     # chaque grid()/pack() : une seule valeur a retoucher si besoin.
-    ROW_PADX = 11
-    ROW_PADY = 4
-    SECTION_GAP = 7  # au-dessus/en-dessous d'un separateur de section
+    ROW_PADX = 6 if compact else 11
+    ROW_PADY = 2 if compact else 4
+    SECTION_GAP = 4 if compact else 7  # au-dessus/en-dessous d'un separateur de section
 
     # Disposition en deux colonnes de reglages (gauche/droite) plutot qu'une seule
     # liste verticale: une fenetre a la hauteur d'un ecran entier avec autant de
@@ -1977,15 +2084,17 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         # rendu "plus moderne" : une fenetre organisee en groupes nommes plutot
         # qu'une seule longue liste coupee de traits fins anonymes.
         label_col, ctrl_col = cols(panel)
-        tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG,
-                ).grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
-                       padx=ROW_PADX, pady=(0, 2))
+        title_label = tk.Label(root, text=title.upper(), font=GUI_FONT_SMALL, fg=GUI_MUTED_FG)
+        title_label.grid(row=next_row(panel), column=label_col, columnspan=2, sticky="w",
+                         padx=ROW_PADX, pady=(0, 2))
+        widgets["section_titles"].append(title_label)
 
     def add_separator(panel: str, title: str | None = None) -> None:
         label_col, ctrl_col = cols(panel)
-        tk.Frame(root, bg=GUI_PANEL_BG, height=1).grid(
-            row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
-            padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        line = tk.Frame(root, bg=GUI_PANEL_BG, height=1)
+        line.grid(row=next_row(panel), column=label_col, columnspan=2, sticky="ew",
+                  padx=ROW_PADX, pady=(SECTION_GAP, SECTION_GAP if title is None else 4))
+        widgets["separators"].append(line)
         if title:
             add_section_title(panel, title)
 
@@ -2223,6 +2332,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
         scale = tk.Scale(holder, from_=lo, to=hi, resolution=step, orient="horizontal",
                          variable=var, length=170, showvalue=True, command=on_change)
+        widgets[attr] = scale
         if automatable:
             scale.pack(side="top", anchor="w")
         else:
@@ -2271,7 +2381,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                                    command=on_toggle)
             check.pack(side="left")
             Tooltip(check, "Fait varier ce reglage tout seul en suivant sa propre courbe "
-                          "(bouton 'courbe' a cote) au lieu de le laisser fixe a la "
+                          "(petite vague a cote) au lieu de le laisser fixe a la "
                           "position du curseur.")
 
             # Bouton volontairement plus discret que les boutons d'action de cette
@@ -2279,7 +2389,9 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
             # point de theme via style_gui, pas de couleur recreee ici), mais
             # marges reduites pour rester a l'echelle d'un simple bouton d'edition
             # accole a une case a cocher, pas une action principale.
-            edit_btn = tk.Button(automate_row, text="courbe", padx=4, pady=0,
+            # Petite vague (U+223F) plutot que le mot "courbe", comme la GUI de
+            # casual-overlay ; l'info-bulle ci-dessous garde l'explication.
+            edit_btn = tk.Button(automate_row, text="∿", padx=3, pady=0,
                                  command=lambda a=attr: open_curve_editor(a))
             edit_btn.pack(side="left", padx=(4, 0))
             Tooltip(edit_btn, "Ouvre l'editeur de courbe pour CE reglage : glisse les points "
@@ -2407,8 +2519,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 
         entry = tk.Entry(root, textvariable=var, width=width_chars)
         entry.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
-        entry.bind("<Return>", apply)
-        entry.bind("<FocusOut>", apply)
+        widgets[attr] = entry
+        bind_commit(entry, apply)
 
         def set_value(value: object) -> None:
             var.set(value or "")
@@ -2431,6 +2543,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         menu = tk.OptionMenu(root, var, *choices)
         style_option_menu(menu)
         menu.grid(row=r, column=ctrl_col, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+        widgets[attr] = menu
         controls[attr] = var.set
 
     colors_var = add_entry(
@@ -2467,7 +2580,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                        "d'oscillations sur la largeur.")
     tk.Scale(root, from_=1, to=64, resolution=1, orient="horizontal", variable=wave_cycles,
             length=170, showvalue=True,
-            command=lambda _v: on_wave_change()).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
+            command=lambda *_: on_wave_change()).grid(row=r, column=1, padx=ROW_PADX, pady=ROW_PADY)
 
     add_slider("Points / colonnes", "columns", 0, 400, 4,
               initial=args.columns if args.columns is not None else PENCIL_POINTS,
@@ -2560,8 +2673,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
         video_frame.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
         entry = tk.Entry(video_frame, textvariable=var, width=14)
         entry.pack(side="left")
-        entry.bind("<Return>", apply)
-        entry.bind("<FocusOut>", apply)
+        widgets[attr] = entry
+        bind_commit(entry, apply)
 
         def on_browse() -> None:
             # initialdir: le dossier du fichier deja saisi s'il existe, sinon
@@ -2638,8 +2751,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     for var in (low_var, high_var):
         entry = tk.Entry(cross_frame, textvariable=var, width=6)
         entry.pack(side="left", padx=(0, 6))
-        entry.bind("<Return>", apply_crossover)
-        entry.bind("<FocusOut>", apply_crossover)
+        bind_commit(entry, apply_crossover)
 
     # Separateur: bascule des controles de trace (rekordbox/simple ci-dessus) au
     # gain, qui s'applique lui a tous les styles.
@@ -2674,7 +2786,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     add_label("Gain manuel", r, RIGHT_LABEL_COL,
              tooltip="En dB, actif quand gain automatique est decoche.")
     tk.Scale(root, from_=-40, to=40, resolution=1, orient="horizontal", variable=gain_db_var,
-            length=170, showvalue=True, command=lambda _v: on_gain_change(),
+            length=170, showvalue=True, command=lambda *_: on_gain_change(),
             ).grid(row=r, column=RIGHT_CTRL_COL, padx=ROW_PADX, pady=ROW_PADY)
 
     # Tuning: mesure la crete (et le facteur de crete, pour detecter un ecretage
@@ -2757,8 +2869,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     for var in (width_var, height_var):
         entry = tk.Entry(size_frame, textvariable=var, width=6)
         entry.pack(side="left", padx=(0, 6))
-        entry.bind("<Return>", apply_size)
-        entry.bind("<FocusOut>", apply_size)
+        bind_commit(entry, apply_size)
 
     # --fullscreen : bascule juste a cote de la taille, meme redemarrage de
     # viewer -- utile en particulier pour SORTIR d'un plein ecran ouvert sur le
@@ -2808,8 +2919,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                      "besoin. Vide = desactive.")
     save_entry = tk.Entry(root, textvariable=save_var, width=18)
     save_entry.grid(row=r, column=RIGHT_CTRL_COL, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
-    save_entry.bind("<Return>", apply_save_dir)
-    save_entry.bind("<FocusOut>", apply_save_dir)
+    widgets["save_dir"] = save_entry
+    bind_commit(save_entry, apply_save_dir)
 
     # =========================== SECTION PARTAGEE ===========================
     # A partir d'ici, tout court sur la largeur totale des deux panneaux, sous le
@@ -2878,6 +2989,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     # "club" en depend deja, voir plus haut) : seule la taille en pixels est
     # exclue ici, pas le mode plein ecran.
     PRESET_EXCLUDED_CONTROLS = {"size"}
+    presets_block_first_row = row_shared - 2  # separateur + titre "Presets" ci-dessus
 
     # Cle reservee (prefixe "_", ne collisionne avec aucun `dest` argparse) qui
     # porte l'etat de la "Variation automatique" (case ~, courbe, vitesse) par
@@ -2954,6 +3066,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     preset_menu = tk.OptionMenu(preset_frame, preset_var, "")
     style_option_menu(preset_menu)
     preset_menu.pack(side="left")
+    widgets["preset_menu"] = preset_menu
 
     def on_load_preset(name: str) -> None:
         presets = all_presets()
@@ -3075,9 +3188,11 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     save_preset_frame.grid(row=r, column=1, columnspan=2, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
     save_name_entry = tk.Entry(save_preset_frame, textvariable=save_name_var, width=14)
     save_name_entry.pack(side="left")
+    widgets["save_name"] = save_name_entry
 
     def on_save_preset(_evt: object = None) -> None:
-        name = save_name_var.get().strip().lower()
+        from preset_registry import normalize_name
+        name = normalize_name(save_name_var.get())
         if not name:
             status["text"] = "nom de preset vide"
             return
@@ -3410,7 +3525,8 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                              selectforeground=GUI_ACCENT_FG, activestyle="none",
                              exportselection=False, font=GUI_FONT_MONO)
         listbox.pack(side="left", fill="both", expand=True)
-        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        import common  # attribut lu a l'appel : un hote peut remplacer common.make_scrollbar
+        scrollbar = common.make_scrollbar(list_frame, listbox.yview)
         scrollbar.pack(side="left", fill="y")
         listbox.config(yscrollcommand=scrollbar.set)
         vj_state["listbox"] = listbox
@@ -3459,6 +3575,7 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
                      "boucle -- pour planifier un set entier a l'avance.")
     tk.Button(root, text="Ouvrir...", command=open_vj_editor).grid(
         row=r, column=1, sticky="w", padx=ROW_PADX, pady=ROW_PADY)
+    presets_block_last_row = r
 
     def vj_tick() -> None:
         # Tourne dans le fil tkinter (root.after), jamais dans run() : un
@@ -3512,15 +3629,43 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
     status_label.grid(row=next_shared_row(), column=0, columnspan=TOTAL_COLUMNS, sticky="w",
                       padx=ROW_PADX, pady=(8, 8))
 
+    widgets["status"] = status_label
+
     def refresh() -> None:
         status_label.config(text=status.get("text", ""))
         if finished_event.is_set():
-            root.destroy()
+            if not embedded:  # un hote garde sa fenetre : il voit finished_event lui-meme
+                root.destroy()
             return
         refresh_after_id["id"] = root.after(200, refresh)
 
-    root.protocol("WM_DELETE_WINDOW", stop_event.set)
+    if not embedded:
+        root.protocol("WM_DELETE_WINDOW", stop_event.set)
     refresh()
+
+    block_first = presets_block_first_row
+    if presets_first:
+        move_rows_to_top(root, presets_block_first_row, presets_block_last_row)
+        block_first = 1
+    block_last = block_first + (presets_block_last_row - presets_block_first_row)
+    widgets["presets"] = [w for w in root.grid_slaves()
+                          if block_first <= int(w.grid_info()["row"]) <= block_last]
+
+    def capture_state_now() -> dict:
+        return capture_overrides()
+
+    def apply_state_now(state: dict) -> list[str]:
+        return apply_preset(state)
+
+    def commit_now() -> None:
+        for handler in commit_callbacks:
+            handler()
+
+    controller = GuiController("snap", args, widgets, capture_state_now, apply_state_now, commit_now)
+    if host_on_change is not None:
+        controller.on_change = host_on_change
+    watch_args(args, root, lambda a: controller.on_change(a) if controller.on_change else None)
+    return controller
     # PAS de root.mainloop()/root.destroy() ici: `root` est desormais PARTAGE
     # entre les trois modes (bascule EN PLACE dans la MEME fenetre reelle, pas
     # seulement le meme processus -- voir "Bascule de mode EN PLACE, MEME
@@ -3537,11 +3682,20 @@ def build_gui(args: argparse.Namespace, size: tuple[int, int], status: dict,
 def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink: bytes,
        capture_proc: subprocess.Popen, viewer: subprocess.Popen, capture: LiveCapture,
        status: dict, capture_state: dict, stop_event: threading.Event,
-       finished_event: threading.Event) -> None:
+       finished_event: threading.Event, *,
+       frame_sink: Callable[[object, tuple[int, int]], None] | None = None) -> None:
     """Boucle de capture/rendu/affichage. Tourne dans un fil separe quand --gui est
     actif (pour laisser tkinter posseder le fil principal), directement dans main()
     sinon.
+
+    `frame_sink(frame, size)` : si fourni, les images ne vont pas a ffplay mais a ce
+    callback (voir `FrameSinkViewer`) ; `viewer` est alors ignore (peut valoir None),
+    aucune fenetre ni moniteur n'est gere (`--fullscreen` n'a plus d'effet), et un
+    changement de taille (`args.size`) recree simplement le puits a la nouvelle taille.
     """
+    if frame_sink is not None:
+        viewer = FrameSinkViewer(frame_sink, size)
+
     def stop_viewer(v: subprocess.Popen) -> None:
         # Factorise entre le redemarrage sur changement de --size (voir plus bas)
         # et le nettoyage final (bloc finally) : fermer stdin (EOF, -autoexit
@@ -3587,6 +3741,23 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     glow_live_window_bytes = round(
         capture_rate(args) * GLOW_LIVE_WINDOW_MS / 1000) * SAMPLE_BYTES * channel_count(args)
     glow_meter = LiveGlowMeter()
+
+    # --json-status : une ligne JSON par photo (voir analyze_block). "-" = stdout.
+    json_to_stdout = args.json_status == "-"
+    json_sink = None
+    if args.json_status and not json_to_stdout:
+        Path(args.json_status).parent.mkdir(parents=True, exist_ok=True)
+        json_sink = open(args.json_status, "a", encoding="utf-8", buffering=1)
+
+    def emit_json_status(pcm: bytes, gain: float) -> None:
+        record = analyze_block(pcm, channel_count(args), capture_rate(args), args.bpm)
+        record.update(t=round(time.time(), 3), gain_db=round(gain, 2), style=args.style,
+                      glow=round(glow_meter.value, 3) if args.kick_glow and args.glow_live else None)
+        line = json.dumps(record, ensure_ascii=False)
+        if json_to_stdout:
+            print(line, flush=True)
+        elif json_sink is not None:
+            json_sink.write(line + "\n")
 
     def read_live_glow() -> float | None:
         if not (args.kick_glow and args.glow_live):
@@ -3666,7 +3837,7 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             # decoche "Plein ecran" avec une taille explicite deja fixee -- rien que
             # la comparaison de taille seule ne detecterait.
             current_size = resolve_size(args)
-            if current_size != size or args.fullscreen != last_fullscreen:
+            if current_size != size or (frame_sink is None and args.fullscreen != last_fullscreen):
                 status["text"] = f"changement d'affichage -> {current_size[0]}x{current_size[1]}..."
                 # Position de la fenetre ENCORE OUVERTE, retrouvee par son titre
                 # avant de la fermer (meme technique qu'audio2wave_live.py) :
@@ -3674,14 +3845,18 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
                 # fenetre. `monitor` (voir target_monitor_rect()) determine, lui,
                 # le moniteur a remplir en plein ecran borderless -- celui qui
                 # heberge deja cette position si elle est connue.
-                old_title = window_title(args)
-                position = find_window_position(old_title)
-                monitor = target_monitor_rect(old_title)
+                if frame_sink is None:
+                    old_title = window_title(args)
+                    position = find_window_position(old_title)
+                    monitor = target_monitor_rect(old_title)
                 size = current_size
                 last_fullscreen = args.fullscreen
                 stop_viewer(viewer)
-                viewer = subprocess.Popen(viewer_command(args, size, position, monitor),
-                                          stdin=subprocess.PIPE)
+                if frame_sink is not None:
+                    viewer = FrameSinkViewer(frame_sink, size)
+                else:
+                    viewer = subprocess.Popen(viewer_command(args, size, position, monitor),
+                                              stdin=subprocess.PIPE)
                 previous_frame = background * (size[0] * size[1])
                 if video is not None:
                     video.stop()
@@ -3796,7 +3971,10 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
             text = (f"[{time.strftime('%H:%M:%S')}] {level}{kick_info}"
                     f"{f' -> {png.name}' if png else ''}")
             status["text"] = text
-            print(f"\r{text}   ", end="", flush=True)
+            if args.json_status:
+                emit_json_status(pcm, gain)
+            if not json_to_stdout:
+                print(f"\r{text}   ", end="", flush=True)
 
             # Le trace occupe exactement ce qui reste du creneau: le trait atteint le
             # bord droit au moment ou la photo suivante prend sa place.
@@ -3835,7 +4013,10 @@ def run(args: argparse.Namespace, size: tuple[int, int], background: bytes, ink:
     except KeyboardInterrupt:
         pass
     finally:
-        print(flush=True)
+        if not json_to_stdout:
+            print(flush=True)
+        if json_sink is not None:
+            json_sink.close()
         capture_proc.terminate()
         capture_proc.wait()
         if video is not None:
@@ -3924,6 +4105,70 @@ def main() -> None:
     run_app(args, size)
 
 
+def resolve_capture_rate(args: argparse.Namespace, say: Callable[..., None] = print) -> None:
+    """Fixe `args.rate` : celle imposee, sinon la frequence native du peripherique
+    (aucun reechantillonnage), sinon DEFAULT_CAPTURE_RATE. `say` recoit les messages
+    (un hote silencieux passe `lambda *a, **k: None`)."""
+    if args.rate is None:
+        # Sans peripherique encore choisi (--gui, voir plus haut), interroger
+        # une entree vide n'aurait aucun sens -- reste sur le repli
+        # (DEFAULT_CAPTURE_RATE) le temps que l'utilisateur en selectionne un.
+        native = probe_device_rate(args) if args.device else None
+        if native:
+            args.rate = native
+            say(f"Capture a {native} Hz, la frequence du peripherique: aucun "
+                f"reechantillonnage.", flush=True)
+        else:
+            args.rate = DEFAULT_CAPTURE_RATE
+            say(f"Frequence du peripherique non lisible, capture a "
+                f"{DEFAULT_CAPTURE_RATE} Hz (voir --rate).", flush=True)
+    else:
+        say(f"Capture a {args.rate} Hz (impose).", flush=True)
+
+
+def start_headless(args: argparse.Namespace | None = None, *, argv: list[str] | None = None,
+                   size: tuple[int, int] | None = None,
+                   frame_sink: Callable[[object, tuple[int, int]], None],
+                   status: dict | None = None) -> HeadlessSession:
+    """Lance le rendu SANS fenetre ni ffplay : chaque image va a `frame_sink(frame,
+    size)` (voir `FrameSinkViewer`). Point d'entree public pour un programme hote, a
+    la place de remplacer `subprocess` dans ce module et de recopier le demarrage de
+    `run_app()` (frequence, couleurs, capture).
+
+    - `args` : un Namespace (de `parse_args`) ou, a defaut, construit par
+      `parse_args(argv)`. Il reste pilotable en direct pendant que la session tourne.
+    - `size` : taille des images ; sinon `resolve_size(args)` (taille de l'ecran !).
+      Fixee dans `args.size`, donc ce qu'`args.size` dit ensuite change la taille.
+    - `require_tools()` est a la charge de l'appelant.
+    Renvoie un `HeadlessSession` (`stop()`, `alive`, `status`, `args`)."""
+    if args is None:
+        args = parse_args(argv)
+    if size is not None:
+        args.size = f"{size[0]}x{size[1]}"
+    size = resolve_size(args)
+    if args.save_dir:
+        args.save_dir.mkdir(parents=True, exist_ok=True)
+    resolve_capture_rate(args, say=lambda *a, **k: None)
+    background = probe_color(resolve_bg(args))
+    ink = probe_color(resolve_colors(args)[0])
+    if args.device:
+        capture_proc = subprocess.Popen(capture_command(args), stdout=subprocess.PIPE)
+        capture = LiveCapture(capture_proc.stdout, chunk_size(args))
+    else:
+        capture_proc = NoDeviceProcess()
+        capture = NoDeviceCapture()
+    status = status if status is not None else {}
+    capture_state: dict = {"capture": capture}
+    stop_event = threading.Event()
+    finished_event = threading.Event()
+    thread = threading.Thread(
+        target=run, daemon=True, kwargs={"frame_sink": frame_sink},
+        args=(args, size, background, ink, capture_proc, None, capture, status, capture_state,
+              stop_event, finished_event))
+    thread.start()
+    return HeadlessSession(args, thread, stop_event, finished_event, status, capture_state)
+
+
 def run_app(args: argparse.Namespace, size: tuple[int, int],
            root: "tk.Tk | None" = None) -> None:
     """Coeur d'execution, factorise hors de main() pour etre rappele quand un
@@ -3951,21 +4196,7 @@ def run_app(args: argparse.Namespace, size: tuple[int, int],
     if args.save_dir:
         args.save_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.rate is None:
-        # Sans peripherique encore choisi (--gui, voir plus haut), interroger
-        # une entree vide n'aurait aucun sens -- reste sur le repli
-        # (DEFAULT_CAPTURE_RATE) le temps que l'utilisateur en selectionne un.
-        native = probe_device_rate(args) if args.device else None
-        if native:
-            args.rate = native
-            print(f"Capture a {native} Hz, la frequence du peripherique: aucun "
-                  f"reechantillonnage.", flush=True)
-        else:
-            args.rate = DEFAULT_CAPTURE_RATE
-            print(f"Frequence du peripherique non lisible, capture a "
-                  f"{DEFAULT_CAPTURE_RATE} Hz (voir --rate).", flush=True)
-    else:
-        print(f"Capture a {args.rate} Hz (impose).", flush=True)
+    resolve_capture_rate(args)
 
     print(f"Photo {args.style} {size[0]}x{size[1]} des {describe_window(args)}, "
           f"soit {args.interval * 1000:.0f} ms, rafraichie au meme rythme.", flush=True)
@@ -4134,12 +4365,7 @@ def enter_gui(device: str | None, root: "tk.Tk | None" = None) -> None:
     switch de mode part toujours directement sur --gui, jamais besoin de
     revalider ces cas-la.
     """
-    saved_argv = sys.argv
-    try:
-        sys.argv = ["audio2wave_snap.py", "--gui"] + (["-d", device] if device else [])
-        args = parse_args()
-    finally:
-        sys.argv = saved_argv
+    args = parse_args(["--gui"] + (["-d", device] if device else []))
     require_tools()
     size = resolve_size(args)
     run_app(args, size, root=root)

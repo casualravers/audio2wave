@@ -2023,6 +2023,99 @@ prefixes `live:`/`ridge:`, "default" n'apparait qu'une fois (pas
 `live:default`/`ridge:default`), et un preset `live:*` fusionne perd bien
 `style`/`shape` tout en gardant `gain`/`fullscreen`.
 
+### `preset_registry.py` : un seul endroit pour les presets multi-modes
+
+Snap stocke ses presets dans des fonctions de module, live/ridge dans un objet
+`preset_store` : `preset_registry.ModeStore` (`store_for(mode, module=None)`)
+cache cette difference (`user()`/`all()`/`save()`/`delete()`/`override_default()`)
+et porte la regle de partage entre modes (`CROSS_MODE_UNSAFE_KEYS` = `style`,
+`shape`, `_automation`, retirees par `strip_foreign`). `presets_for_category()`/
+`all_presets_all_modes()` d'`audio2wave_snap.py` n'en sont plus que des
+wrappers (ils passent `sys.modules[__name__]` : lance en `__main__`, snap ne doit
+pas etre recharge en seconde copie). casual-overlay (`gl_gui.mode_store`) utilise
+le meme module au lieu de ses propres classes de magasin. Imports des modules de
+mode paresseux (cycle snap/ridge). Verifie : memes resultats qu'avant pour le Mode
+VJ, `override_default` restitue bien l'etat d'origine, `check_gl.py` d'overlay passe.
+
+### Test de contrat (`check_contract.py`) et sortie machine (`--json-status`)
+
+`check_contract.py` (racine, pas de ffmpeg ni de fenetre ; code de sortie non nul
+si casse) verifie par `inspect` les noms et l'ORDRE des parametres dont dependent
+les hotes (casual-overlay) : `AutomationManager(root, tooltip_cls, panel_bg,
+muted_fg, accent, curve_label, on_editor_open)` + `default_on_editor_open`,
+`Tooltip(widget, text)`, `PresetStore`, les trois `build_gui(..., root,
+on_switch_mode)`, `run`/`parse_args`/`subprocess` de snap et ridge,
+`common.set_gui_accent`, `preset_registry`, `confirm_dialog`. A relancer apres
+toute modification d'API publique ; en ajouter une ligne quand un hote commence
+a dependre d'un nouveau nom.
+
+`audio2wave_snap.analyze_block(pcm, channels, rate, nominal_bpm)` renvoie un dict
+JSON (crete/RMS en dBFS, `kicks_s` en secondes, `bpm_estimate` = mediane des
+intervalles entre kicks repliee dans 70-180) avec le MEME detecteur que
+`--kick-glow` (`detect_kicks`). `--json-status <fichier|->` l'ecrit en une ligne
+par photo depuis `run()` (calcule seulement si l'option est donnee, donc aucun
+cout par defaut ; `-` = stdout et supprime la ligne de statut `\r`, sinon le flux
+serait illisible). Seul snap l'a : live n'a pas de boucle Python par image, donc
+rien a mesurer cote Python. Verifie : signal synthetique a 120 BPM -> BPM estime
+~120 ; silence -> `peak_dbfs` None ; `run()` reel avec capture/affichage
+factices ecrit bien une ligne par photo.
+
+### API pour programmes hotes (casual-overlay) : controleur, mise en page, rendu sans fenetre
+
+Demande : supprimer les accrochages fragiles d'overlay (clic sur la ligne `default`, `<FocusOut>`
+synthetiques, regrid des presets, shim `subprocess`...). Tout est additif (defauts = comportement
+historique) ; `common.API_VERSION` (entier, 2) permet a un hote de tester une version plutot que des
+`hasattr`. Couvert par `check_contract.py`.
+
+- **`GuiController`** (`common.py`, sans tkinter), renvoye par les trois `build_gui()` :
+  `capture_state()` (valide d'abord ce qui est en saisie, puis dict de preset avec `_automation`),
+  `apply_state(dict)` (-> cles ignorees, comme charger un preset : pas de clic de menu, pas d'ecriture
+  dans un magasin ; en live il declenche aussi le redemarrage du producteur, seule facon de prendre
+  effet), `commit_pending()` (champs texte via `bind_commit` = Entree/FocusOut enregistres ; en live
+  avance un `apply()` differe), `widgets` (dict nomme : un widget par attribut d'`args`, plus `status`,
+  `preset_menu`, `save_name`, `presets` (liste du bloc), `section_titles`, `separators`, `root`),
+  `on_change`.
+- **`build_gui(..., *, parent, on_change, embedded, presets_first, compact)`** : `parent` remplace `root`
+  (conteneur DEDIE, vide avant construction) ; `embedded` = ni titre/redimensionnement/`protocol`, ni
+  `root.destroy()` en fin de rendu ; `compact` = marges 6/2/4 au lieu de 11/4/7 ; `presets_first` = le
+  bloc presets passe sous le titre (`common.move_rows_to_top`, sur les numeros de lignes enregistres
+  autour du bloc, pas sur des textes de labels). `on_change(args)` vient de `common.watch_args` : classe
+  observatrice posee sur l'instance (`args.__class__`, meme objet donc partage avec le fil de rendu),
+  notification regroupee via `after_idle`, uniquement pour les ecritures du fil de l'interface (le fil
+  de rendu n'en declenche pas) et pas sur une copie (`copy.copy`).
+- **`parse_args(argv=None)`** dans les trois scripts ; les `enter_gui()` n'echangent plus `sys.argv`.
+- **Rendu sans fenetre (snap, ridge)** : `run(..., frame_sink=f)` -- `f(frame, size)` recoit chaque
+  image RGB24 (tampon de travail, a copier si garde) au lieu de ffplay, via `FrameSinkViewer` (un faux
+  `Popen`) ; `--fullscreen` n'agit plus, `args.size` change -> puits recree. `start_headless(args|argv,
+  size, frame_sink, status)` ouvre capture/couleurs/fil de rendu et renvoie un `HeadlessSession`
+  (`stop()`, `alive`, `args`, `status`). Live n'en a pas : pas de rendu Python (ffmpeg -> ffplay).
+  `require_tools()` reste a la charge de l'appelant. `resolve_capture_rate(args, say)` extrait de
+  `run_app`. Verifie avec de faux `Popen` : 6+ images a la bonne taille, redimensionnement a chaud, arret
+  propre, aucun ffplay lance.
+- **`AutomationManager.snapshot()`** : etat en types simples (`enabled`, `points`, `period`, `phase`,
+  `value`) au lieu de lire `.state`. Non fait : un « chemin de reglages injectable » (les magasins de
+  presets exposent deja `preset_store.path`/`USER_PRESETS_PATH`, reaffectables) ; snap garde son
+  automation locale (pas un `AutomationManager`), donc pas de `snapshot()` cote snap.
+
+### Defauts corriges a la source (signales par casual-overlay, qui les contournait)
+
+- **`--bar-gap` plafonne a `MAX_BAR_GAP = 0.7`** (`build_filter` ET plage du curseur) : a partir de 1, le
+  separateur `drawgrid` est aussi epais que la barre et la couvre (ecran noir).
+- **`analyzer --shape line`** : 400 points (`LINE_ANALYZER_BARS`) et fenetre FFT de 2048 (`LINE_WIN_SIZE`)
+  au lieu de 128/512 (escalier flou), +35 ms de latence comptes par `report_latency()` ; helper
+  `live_win_size(args, rate)` partage par `build_filter`/`report_latency`/`producer_warmup_seconds`.
+- **Survol des menus lisible** : `common.readable_fg(bg)` (texte sombre seulement si contraste >= 4,5, sinon
+  clair) remplace `GUI_ACCENT_FG` pour `*Menu.activeForeground` et `style_option_menu(menu, hover_fg=None)` ;
+  turquoise inchange, un accent bleu recoit du texte clair.
+- **`common.make_scrollbar(parent, command)`** : ascenseur au theme (la liste du Mode VJ l'utilise, via
+  l'attribut du module, donc un hote peut le remplacer).
+- **`preset_registry.normalize_name`** (strip + minuscules, regle des trois fenetres) ; `ModeStore.save`
+  normalise et RENVOIE le nom enregistre.
+- Commandes de `tk.Scale` en `lambda *_:` (gain/sinusoide) : tolerantes a un appel sans valeur. Le message
+  « missing ... '_v' » n'a pas pu etre reproduit ici (aucune exception en agitant tous les widgets des
+  trois fenetres) ; correctif de robustesse, a reverifier cote hote.
+`check_contract.py` couvre chaque point.
+
 ### Selection automatique du premier peripherique (`audio2wave_snap.py`)
 
 Demande explicite : "par defaut selectionne le premier device dispo dans la

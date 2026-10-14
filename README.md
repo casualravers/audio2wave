@@ -121,7 +121,7 @@ Liste complete : `python audio2wave.py -h`
 
 ```bash
 python audio2wave.py voix.wav                                    # -> output/voix_analyzer.mov
-python audio2wave.py voix.wav --shape line --colors grey
+python audio2wave.py voix.wav --shape line --colors gray
 python audio2wave.py voix.wav --style radio --colors "0xff00ff"
 python audio2wave.py voix.wav clip.webm --format webm --style spectrum --colormap rainbow
 python audio2wave.py voix.wav preview.mp4 --format mp4 --no-transparent --bg-color "0x1a1a1a"
@@ -171,7 +171,7 @@ python audio2wave_live.py -d "<entree>" --style radio --gain -10 # onde temporel
 Le fond se regle separement du trace, dans les deux programmes :
 
 ```bash
-python audio2wave_live.py -d "<entree>" --colors grey --bg-color navy
+python audio2wave_live.py -d "<entree>" --colors gray --bg-color navy
 ```
 
 | mode | rendu | latence |
@@ -616,6 +616,7 @@ la crete mesuree pour le gain auto est bien celle qui touche les bords de l'imag
 | `--asset-dir <dir>` | dossier ou chercher `--video`/`--video2` si le chemin donne n'existe pas tel quel | `asset` |
 | `--gui` | ouvre une fenetre de reglages en direct (voir plus bas) | - |
 | `--save-dir <dir>` | ecrit aussi chaque photo en PNG (image entiere) | - |
+| `--json-status <fichier>` | une ligne JSON par photo : `peak_dbfs`, `rms_dbfs`, `gain_db`, `kicks_s` (instants des kicks en secondes), `bpm_set`, `bpm_estimate`, `glow`. `-` = sortie standard (la ligne de statut humaine est alors supprimee). Fonction equivalente : `audio2wave_snap.analyze_block(pcm, channels, rate)` | - |
 | `--size` | resolution | largeur de l'ecran, tiers de sa hauteur |
 | `--rate auto\|<Hz>` | frequence d'echantillonnage de la capture | `auto` |
 | `--buffer <ms>` | tampon de capture | `50` |
