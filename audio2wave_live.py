@@ -819,12 +819,15 @@ class Tooltip:
         win = self.widget.winfo_toplevel()
         left, top = win.winfo_rootx(), win.winfo_rooty()
         right, bottom = left + win.winfo_width(), top + win.winfo_height()
-        x = self.widget.winfo_rootx() + 4
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        if y + h > bottom:
-            y = self.widget.winfo_rooty() - h - 4
-        x = max(left, min(x, right - w))
-        y = max(top, y)
+        gap = 4
+        wx, wy = self.widget.winfo_rootx(), self.widget.winfo_rooty()
+        x = max(left + gap, min(wx + gap, right - w - gap))
+        y = wy + self.widget.winfo_height() + gap
+        if y + h > bottom - gap:
+            above = wy - h - gap
+            y = above if above >= top + gap else bottom - h - gap
+        # Widget lui-meme defile hors de vue : l'info-bulle reste dans la fenetre.
+        y = max(top + gap, min(y, bottom - h - gap))
         self.tip.wm_geometry(f"+{x}+{y}")
         self.tip.deiconify()
 
@@ -1032,14 +1035,17 @@ class AutomationManager:
     """
 
     AUTOMATION_KEY = "_automation"  # cle reservee dans un preset JSON, voir capture()/apply()
+    default_on_editor_open: Callable[[object, object, str, object], None] | None = None
 
     def __init__(self, root: object, tooltip_cls: type, panel_bg: str, muted_fg: str, accent: str,
                  curve_label: str = "∿",
-                 on_editor_open: Callable[[object, str, object], None] | None = None):
+                 on_editor_open: Callable[[object, object, str, object], None] | None = None):
         """`curve_label` : texte du bouton d'edition (petite vague par defaut).
-        `on_editor_open(window, attr, canvas)` : appele une fois la fenetre
-        d'edition construite, pour qu'un programme hote l'habille a sa facon
-        sans remplacer `open_editor` ni parcourir ses widgets."""
+        `on_editor_open(manager, window, attr, canvas)` : appele une fois la
+        fenetre d'edition construite, pour qu'un programme hote l'habille a sa
+        facon sans remplacer `open_editor`. A defaut, le crochet de classe
+        `AutomationManager.default_on_editor_open` s'applique, pour atteindre
+        aussi les gestionnaires crees par les `build_gui()` eux-memes."""
         self.root = root
         self.curve_label = curve_label
         self.on_editor_open = on_editor_open
@@ -1168,8 +1174,9 @@ class AutomationManager:
         win.protocol("WM_DELETE_WINDOW", on_close)
         tk.Button(win, text="Fermer", command=on_close).pack(pady=(0, 12))
         state["editor"] = win
-        if self.on_editor_open is not None:
-            self.on_editor_open(win, attr, state["canvas"])
+        hook = self.on_editor_open or AutomationManager.default_on_editor_open
+        if hook is not None:
+            hook(self, win, attr, state["canvas"])
 
     def tick(self, controls: dict, finished_event: object) -> None:
         """A programmer par l'appelant via root.after(AUTOMATE_TICK_MS, ...) ; se
