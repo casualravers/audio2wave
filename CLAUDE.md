@@ -2114,6 +2114,23 @@ historique) ; `common.API_VERSION` (entier, 2) permet a un hote de tester une ve
 - Commandes de `tk.Scale` en `lambda *_:` (gain/sinusoide) : tolerantes a un appel sans valeur. Le message
   « missing ... '_v' » n'a pas pu etre reproduit ici (aucune exception en agitant tous les widgets des
   trois fenetres) ; correctif de robustesse, a reverifier cote hote.
+- **analyzer + `--amp-scale log` : barres collees au maximum** (signale par casual-overlay, preset
+  utilisateur « purple analyzer » : log, rlog, gain 35). Cause : les gains (`DEFAULT_GAIN_DB` 30,
+  `STYLE_BOOST_DB` 18) sont calibres pour `cbrt`, or l'echelle log releve tout. Mesure (sinus pur,
+  hauteur de barre selon le niveau APRES gain) : log 0,80 a 0 dBFS et 0,97 a +20 dB ; cbrt 0,39 et
+  0,84 ; sqrt 0,25/0,77 ; lin 0,06/0,59 (toutes saturent vers +25..+30 dB). Avec 30-35 dB, un bin de
+  basse a -10 dBFS est donc plafonne en continu. Non causes (mesures : memes resultats) : stereo vs
+  mono, `averaging` (1 a 12), `win_size` (512/1024), DC (highpass sans effet). Correctif : en analyzer
+  + log, defaut 20 dB (`LOG_AMP_DEFAULT_GAIN_DB`), conseil de `--tune` = crete + 8
+  (`LOG_AMP_BOOST_DB`) et gain EFFECTIF plafonne a `LOG_AMP_MAX_GAIN_DB` = 20 dans `resolve_gain`
+  (un `--gain`/preset plus haut est ramene a 20 ; le curseur GUI garde sa valeur, info-bulle).
+  **Changement de comportement** : les presets log avec gain > 20 sortent plus bas qu'avant ; cbrt,
+  sqrt, lin et radio sont inchanges. Helpers `default_gain_db`, `style_boost_db`, `advised_gain`.
+  Limite connue, non corrigee : en `freq_scale=rlog` (128 barres, fenetre 512) la barre 1 absorbe
+  toute la bande grave (200 Hz et 1 kHz y tombent) et la barre 0 reste vide ; avec le plafond elle ne
+  sature plus, mais la resolution grave de rlog reste mauvaise (preferer `log`). Test :
+  `check_contract.py` rend du bruit rose + basse 55 Hz avec ffmpeg reel (echoue sans le correctif :
+  1 et 5 barres au maximum).
 `check_contract.py` couvre chaque point.
 
 ### Selection automatique du premier peripherique (`audio2wave_snap.py`)

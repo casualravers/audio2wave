@@ -53,6 +53,18 @@ STYLE_BOOST_DB = {"analyzer": 18.0, "radio": -22.0}
 # entree ligne classique (crete vers -12 dBFS); --tune donne la valeur exacte.
 DEFAULT_GAIN_DB = {"analyzer": 30.0, "radio": -10.0}
 
+# analyzer + --amp-scale log : les gains ci-dessus sont calibres pour cbrt (le defaut) et
+# SATURENT en log. Mesure (sinus pur, showfreqs, hauteur de barre selon le niveau apres
+# gain) : log donne 0,80 a 0 dBFS et 0,97 a +20 dB, cbrt seulement 0,39 et 0,84 ; a
+# l'oeil, toute barre dont le niveau passe ~+17 dB touche le plafond. Avec 30 a 35 dB de
+# gain, la moindre basse de musique (bin a -10 dBFS) est donc collee en haut en continu.
+# Ici : defaut et conseil de --tune abaisses (8 dB au-dessus de la crete mesuree, la
+# crete tombe vers 0,86), et gain EFFECTIF plafonne a LOG_AMP_MAX_GAIN_DB (un --gain
+# ou un preset plus eleve est ramene a cette valeur). Hors analyzer+log, rien ne change.
+LOG_AMP_DEFAULT_GAIN_DB = 20.0
+LOG_AMP_BOOST_DB = 8.0
+LOG_AMP_MAX_GAIN_DB = 20.0
+
 # Le cout de rendu est domine par la FFT (win_size) et la capture, pas par le nombre
 # de colonnes dessinees ni par la taille de sortie: mesure, 48 vs 240 barres et
 # 960x540 vs 1920x1080 donnent le meme temps de traitement. Autant profiter de cette
@@ -129,7 +141,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--gain", type=float, default=None,
                     help="Gain en dB avant analyse. Contrairement au mode fichier, un flux live n'a "
                          "pas de crete connue a l'avance: utilise --tune pour trouver la valeur "
-                         "adaptee a ta carte son (defaut: 30 en analyzer, -10 en radio)")
+                         "adaptee a ta carte son (defaut: 30 en analyzer, -10 en radio ; "
+                         f"en analyzer avec --amp-scale log: {LOG_AMP_DEFAULT_GAIN_DB:.0f}, et "
+                         f"plafonne a {LOG_AMP_MAX_GAIN_DB:.0f})")
     p.add_argument("--averaging", type=int, default=6,
                     help="Lissage temporel du spectre. Attention, chaque image moyennee retarde "
                          "l'affichage: c'est le reglage qui coute le plus cher en reactivite. "
@@ -183,8 +197,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def default_gain_db(style: str, amp_scale: str) -> float:
+    """Gain par defaut du style, ou celui de l'echelle log (voir LOG_AMP_*)."""
+    if style == "analyzer" and amp_scale == "log":
+        return LOG_AMP_DEFAULT_GAIN_DB
+    return DEFAULT_GAIN_DB[style]
+
+
+def style_boost_db(style: str, amp_scale: str) -> float:
+    """Marge de --tune du style, ou celle de l'echelle log (voir LOG_AMP_*)."""
+    if style == "analyzer" and amp_scale == "log":
+        return LOG_AMP_BOOST_DB
+    return STYLE_BOOST_DB[style]
+
+
+def advised_gain(style: str, amp_scale: str, peak_db: float) -> float:
+    """Gain que --tune conseille pour une crete mesuree, borne comme resolve_gain."""
+    gain = -peak_db + style_boost_db(style, amp_scale)
+    if style == "analyzer" and amp_scale == "log":
+        gain = min(gain, LOG_AMP_MAX_GAIN_DB)
+    return gain
+
+
 def resolve_gain(args: argparse.Namespace) -> float:
-    return args.gain if args.gain is not None else DEFAULT_GAIN_DB[args.style]
+    gain = args.gain if args.gain is not None else default_gain_db(args.style, args.amp_scale)
+    if args.style == "analyzer" and args.amp_scale == "log":
+        gain = min(gain, LOG_AMP_MAX_GAIN_DB)
+    return gain
 
 
 def resolve_size(args: argparse.Namespace) -> tuple[int, int]:
@@ -263,9 +302,9 @@ def tune(args: argparse.Namespace) -> None:
               "Niveaux) : un curseur d'entree pousse a fond y ecrete independamment de "
               "--gain.")
     # Le gain conseille depend du style: les deux sont a 40 dB d'ecart.
-    print(f"\n  --style {args.style} --gain {-peak_db + STYLE_BOOST_DB[args.style]:.0f}")
+    print(f"\n  --style {args.style} --gain {advised_gain(args.style, args.amp_scale, peak_db):.0f}")
     other = "radio" if args.style == "analyzer" else "analyzer"
-    print(f"  --style {other} --gain {-peak_db + STYLE_BOOST_DB[other]:.0f}")
+    print(f"  --style {other} --gain {advised_gain(other, args.amp_scale, peak_db):.0f}")
 
 
 def build_filter(args: argparse.Namespace) -> str:
@@ -1637,6 +1676,9 @@ def build_gui(args: argparse.Namespace, width: int, height: int, status: dict,
     bars_var = add_slider("Barres/points", "bars", 8, 400, 4, resolve_bars(args, width), panel="right",
                           automatable=True)
     gain_var = add_slider("Gain (dB)", "gain", -60, 60, 1, resolve_gain(args), panel="right",
+                          tooltip=f"En style analyzer avec l'echelle d'amplitude log, le gain "
+                                  f"effectif est plafonne a {LOG_AMP_MAX_GAIN_DB:.0f} dB "
+                                  "(au-dela les barres restent collees en haut).",
                           automatable=True)
     averaging_var = add_slider("Lissage", "averaging", 1, 30, 1, args.averaging, panel="right",
                               tooltip="Uniquement pour le style analyzer: nombre de trames "

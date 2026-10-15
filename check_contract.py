@@ -176,6 +176,54 @@ finally:
     ridge.preset_store.path = _old_path
     _tmp_path.unlink(missing_ok=True)
 
+print("analyzer: aucune barre collee au maximum (rendu ffmpeg reel)")
+import shutil
+import subprocess
+
+
+def saturated_bars(extra: list[str], seconds: int = 3) -> int | None:
+    """Nombre de barres allumees a plus de 95 % de la hauteur sur la moyenne des 8
+    dernieres images, pour une musique simulee (bruit rose + basse a 55 Hz)."""
+    width, height = 640, 180
+    sat_args = live.parse_args(["-d", "x", "--style", "analyzer", "--shape", "bar", "--bars", "128",
+                                "--bar-gap", "0.35", "--stereo", "--colors", "purple",
+                                "--size", f"{width}x{height}"] + extra)
+    cmd = ["ffmpeg", "-v", "error",
+           "-f", "lavfi", "-t", str(seconds), "-i", "anoisesrc=c=pink:a=0.3:r=44100",
+           "-f", "lavfi", "-t", str(seconds), "-i", "sine=f=55:r=44100,volume=0.5",
+           "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first,aformat=channel_layouts=stereo[m];[m]"
+                              + live.build_filter(sat_args).replace("[0:a]", "", 1),
+           "-map", "[v]", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    out = subprocess.run(cmd, capture_output=True).stdout
+    size = width * height * 3
+    frames = [out[i * size:(i + 1) * size] for i in range(max(0, len(out) // size - 8), len(out) // size)]
+    if not frames:
+        return None
+    count = 0
+    for bar in range(128):
+        x = int((bar + 0.5) * width / 128)
+        lit = sum(1 for f in frames for y in range(height) if any(f[(y * width + x) * 3:(y * width + x) * 3 + 3]))
+        if lit / (height * len(frames)) > 0.95:
+            count += 1
+    return count
+
+
+check(live.resolve_gain(live.parse_args(["-d", "x", "--amp-scale", "log"])) == live.LOG_AMP_DEFAULT_GAIN_DB,
+      "analyzer + log: gain par defaut abaisse")
+check(live.resolve_gain(live.parse_args(["-d", "x", "--amp-scale", "log", "--gain", "35"])) == live.LOG_AMP_MAX_GAIN_DB,
+      "analyzer + log: gain explicite plafonne")
+check(live.resolve_gain(live.parse_args(["-d", "x", "--amp-scale", "cbrt", "--gain", "35"])) == 35.0
+      and live.resolve_gain(live.parse_args(["-d", "x"])) == live.DEFAULT_GAIN_DB["analyzer"],
+      "hors log: gains inchanges")
+if shutil.which("ffmpeg"):
+    # Reglages du preset utilisateur "purple analyzer" (log, rlog, 35 dB) : une barre restait au maximum.
+    count = saturated_bars(["--amp-scale", "log", "--freq-scale", "rlog", "--gain", "35", "--averaging", "6"])
+    check(count == 0, "preset log/rlog/35 dB sur musique simulee: aucune barre au maximum", str(count))
+    count = saturated_bars(["--amp-scale", "log", "--freq-scale", "log"])
+    check(count == 0, "log + gain par defaut: aucune barre au maximum", str(count))
+else:
+    print("  [--] ffmpeg absent: rendu reel ignore")
+
 print("analyze_block (sortie machine, --json-status)")
 _argv = sys.argv
 sys.argv = ["snap", "-d", "x", "--json-status", "-"]
